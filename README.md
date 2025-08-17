@@ -9,4 +9,4 @@ pip install -r requirements.txt
 # Provide Snowflake creds via .env
 cp .env.example .env  # fill values
 
-streamlit run app.py
+streamlit run tco_app.py
