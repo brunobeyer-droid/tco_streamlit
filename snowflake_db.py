@@ -85,18 +85,19 @@ def fetch_df(sql: str, params=None):
         conn.close()
 
 def ensure_tables():
-    """Create minimal tables if they don't exist (idempotent)."""
     ddl = """
     CREATE TABLE IF NOT EXISTS PROGRAMS (
       PROGRAMID STRING PRIMARY KEY,
       PROGRAMNAME STRING,
-      PROGRAMOWNER STRING
+      PROGRAMOWNER STRING,
+      PROGRAMFTE NUMBER(18,2) DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS TEAMS (
       TEAMID STRING PRIMARY KEY,
       TEAMNAME STRING,
       PROGRAMID STRING,
-      COSTPERFTE NUMBER(18,2)
+      COSTPERFTE NUMBER(18,2),
+      TEAMFTE NUMBER(18,2) DEFAULT 0
     );
     CREATE TABLE IF NOT EXISTS INVOICES (
       INVOICEID STRING PRIMARY KEY,
@@ -108,6 +109,10 @@ def ensure_tables():
       STATUS STRING,
       VENDOR STRING
     );
+    CREATE TABLE IF NOT EXISTS VENDORS (
+      VENDORID STRING PRIMARY KEY,
+      VENDORNAME STRING
+    );
     """
     for stmt in ddl.split(";"):
         s = stmt.strip()
@@ -117,32 +122,45 @@ def ensure_tables():
 # -----------------------
 # Upserts / Deletes
 # -----------------------
-
-def upsert_program(program_id: str, name: str, owner: str = None):
+def upsert_program(program_id: str, name: str, owner: str = None, program_fte: float = 0.0):
     sql = """
     MERGE INTO PROGRAMS t
-    USING (SELECT %s AS PROGRAMID, %s AS PROGRAMNAME, %s AS PROGRAMOWNER) s
+    USING (
+        SELECT %s AS PROGRAMID, %s AS PROGRAMNAME, %s AS PROGRAMOWNER, %s AS PROGRAMFTE
+    ) s
     ON t.PROGRAMID = s.PROGRAMID
-    WHEN MATCHED THEN UPDATE SET PROGRAMNAME = s.PROGRAMNAME, PROGRAMOWNER = s.PROGRAMOWNER
-    WHEN NOT MATCHED THEN INSERT (PROGRAMID, PROGRAMNAME, PROGRAMOWNER)
-    VALUES (s.PROGRAMID, s.PROGRAMNAME, s.PROGRAMOWNER);
+    WHEN MATCHED THEN UPDATE SET
+        PROGRAMNAME = s.PROGRAMNAME,
+        PROGRAMOWNER = s.PROGRAMOWNER,
+        PROGRAMFTE = s.PROGRAMFTE
+    WHEN NOT MATCHED THEN INSERT (PROGRAMID, PROGRAMNAME, PROGRAMOWNER, PROGRAMFTE)
+    VALUES (s.PROGRAMID, s.PROGRAMNAME, s.PROGRAMOWNER, s.PROGRAMFTE);
     """
-    execute(sql, (program_id, name, owner))
+    execute(sql, (program_id, name, owner, program_fte))
 
 def delete_program(program_id: str):
     execute("DELETE FROM TEAMS WHERE PROGRAMID = %s;", (program_id,))
     execute("DELETE FROM PROGRAMS WHERE PROGRAMID = %s;", (program_id,))
 
-def upsert_team(team_id: str, team_name: str, program_id: str, cost_per_fte: float = 0.0):
+def upsert_team(team_id: str, team_name: str, program_id: str, cost_per_fte: float = 0.0, team_fte: float = 0.0):
+    """
+    Upsert a team, including TEAMFTE persistence.
+    """
     sql = """
     MERGE INTO TEAMS t
-    USING (SELECT %s AS TEAMID, %s AS TEAMNAME, %s AS PROGRAMID, %s AS COSTPERFTE) s
+    USING (
+        SELECT %s AS TEAMID, %s AS TEAMNAME, %s AS PROGRAMID, %s AS COSTPERFTE, %s AS TEAMFTE
+    ) s
     ON t.TEAMID = s.TEAMID
-    WHEN MATCHED THEN UPDATE SET TEAMNAME = s.TEAMNAME, PROGRAMID = s.PROGRAMID, COSTPERFTE = s.COSTPERFTE
-    WHEN NOT MATCHED THEN INSERT (TEAMID, TEAMNAME, PROGRAMID, COSTPERFTE)
-    VALUES (s.TEAMID, s.TEAMNAME, s.PROGRAMID, s.COSTPERFTE);
+    WHEN MATCHED THEN UPDATE SET
+        TEAMNAME   = s.TEAMNAME,
+        PROGRAMID  = s.PROGRAMID,
+        COSTPERFTE = s.COSTPERFTE,
+        TEAMFTE    = s.TEAMFTE
+    WHEN NOT MATCHED THEN INSERT (TEAMID, TEAMNAME, PROGRAMID, COSTPERFTE, TEAMFTE)
+    VALUES (s.TEAMID, s.TEAMNAME, s.PROGRAMID, s.COSTPERFTE, s.TEAMFTE);
     """
-    execute(sql, (team_id, team_name, program_id, cost_per_fte))
+    execute(sql, (team_id, team_name, program_id, cost_per_fte, team_fte))
 
 def delete_team(team_id: str):
     execute("DELETE FROM TEAMS WHERE TEAMID = %s;", (team_id,))
@@ -165,3 +183,24 @@ def upsert_invoice(invoice_id: str, application_id: str, team_id: str, invoice_d
 
 def delete_invoice(invoice_id: str):
     execute("DELETE FROM INVOICES WHERE INVOICEID = %s;", (invoice_id,))
+
+def upsert_vendor(vendor_id: str, vendor_name: str):
+    sql = """
+    MERGE INTO VENDORS t
+    USING (SELECT %s AS VENDORID, %s AS VENDORNAME) s
+    ON t.VENDORID = s.VENDORID
+    WHEN MATCHED THEN UPDATE SET VENDORNAME = s.VENDORNAME
+    WHEN NOT MATCHED THEN INSERT (VENDORID, VENDORNAME)
+    VALUES (s.VENDORID, s.VENDORNAME);
+    """
+    execute(sql, (vendor_id, vendor_name))
+
+def delete_vendor(vendor_id: str):
+    execute("DELETE FROM VENDORS WHERE VENDORID = %s;", (vendor_id,))
+
+def ensure_programs_schema():
+    # Safe/idempotent: adds column only if missing
+    execute("ALTER TABLE IF EXISTS PROGRAMS ADD COLUMN IF NOT EXISTS PROGRAMFTE NUMBER(18,2) DEFAULT 0;")
+
+def ensure_teams_schema():
+    execute("ALTER TABLE IF EXISTS TEAMS ADD COLUMN IF NOT EXISTS TEAMFTE NUMBER(18,2) DEFAULT 0;")

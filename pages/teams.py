@@ -1,97 +1,194 @@
-
+# filename: pages/teams.py
 import streamlit as st
+import uuid
+from typing import Dict
 
-st.title("Team Composition")
+# If you sometimes run the page directly, uncomment:
+# import sys, os
+# sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
-st.write("Define your teams, link them to programs, and specify their workforce composition here.")
+from snowflake_db import ensure_tables, fetch_df, upsert_team, delete_team
 
-# Retrieve programs from session state
-programs = st.session_state.get("programs", [])
+st.set_page_config(page_title="Teams", page_icon="👥", layout="wide")
+st.title("👥 Team Composition")
 
-if not programs:
-    st.warning("Please define programs in the \'Programs and Workforce\' page first.")
+# -----------------------------------------------------------------------------
+# Initialize (ensure tables once per session)
+# -----------------------------------------------------------------------------
+if not st.session_state.get("_init_teams_done"):
+    ensure_tables()
+    st.session_state["_init_teams_done"] = True
+
+# Session-only MSP flags (since schema doesn't have an MSP column)
+# key by TEAMID -> bool
+st.session_state.setdefault("msp_flags", {})
+
+# -----------------------------------------------------------------------------
+# Cached readers
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def get_programs_df():
+    return fetch_df("SELECT PROGRAMID, PROGRAMNAME FROM PROGRAMS ORDER BY PROGRAMNAME;")
+
+@st.cache_data(show_spinner=False)
+def get_teams_df():
+    return fetch_df("""
+        SELECT t.TEAMID, t.TEAMNAME,
+               p.PROGRAMID, p.PROGRAMNAME,
+               COALESCE(t.COSTPERFTE,0) AS COSTPERFTE,
+               COALESCE(t.TEAMFTE,0)    AS TEAMFTE
+        FROM TEAMS t
+        LEFT JOIN PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
+        ORDER BY p.PROGRAMNAME, t.TEAMNAME;
+    """)
+
+def invalidate_programs_cache():
+    get_programs_df.clear()
+
+def invalidate_teams_cache():
+    get_teams_df.clear()
+
+# -----------------------------------------------------------------------------
+# Load references
+# -----------------------------------------------------------------------------
+prog_df = get_programs_df()
+name_to_program_id: Dict[str, str] = dict(zip(prog_df["PROGRAMNAME"], prog_df["PROGRAMID"])) if not prog_df.empty else {}
+program_names = list(name_to_program_id.keys())
+
+if not program_names:
+    st.warning("No Programs found. Please create Programs first.")
+    st.stop()
+
+# -----------------------------------------------------------------------------
+# Add Team (form)
+# -----------------------------------------------------------------------------
+st.subheader("Add Team")
+
+a1, a2, a3, a4 = st.columns([2.2, 2, 1.2, 1.2])
+with a1:
+    new_team = st.text_input("Team Name")
+with a2:
+    new_prog = st.selectbox("Program", options=program_names, index=0)
+with a3:
+    new_cost = st.number_input("Cost per FTE Hour", min_value=0.0, step=10.0, value=0.0)
+with a4:
+    mode = st.radio("FTE Input Mode", options=["Single number", "By role breakdown"], horizontal=True, index=0)
+
+if mode == "Single number":
+    team_fte = st.number_input("Team FTE", min_value=0.0, step=0.5, value=0.0, key="new_team_fte_single")
 else:
-    # Initialize session state for teams if not already present
-    if 'teams_data' not in st.session_state:
-        st.session_state.teams_data = {}
+    st.markdown("**Workforce (FTE) by role** — we’ll sum these and save as Team FTE.")
+    r1, r2, r3, r4, r5 = st.columns(5)
+    with r1:
+        eng = st.number_input("Engineers", min_value=0.0, step=0.5, value=0.0, key="role_eng")
+    with r2:
+        pm = st.number_input("Product Managers", min_value=0.0, step=0.5, value=0.0, key="role_pm")
+    with r3:
+        des = st.number_input("Designers", min_value=0.0, step=0.5, value=0.0, key="role_des")
+    with r4:
+        qa = st.number_input("QA Engineers", min_value=0.0, step=0.5, value=0.0, key="role_qa")
+    with r5:
+        devops = st.number_input("DevOps Engineers", min_value=0.0, step=0.5, value=0.0, key="role_devops")
+    team_fte = float(eng + pm + des + qa + devops)
 
-    st.header("Define Teams per Program")
+# Optional MSP flag (session-only)
+msp_flag = st.checkbox("Is this an MSP team? (session-only flag)")
 
-    selected_program = st.selectbox("Select a Program to add/edit teams", programs)
+save_btn = st.button("Save Team", type="primary")
+if save_btn:
+    if not new_team.strip():
+        st.warning("Please provide a Team Name.")
+    else:
+        tid = str(uuid.uuid4())
+        upsert_team(
+            team_id=tid,
+            team_name=new_team.strip(),
+            program_id=name_to_program_id[new_prog],
+            cost_per_fte=float(new_cost or 0.0),
+            team_fte=float(team_fte or 0.0),
+        )
+        # store MSP flag in session
+        st.session_state["msp_flags"][tid] = bool(msp_flag)
 
-    if selected_program:
-        if selected_program not in st.session_state.teams_data:
-            st.session_state.teams_data[selected_program] = []
+        invalidate_teams_cache()
+        st.success(f"Saved team '{new_team}' under program '{new_prog}'.")
+        st.rerun()
 
-        st.subheader(f"Teams for {selected_program}")
+st.divider()
 
-        with st.form(key=f"add_team_form_{selected_program}"):
-            new_team_name = st.text_input(f"New Team Name for {selected_program}")
-            is_msp = st.checkbox(f"Is {new_team_name} an MSP (Managed Service Provider) team?", key=f"is_msp_{selected_program}_{new_team_name}")
-            st.markdown("**Workforce Composition (FTEs) for this Team:**")
-            team_workforce = {
-                'Engineers': st.number_input('Engineers (FTEs)', min_value=0.0, value=0.0, key=f"eng_{selected_program}_{new_team_name}"),
-                'Product Managers': st.number_input('Product Managers (FTEs)', min_value=0.0, value=0.0, key=f"pm_{selected_program}_{new_team_name}"),
-                'Designers': st.number_input('Designers (FTEs)', min_value=0.0, value=0.0, key=f"des_{selected_program}_{new_team_name}"),
-                'QA Engineers': st.number_input('QA Engineers (FTEs)', min_value=0.0, value=0.0, key=f"qa_{selected_program}_{new_team_name}"),
-                'DevOps Engineers': st.number_input('DevOps Engineers (FTEs)', min_value=0.0, value=0.0, key=f"devops_{selected_program}_{new_team_name}")
-            }
-            add_team_button = st.form_submit_button(f"Add Team to {selected_program}")
+# -----------------------------------------------------------------------------
+# Current Teams (aligned grid)
+# -----------------------------------------------------------------------------
+st.subheader("Current Teams")
 
-            if add_team_button and new_team_name:
-                # Check if team already exists
-                team_exists = False
-                for team_entry in st.session_state.teams_data[selected_program]:
-                    if team_entry["name"] == new_team_name:
-                        team_exists = True
-                        break
+teams_df = get_teams_df()
+if teams_df.empty:
+    st.info("No teams yet. Add a team above.")
+else:
+    COLS = [2.2, 2, 1.2, 1.0, 0.9, 0.9, 1.0]  # Team | Program | Cost/FTE | Team FTE | MSP | Update | Delete
+    h1, h2, h3, h4, h5, h6, h7 = st.columns(COLS, gap="small")
+    with h1: st.markdown("**Team Name**")
+    with h2: st.markdown("**Program**")
+    with h3: st.markdown("**Cost/FTE**")
+    with h4: st.markdown("**Team FTE**")
+    with h5: st.markdown("**MSP (session)**")
+    with h6: st.markdown("** **")
+    with h7: st.markdown("** **")
+    st.divider()
 
-                if not team_exists:
-                    st.session_state.teams_data[selected_program].append({"name": new_team_name, "workforce": team_workforce, "is_msp": is_msp})
-                    st.success(f"Team \'{new_team_name}\' added to {selected_program}.")
-                else:
-                    st.warning(f"Team \'{new_team_name}\' already exists in {selected_program}.")
+    for _, row in teams_df.iterrows():
+        tid         = row["TEAMID"]
+        tname       = row["TEAMNAME"]
+        prog_name   = row["PROGRAMNAME"]
+        cost_fte    = float(row["COSTPERFTE"] or 0.0)
+        team_fte    = float(row["TEAMFTE"] or 0.0)
+        msp_current = bool(st.session_state["msp_flags"].get(tid, False))
 
-        st.markdown("--- ")
-        st.subheader(f"Existing Teams in {selected_program}")
-        if st.session_state.teams_data[selected_program]:
-            for i, team_entry in enumerate(st.session_state.teams_data[selected_program]):
-                team_name = team_entry["name"]
-                team_workforce = team_entry["workforce"]
-                team_is_msp = team_entry["is_msp"]
-                
-                st.write(f"**Team: {team_name}** (MSP: {team_is_msp})")
-                
-                # Allow editing of team name, MSP flag, and workforce
-                with st.expander(f"Edit {team_name}"):
-                    edited_team_name = st.text_input("Team Name", value=team_name, key=f"edit_team_name_{selected_program}_{i}")
-                    edited_is_msp = st.checkbox("Is MSP?", value=team_is_msp, key=f"edit_is_msp_{selected_program}_{i}")
-                    
-                    st.markdown("**Edit Workforce Composition (FTEs):**")
-                    edited_workforce = {}
-                    for role, fte_value in team_workforce.items():
-                        edited_workforce[role] = st.number_input(
-                            f"{role} (FTEs)",
-                            min_value=0.0,
-                            value=float(fte_value),
-                            key=f"edit_fte_{selected_program}_{i}_{role}"
-                        )
-                    
-                    # Update logic
-                    if edited_team_name != team_name or edited_is_msp != team_is_msp or edited_workforce != team_workforce:
-                        st.session_state.teams_data[selected_program][i]["name"] = edited_team_name
-                        st.session_state.teams_data[selected_program][i]["is_msp"] = edited_is_msp
-                        st.session_state.teams_data[selected_program][i]["workforce"] = edited_workforce
-                        st.success(f"Team ‘{team_name}’ updated.")
-                        st.experimental_rerun()
+        with st.form(f"row_{tid}", clear_on_submit=False):
+            c1, c2, c3, c4, c5, c6, c7 = st.columns(COLS, gap="small")
+            with c1:
+                e_name = st.text_input("Team Name", value=tname, key=f"name_{tid}", label_visibility="hidden")
+            with c2:
+                idx = program_names.index(prog_name) if prog_name in program_names else 0
+                e_prog = st.selectbox("Program", options=program_names, index=idx, key=f"prog_{tid}", label_visibility="hidden")
+            with c3:
+                e_cost = st.number_input("Cost/FTE", min_value=0.0, step=10.0, value=cost_fte, key=f"cost_{tid}", label_visibility="hidden")
+            with c4:
+                e_fte = st.number_input("Team FTE", min_value=0.0, step=0.5, value=team_fte, key=f"fte_{tid}", label_visibility="hidden")
+            with c5:
+                e_msp = st.checkbox("MSP", value=msp_current, key=f"msp_{tid}", label_visibility="hidden")
+            with c6:
+                update_clicked = st.form_submit_button("Update", type="primary", use_container_width=True)
+            with c7:
+                delete_clicked = st.form_submit_button("Delete", use_container_width=True)
 
-                if st.button(f"Remove {team_name}", key=f"remove_team_{selected_program}_{i}"):
-                    st.session_state.teams_data[selected_program].pop(i)
-                    st.experimental_rerun()
-        else:
-            st.info(f"No teams defined for {selected_program} yet. Add a team above.")
+            if update_clicked:
+                upsert_team(
+                    team_id=tid,
+                    team_name=e_name.strip(),
+                    program_id=name_to_program_id[e_prog],
+                    cost_per_fte=float(e_cost or 0.0),
+                    team_fte=float(e_fte or 0.0),
+                )
+                # update MSP session flag
+                st.session_state["msp_flags"][tid] = bool(e_msp)
 
-    # Save teams data to session state for use in other pages
-    st.session_state["teams_data"] = st.session_state.teams_data
+                invalidate_teams_cache()
+                st.success(f"Updated team '{e_name}'.")
+                st.rerun()
 
+            if delete_clicked:
+                delete_team(tid)
+                st.session_state["msp_flags"].pop(tid, None)
+                invalidate_teams_cache()
+                st.success(f"Deleted team '{tname}'.")
+                st.rerun()
 
+    with st.expander("View Teams table (live)"):
+        st.dataframe(get_teams_df(), use_container_width=True)
+
+st.caption(
+    "Team changes are saved to Snowflake only when you click **Save**, **Update**, or **Delete**. "
+    "MSP is a session-only flag (not persisted). If you want MSP in the database, we can add a `MSP BOOLEAN` "
+    "column to the TEAMS table and wire it through."
+)
