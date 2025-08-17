@@ -2,15 +2,19 @@ import os
 import streamlit as st
 import snowflake.connector
 
-# Try to load a local .env if python-dotenv is installed (optional convenience)
+# Try to load a local .env if python-dotenv is installed (optional)
 try:
     from dotenv import load_dotenv
-    load_dotenv()  # loads variables from a .env file into os.environ if present
+    load_dotenv()
 except Exception:
     pass
 
+
+# ------------------------------
+# Connection helpers
+# ------------------------------
 def _safe_get_secrets() -> dict:
-    """Return st.secrets['snowflake'] as a plain dict if available; otherwise {} (no crash)."""
+    """Return st.secrets['snowflake'] as a plain dict if available; otherwise {}."""
     try:
         cfg = st.secrets.get("snowflake", {})  # type: ignore[attr-defined]
         return dict(cfg) if isinstance(cfg, dict) else {}
@@ -22,7 +26,6 @@ def _get_conn():
     Build a Snowflake connection using (in order of precedence):
     1) st.secrets['snowflake'] (if present)
     2) Environment variables SNOWFLAKE_*
-    3) If still missing, raise a readable error listing what is missing
     """
     cfg = _safe_get_secrets()
 
@@ -50,7 +53,7 @@ def _get_conn():
             "or set environment variables. Missing: " + ", ".join(missing)
         )
 
-    conn = snowflake.connector.connect(
+    return snowflake.connector.connect(
         user=user,
         password=password,
         account=account,
@@ -59,7 +62,6 @@ def _get_conn():
         schema=schema,
         role=role
     )
-    return conn
 
 def execute(sql: str, params=None):
     """Execute a statement (INSERT/UPDATE/DDL)."""
@@ -84,33 +86,61 @@ def fetch_df(sql: str, params=None):
     finally:
         conn.close()
 
+
+# ------------------------------
+# FQ helpers (ensure same DB/Schema)
+# ------------------------------
+def _current_db_schema():
+    """Return ('DB','SCHEMA') for the active connection/session."""
+    df = fetch_df("SELECT CURRENT_DATABASE(), CURRENT_SCHEMA();")
+    db, sc = df.iloc[0, 0], df.iloc[0, 1]
+    return db, sc
+
+def _fq(table_name: str) -> str:
+    """Fully-qualify a table with CURRENT_DATABASE()/CURRENT_SCHEMA()."""
+    db, sc = _current_db_schema()
+    return f'{db}.{sc}.{table_name}'
+
+
+# ------------------------------
+# Schema ensure/repair
+# ------------------------------
 def ensure_tables():
-    ddl = """
-    CREATE TABLE IF NOT EXISTS PROGRAMS (
-      PROGRAMID STRING PRIMARY KEY,
-      PROGRAMNAME STRING,
+    """
+    Create base tables if missing. Avoid ambiguous ADD COLUMN statements here.
+    Columns like PROGRAMFTE are ensured via dedicated repair functions below.
+    """
+    programs = _fq("PROGRAMS")
+    teams    = _fq("TEAMS")
+    invoices = _fq("INVOICES")
+    vendors  = _fq("VENDORS")
+
+    ddl = f"""
+    CREATE TABLE IF NOT EXISTS {programs} (
+      PROGRAMID    STRING PRIMARY KEY,
+      PROGRAMNAME  STRING,
       PROGRAMOWNER STRING
-      -- PROGRAMFTE added via ALTER below to cover pre-existing installs
+      -- PROGRAMFTE handled by repair_programs_programfte()
     );
-    CREATE TABLE IF NOT EXISTS TEAMS (
-      TEAMID STRING PRIMARY KEY,
-      TEAMNAME STRING,
-      PROGRAMID STRING,
-      COSTPERFTE NUMBER(18,2)
-      -- TEAMFTE added via ALTER below
+    CREATE TABLE IF NOT EXISTS {teams} (
+      TEAMID      STRING PRIMARY KEY,
+      TEAMNAME    STRING,
+      PROGRAMID   STRING,
+      COSTPERFTE  NUMBER(18,2),
+      TEAMFTE     NUMBER(18,2) DEFAULT 0
     );
-    CREATE TABLE IF NOT EXISTS INVOICES (
-      INVOICEID STRING PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS {invoices} (
+      INVOICEID     STRING PRIMARY KEY,
       APPLICATIONID STRING,
-      TEAMID STRING,
-      INVOICEDATE DATE,
-      RENEWALDATE DATE,
-      AMOUNT NUMBER(18,2),
-      STATUS STRING,
-      VENDOR STRING
+      TEAMID        STRING,
+      INVOICEDATE   DATE,
+      RENEWALDATE   DATE,
+      AMOUNT        NUMBER(18,2),
+      STATUS        STRING,
+      VENDOR        STRING
     );
-    CREATE TABLE IF NOT EXISTS VENDORS (
-      VENDORID STRING PRIMARY KEY,
+    CREATE TABLE IF NOT EXISTS {vendors} (
+      VENDORID   STRING PRIMARY KEY,
       VENDORNAME STRING
     );
     """
@@ -119,9 +149,54 @@ def ensure_tables():
         if s:
             execute(s)
 
-    # Always attempt to add the newer columns (no-op if already there)
-    execute("ALTER TABLE IF EXISTS PROGRAMS ADD COLUMN IF NOT EXISTS PROGRAMFTE NUMBER(18,2) DEFAULT 0;")
-    execute("ALTER TABLE IF EXISTS TEAMS    ADD COLUMN IF NOT EXISTS TEAMFTE    NUMBER(18,2) DEFAULT 0;")
+    # 🔧 Repair/ensure PROGRAMFTE specifically (no ambiguous IF NOT EXISTS)
+    repair_programs_programfte()
+
+def repair_programs_programfte():
+    """
+    Ensure PROGRAMS has exactly one canonical PROGRAMFTE (NUMBER(18,2) DEFAULT 0).
+    Handles mis-cased/quoted duplicates safely without using ambiguous 'ADD COLUMN IF NOT EXISTS'.
+    """
+    programs = _fq("PROGRAMS")
+    # Which columns case-insensitively equal 'programfte'?
+    cols = fetch_df(f"""
+        SELECT COLUMN_NAME
+        FROM {programs.split('.')[0]}.INFORMATION_SCHEMA.COLUMNS
+        WHERE TABLE_CATALOG = CURRENT_DATABASE()
+          AND TABLE_SCHEMA  = CURRENT_SCHEMA()
+          AND TABLE_NAME    = 'PROGRAMS'
+          AND LOWER(COLUMN_NAME) = 'programfte'
+        ORDER BY ORDINAL_POSITION;
+    """)["COLUMN_NAME"].tolist()
+
+    if not cols:
+        # No column at all -> create canonical
+        execute(f"ALTER TABLE {programs} ADD COLUMN PROGRAMFTE NUMBER(18,2) DEFAULT 0;")
+        return
+
+    if len(cols) == 1:
+        only = cols[0]
+        if only != "PROGRAMFTE":
+            # Rename the quoted/mis-cased one to canonical
+            execute(f'ALTER TABLE {programs} RENAME COLUMN "{only}" TO PROGRAMFTE;')
+        # else already correct
+        return
+
+    # Multiple variants exist -> consolidate
+    # 1) Create a temp canonical column
+    execute(f"ALTER TABLE {programs} ADD COLUMN PROGRAMFTE_CANON NUMBER(18,2) DEFAULT 0;")
+
+    # 2) Merge data from all variants into temp
+    coalesce_chain = "COALESCE(" + ", ".join([f'"{c}"' for c in cols if c != "PROGRAMFTE_CANON"]) + ")"
+    execute(f"UPDATE {programs} SET PROGRAMFTE_CANON = {coalesce_chain};")
+
+    # 3) Drop old variants
+    for c in cols:
+        execute(f'ALTER TABLE {programs} DROP COLUMN "{c}";')
+
+    # 4) Rename temp to canonical
+    execute(f"ALTER TABLE {programs} RENAME COLUMN PROGRAMFTE_CANON TO PROGRAMFTE;")
+
 
 # -----------------------
 # Upserts / Deletes
@@ -147,9 +222,6 @@ def delete_program(program_id: str):
     execute("DELETE FROM PROGRAMS WHERE PROGRAMID = %s;", (program_id,))
 
 def upsert_team(team_id: str, team_name: str, program_id: str, cost_per_fte: float = 0.0, team_fte: float = 0.0):
-    """
-    Upsert a team, including TEAMFTE persistence.
-    """
     sql = """
     MERGE INTO TEAMS t
     USING (
@@ -202,9 +274,14 @@ def upsert_vendor(vendor_id: str, vendor_name: str):
 def delete_vendor(vendor_id: str):
     execute("DELETE FROM VENDORS WHERE VENDORID = %s;", (vendor_id,))
 
+
+# ------------------------------
+# (Optional) legacy guards kept for compatibility
+# ------------------------------
 def ensure_programs_schema():
-    # Safe/idempotent: adds column only if missing
-    execute("ALTER TABLE IF EXISTS PROGRAMS ADD COLUMN IF NOT EXISTS PROGRAMFTE NUMBER(18,2) DEFAULT 0;")
+    # no-op kept for compatibility; use repair_programs_programfte() instead
+    repair_programs_programfte()
 
 def ensure_teams_schema():
-    execute("ALTER TABLE IF EXISTS TEAMS ADD COLUMN IF NOT EXISTS TEAMFTE NUMBER(18,2) DEFAULT 0;")
+    # TEAMFTE is already part of CREATE TABLE TEAMS above (DEFAULT 0); nothing else needed here
+    pass
