@@ -9,7 +9,7 @@ from typing import Dict
 
 from snowflake_db import ensure_tables, fetch_df, upsert_team, delete_team
 
-st.set_page_config(page_title="Teams", page_icon="👥", layout="wide")
+
 st.title("👥 Team Composition")
 
 # -----------------------------------------------------------------------------

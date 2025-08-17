@@ -7,6 +7,7 @@ import streamlit as st
 
 from snowflake_db import ensure_tables as _ensure_tables, fetch_df
 
+
 st.set_page_config(page_title="Summary & Quick Edit Links", page_icon="🧭", layout="wide")
 st.title("🧭 Summary & Quick Edit Links")
 

@@ -6,10 +6,11 @@ from snowflake.connector.errors import ProgrammingError
 
 from snowflake_db import (
     ensure_tables as _ensure_tables,
-    ensure_programs_schema,
+    ensure_programs_schema,   # <-- make sure this exists in snowflake_db.py
     fetch_df,
     upsert_program,
     delete_program,
+    execute,                  # used for one-time ALTER if needed
 )
 
 st.set_page_config(page_title="Programs", page_icon="🏢", layout="wide")
@@ -19,34 +20,34 @@ st.title("🏢 Programs")
 # Init (only once per session)
 # -----------------------------
 if not st.session_state.get("_init_programs_done"):
-    _ensure_tables()             # create base tables if missing
+    _ensure_tables()  # create base tables if missing; will also try to add PROGRAMFTE
     st.session_state["_init_programs_done"] = True
-
-# Always try to ensure the column exists before any SELECT
-ensure_programs_schema()
 
 st.session_state.setdefault("programs", [])
 
 # -----------------------------
-# Cached loader with auto-repair
+# Cached raw SELECT
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def _select_programs():
-    return fetch_df("""
+    return fetch_df(
+        """
         SELECT PROGRAMID, PROGRAMNAME, PROGRAMOWNER, PROGRAMFTE
         FROM PROGRAMS
         ORDER BY PROGRAMNAME;
-    """)
+        """
+    )
 
 def get_programs_df():
+    """Try select; if PROGRAMFTE missing, add it and retry once."""
     try:
         return _select_programs()
     except ProgrammingError as e:
-        # If PROGRAMFTE doesn't exist, add it and retry once
         msg = str(e).lower()
         if "invalid identifier" in msg and "programfte" in msg:
-            ensure_programs_schema()
-            _select_programs.clear()  # clear cached failure just in case
+            # Self-heal: add the column, clear cache, retry once
+            execute("ALTER TABLE IF EXISTS PROGRAMS ADD COLUMN IF NOT EXISTS PROGRAMFTE NUMBER(18,2) DEFAULT 0;")
+            _select_programs.clear()
             return _select_programs()
         raise
 
@@ -61,7 +62,7 @@ def _sync_program_names(df):
             st.session_state["programs"].append(n)
 
 # -----------------------------
-# Load (cached)
+# Load (with auto-repair)
 # -----------------------------
 prog_df = get_programs_df()
 name_to_id: Dict[str, str] = dict(zip(prog_df["PROGRAMNAME"], prog_df["PROGRAMID"])) if not prog_df.empty else {}

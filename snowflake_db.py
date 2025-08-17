@@ -89,15 +89,15 @@ def ensure_tables():
     CREATE TABLE IF NOT EXISTS PROGRAMS (
       PROGRAMID STRING PRIMARY KEY,
       PROGRAMNAME STRING,
-      PROGRAMOWNER STRING,
-      PROGRAMFTE NUMBER(18,2) DEFAULT 0
+      PROGRAMOWNER STRING
+      -- PROGRAMFTE added via ALTER below to cover pre-existing installs
     );
     CREATE TABLE IF NOT EXISTS TEAMS (
       TEAMID STRING PRIMARY KEY,
       TEAMNAME STRING,
       PROGRAMID STRING,
-      COSTPERFTE NUMBER(18,2),
-      TEAMFTE NUMBER(18,2) DEFAULT 0
+      COSTPERFTE NUMBER(18,2)
+      -- TEAMFTE added via ALTER below
     );
     CREATE TABLE IF NOT EXISTS INVOICES (
       INVOICEID STRING PRIMARY KEY,
@@ -118,6 +118,10 @@ def ensure_tables():
         s = stmt.strip()
         if s:
             execute(s)
+
+    # Always attempt to add the newer columns (no-op if already there)
+    execute("ALTER TABLE IF EXISTS PROGRAMS ADD COLUMN IF NOT EXISTS PROGRAMFTE NUMBER(18,2) DEFAULT 0;")
+    execute("ALTER TABLE IF EXISTS TEAMS    ADD COLUMN IF NOT EXISTS TEAMFTE    NUMBER(18,2) DEFAULT 0;")
 
 # -----------------------
 # Upserts / Deletes

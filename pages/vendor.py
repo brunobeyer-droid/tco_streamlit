@@ -8,6 +8,7 @@ import uuid
 
 from snowflake_db import ensure_tables, fetch_df, upsert_vendor, delete_vendor
 
+
 st.set_page_config(page_title="Vendor Management", page_icon="🏷️", layout="wide")
 st.title("🏷️ Vendor Management")
 
