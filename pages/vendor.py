@@ -1,7 +1,8 @@
 import streamlit as st
 import uuid
 from snowflake_db import ensure_tables as _ensure_tables, fetch_df, upsert_vendor
-
+from utils.sidebar import render_global_actions
+render_global_actions()
 st.set_page_config(page_title="Vendors", page_icon="🏷️", layout="wide")
 st.title("🏷️ Vendors")
 

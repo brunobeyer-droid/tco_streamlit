@@ -6,6 +6,8 @@ import streamlit as st
 # sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from snowflake_db import ensure_tables as _ensure_tables, fetch_df
+from utils.sidebar import render_global_actions
+render_global_actions()
 
 st.set_page_config(page_title="TCO Summary", page_icon="📊", layout="wide")
 st.title("📊 TCO Summary")

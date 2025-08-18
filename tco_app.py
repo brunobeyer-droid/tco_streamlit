@@ -2,6 +2,7 @@
 import streamlit as st
 import snowflake.connector
 import os
+from utils.app_refresh import refresh_all_data
 
 # Load credentials from environment variables
 conn = snowflake.connector.connect(
@@ -27,6 +28,15 @@ st.set_page_config(
     page_icon="📊",
 )
 
+st.session_state.setdefault("db_rev", 0)
+
+with st.sidebar:
+    st.header("Actions")
+    if st.button("🔄 Refresh All Data", use_container_width=True):
+        refresh_all_data()
+        st.success("Caches cleared. Data will be reloaded from Snowflake.")
+        st.rerun()
+        
 st.title("Application Total Cost of Ownership (TCO) Calculator")
 
 st.sidebar.success("Select a page above.")

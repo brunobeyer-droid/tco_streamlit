@@ -3,14 +3,14 @@ import streamlit as st
 import uuid
 from typing import Dict
 from snowflake.connector.errors import ProgrammingError
-
+from utils.sidebar import render_global_actions
 from snowflake_db import (
     ensure_tables as _ensure_tables,
     fetch_df,
     upsert_program,
     execute,
 )
-
+render_global_actions()
 st.set_page_config(page_title="Programs", page_icon="🏢", layout="wide")
 st.title("🏢 Programs")
 
@@ -61,21 +61,22 @@ _sync_program_names(prog_df)
 st.caption("Writes happen only when you click **Save Program**. Reads are cached.")
 
 # ---------- Add Program ----------
+# Add Program (aligned)
 st.subheader("Add Program")
 
-c1, c2, c3 = st.columns([2.8, 2, 1.2], gap="small")
-with c1:
-    new_name = st.text_input("Program Name", key="add_name")
-with c2:
-    new_owner = st.text_input("Program Owner (optional)", key="add_owner")
-with c3:
-    new_fte = st.number_input("Program FTE", min_value=0.0, step=0.5, value=0.0, key="add_fte")
+with st.form("add_program_form", clear_on_submit=True):
+    c1, c2, c3, c4 = st.columns([2.4, 2, 1.1, 0.9], gap="small")
+    with c1:
+        new_name = st.text_input("Program Name", placeholder="e.g. R&D", label_visibility="collapsed")
+    with c2:
+        new_owner = st.text_input("Program Owner (optional)", placeholder="e.g. Jane Doe", label_visibility="collapsed")
+    with c3:
+        new_fte = st.number_input("Program FTE", min_value=0.0, step=0.5, value=0.0, label_visibility="collapsed")
+    with c4:
+        save_prog = st.form_submit_button("Save Program", type="primary", use_container_width=True)
 
-# Save button BELOW the fields
-save_col = st.columns([1])[0]
-with save_col:
-    if st.button("Save Program", type="primary"):
-        if not new_name.strip():
+    if save_prog:
+        if not (new_name or "").strip():
             st.warning("Please provide a Program Name.")
         else:
             pname = new_name.strip()
@@ -91,6 +92,7 @@ with save_col:
             invalidate_programs_cache()
             st.success(f"Saved program '{pname}'.")
             st.rerun()
+
 
 st.divider()
 

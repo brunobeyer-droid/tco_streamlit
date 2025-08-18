@@ -3,7 +3,8 @@ import pandas as pd
 import uuid
 from datetime import date
 from snowflake_db import ensure_tables as _ensure_tables, fetch_df, upsert_invoice
-
+from utils.sidebar import render_global_actions
+render_global_actions()
 st.set_page_config(page_title="Invoices", page_icon="🧾", layout="wide")
 st.title("🧾 Invoice Tracking")
 
