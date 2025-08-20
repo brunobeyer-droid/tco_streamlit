@@ -1,70 +1,74 @@
 import streamlit as st
 import uuid
-from snowflake_db import ensure_tables as _ensure_tables, fetch_df, upsert_vendor
-from utils.sidebar import render_global_actions
-render_global_actions()
+from typing import Optional
+from snowflake_db import ensure_tables, fetch_df, upsert_vendor, delete_vendor
+try:
+    from utils.sidebar import render_global_actions
+except Exception:
+    def render_global_actions(): pass
+
 st.set_page_config(page_title="Vendors", page_icon="🏷️", layout="wide")
+render_global_actions()
+
+if "_tco_init" not in st.session_state:
+    ensure_tables()
+    st.session_state["_tco_init"] = True
+
 st.title("🏷️ Vendors")
 
-# Init once
-if not st.session_state.get("_init_vendors_done"):
-    _ensure_tables()
-    st.session_state["_init_vendors_done"] = True
-
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, ttl=180)
 def get_vendors_df():
-    return fetch_df("""
-        SELECT VENDORID, VENDORNAME
-        FROM TCODB.PUBLIC.VENDORS
-        ORDER BY VENDORNAME;
-    """)
+    return fetch_df("SELECT VENDORID, VENDORNAME FROM VENDORS ORDER BY VENDORNAME")
 
-def invalidate_caches():
-    get_vendors_df.clear()
+def _vendor_id_for_name_ci(name: str) -> Optional[str]:
+    if not name:
+        return None
+    df = fetch_df("SELECT VENDORID FROM VENDORS WHERE UPPER(VENDORNAME)=UPPER(%s) LIMIT 1", (name.strip(),))
+    if df is not None and not df.empty:
+        return str(df.iloc[0]["VENDORID"])
+    return None
 
-# ---------------- Add Vendor (create only) ----------------
-st.subheader("Add Vendor")
-c1, = st.columns([3])
-with c1:
-    vendor_name = st.text_input("Vendor Name")
+with st.expander("➕ Add / Edit Vendor", expanded=True):
+    existing = get_vendors_df()
+    options = ["(new)"] + (existing["VENDORNAME"].tolist() if existing is not None and not existing.empty else [])
+    choice = st.selectbox("Select Vendor to edit", options)
 
-if st.button("Save Vendor", type="primary"):
-    if not vendor_name.strip():
-        st.warning("Please provide a Vendor Name.")
+    if choice == "(new)":
+        vendor_id = None
+        vendor_name = st.text_input("Vendor Name")
     else:
-        upsert_vendor(vendor_id=str(uuid.uuid4()), vendor_name=vendor_name.strip())
-        st.success(f"Vendor '{vendor_name.strip()}' added.")
-        invalidate_caches()
-        st.rerun()
+        row = existing.loc[existing["VENDORNAME"] == choice].iloc[0]
+        vendor_id = row["VENDORID"]
+        vendor_name = st.text_input("Vendor Name", value=row["VENDORNAME"] or "")
 
-st.divider()
+    c1, c2 = st.columns(2)
+    if c1.button("💾 Save Vendor"):
+        name = (vendor_name or "").strip()
+        if not name:
+            st.error("Vendor Name is required.")
+        else:
+            # Uniqueness on VENDORNAME (case-insensitive)
+            existing_id = _vendor_id_for_name_ci(name)
+            if existing_id and existing_id != (vendor_id or ""):
+                st.error(f"A Vendor named '{name}' already exists. Vendor names must be unique.")
+            else:
+                try:
+                    vid = vendor_id or str(uuid.uuid4())
+                    upsert_vendor(vid, name)
+                    st.cache_data.clear()
+                    st.success("Vendor saved.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Save failed: {e}")
 
-# ---------------- Filters + List ----------------
-st.subheader("Vendors")
+    if vendor_id and c2.button("🗑️ Delete Vendor"):
+        try:
+            delete_vendor(vendor_id)
+            st.cache_data.clear()
+            st.warning("Vendor deleted.")
+            st.rerun()
+        except Exception as e:
+            st.error(f"Delete failed: {e}")
 
-df = get_vendors_df()
-
-with st.expander("Filters", expanded=True):
-    col1, col2 = st.columns([2, 1])
-    with col1:
-        query = st.text_input("Vendor name contains", placeholder="e.g. Atlassian, Microsoft...")
-    with col2:
-        sort_dir = st.selectbox("Sort", ["A → Z", "Z → A"])
-
-fdf = df.copy()
-if not fdf.empty and query:
-    fdf = fdf[fdf["VENDORNAME"].str.contains(query, case=False, na=False)]
-
-if sort_dir == "A → Z":
-    fdf = fdf.sort_values("VENDORNAME", ascending=True)
-else:
-    fdf = fdf.sort_values("VENDORNAME", ascending=False)
-
-st.metric("Vendors", int(fdf.shape[0]) if not fdf.empty else 0)
-st.divider()
-
-if fdf.empty:
-    st.info("No vendors found for the selected filters.")
-else:
-    show = fdf.rename(columns={"VENDORNAME": "Vendor"})[["Vendor"]]
-    st.dataframe(show, use_container_width=True)
+st.subheader("All Vendors")
+st.dataframe(get_vendors_df(), use_container_width=True)

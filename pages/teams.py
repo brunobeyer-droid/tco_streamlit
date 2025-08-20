@@ -1,166 +1,198 @@
-# filename: pages/teams.py
-import uuid
+# pages/Teams.py
 import streamlit as st
-from snowflake_db import ensure_tables as _ensure_tables, fetch_df, upsert_team
-from utils.sidebar import render_global_actions
-render_global_actions()
+import uuid
+from typing import Optional
+
+from snowflake_db import ensure_tables, fetch_df, execute
+
+try:
+    from utils.sidebar import render_global_actions
+except Exception:
+    def render_global_actions():
+        pass
+
 st.set_page_config(page_title="Teams", page_icon="👥", layout="wide")
+render_global_actions()
+ensure_tables()
+
+# --- Ensure columns exist (idempotent) ---
+execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
+execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
+execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS CONTRACTOR_CS FLOAT")
+execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS PRODUCTOWNER STRING")
+
 st.title("👥 Teams")
 
-# One-time init
-if not st.session_state.get("_init_teams_done"):
-    _ensure_tables()
-    st.session_state["_init_teams_done"] = True
+@st.cache_data(ttl=180, show_spinner=False)
+def _programs_df():
+    return fetch_df("SELECT PROGRAMID, PROGRAMNAME FROM PROGRAMS ORDER BY PROGRAMNAME")
 
-# Global revision used for cache-busting across pages
-st.session_state.setdefault("db_rev", 0)
-REV = st.session_state["db_rev"]
+@st.cache_data(ttl=60, show_spinner=False)
+def _teams_df():
+    return fetch_df(
+        """
+        SELECT TEAMID, TEAMNAME, PROGRAMID, TEAMFTE,
+               DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS,
+               PRODUCTOWNER
+        FROM TEAMS
+        ORDER BY TEAMNAME
+        """
+    )
 
-# ---------------- Cache loaders (include REV so they refetch after writes) ----------------
-@st.cache_data(show_spinner=False)
-def get_programs_df(_rev: int):
-    return fetch_df("""
-        SELECT PROGRAMID, PROGRAMNAME
-        FROM TCODB.PUBLIC.PROGRAMS
-        ORDER BY PROGRAMNAME;
-    """)
+def _team_id_for_name_ci(name: str) -> Optional[str]:
+    if not name:
+        return None
+    df = fetch_df("SELECT TEAMID FROM TEAMS WHERE UPPER(TEAMNAME)=UPPER(%s) LIMIT 1", (name.strip(),))
+    if df is not None and not df.empty:
+        return str(df.iloc[0]["TEAMID"])
+    return None
 
-@st.cache_data(show_spinner=False)
-def get_teams_df_joined(_rev: int):
-    # Show '(Unknown Program)' instead of NULL so rows aren't silently filtered away
-    return fetch_df("""
-        SELECT
-          t.TEAMID,
-          t.TEAMNAME,
-          t.PROGRAMID,
-          COALESCE(p.PROGRAMNAME, '(Unknown Program)') AS PROGRAMNAME,
-          t.TEAMFTE,
-          t.COSTPERFTE
-        FROM TCODB.PUBLIC.TEAMS t
-        LEFT JOIN TCODB.PUBLIC.PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
-        ORDER BY PROGRAMNAME, t.TEAMNAME;
-    """)
+programs = _programs_df()
 
-@st.cache_data(show_spinner=False)
-def get_teams_df_raw(_rev: int):
-    # Raw table without join (for debugging)
-    return fetch_df("""
-        SELECT TEAMID, TEAMNAME, PROGRAMID, TEAMFTE, COSTPERFTE
-        FROM TCODB.PUBLIC.TEAMS
-        ORDER BY TEAMNAME;
-    """)
+# -------------------------------------------------------------------
+# Add New Team
+# -------------------------------------------------------------------
+with st.expander("➕ Add New Team", expanded=False):
+    teamname = st.text_input("Team Name", key="add_teamname")
+    programid = st.selectbox(
+        "Program",
+        options=(programs["PROGRAMID"].tolist() if programs is not None and not programs.empty else []),
+        format_func=lambda x: programs.loc[programs["PROGRAMID"] == x, "PROGRAMNAME"].values[0]
+        if programs is not None and not programs.empty else "",
+        key="add_programid",
+    )
+    product_owner = st.text_input("Product Owner (required)", key="add_product_owner")
+    teamfte = st.number_input("Team FTE", min_value=0.0, step=0.1, key="add_teamfte")
+    delivery_team_fte = st.number_input("Delivery Team FTE", min_value=0.0, step=0.1, key="add_delivery_team_fte")
+    contractor_c_fte = st.number_input("Contractor C FTE", min_value=0.0, step=0.1, key="add_contractor_c_fte")
+    contractor_cs = st.number_input("Contractor CS", min_value=0.0, step=0.1, key="add_contractor_cs")
 
-def _invalidate_all():
-    get_programs_df.clear()
-    get_teams_df_joined.clear()
-    get_teams_df_raw.clear()
-    st.session_state["db_rev"] = st.session_state.get("db_rev", 0) + 1
-
-# ---------------- Manual refresh ----------------
-if st.button("🔄 Refresh data (force reload)"):
-    _invalidate_all()
-    st.rerun()
-
-# ---------------- Add Team (create only) ----------------
-# Add Team (aligned)
-st.subheader("Add Team")
-
-prog_df = get_programs_df(st.session_state["db_rev"])
-if prog_df.empty:
-    st.warning("No programs found. Please add a Program first.")
-else:
-    with st.form("add_team_form", clear_on_submit=True):
-        c1, c2, c3, c4, c5 = st.columns([2.4, 2, 1.2, 1.2, 1.0], gap="small")
-        with c1:
-            team_name_in = st.text_input("Team Name", placeholder="e.g. Core Platform", label_visibility="collapsed")
-        with c2:
-            prog_display = prog_df["PROGRAMNAME"].tolist()
-            prog_pick = st.selectbox("Program", options=prog_display, label_visibility="collapsed")
-            program_id = prog_df.set_index("PROGRAMNAME").loc[prog_pick, "PROGRAMID"]
-        with c3:
-            team_fte = st.number_input("Team FTE", min_value=0.0, step=0.5, value=0.0, label_visibility="collapsed")
-        with c4:
-            cost_per_fte = st.number_input("Cost / FTE", min_value=0.0, step=100.0, value=0.0, label_visibility="collapsed")
-        with c5:
-            save_team = st.form_submit_button("Save Team", type="primary", use_container_width=True)
-
-        if save_team:
-            team_name = (team_name_in or "").strip()
-            if not team_name:
-                st.warning("Please provide a Team Name.")
+    if st.button("Create Team", key="add_create_btn"):
+        name = (teamname or "").strip()
+        po = (product_owner or "").strip()
+        if not name:
+            st.error("Team Name is required.")
+        elif not programid:
+            st.error("Program is required.")
+        elif not po:
+            st.error("Product Owner is required.")
+        else:
+            # Uniqueness on TEAMNAME (case-insensitive)
+            existing_id = _team_id_for_name_ci(name)
+            if existing_id:
+                st.error(f"A Team named '{name}' already exists. Team names must be unique.")
             else:
-                # Duplicate check (case/trim-insensitive)
-                existing = fetch_df("""
-                    SELECT 1
-                    FROM TCODB.PUBLIC.TEAMS
-                    WHERE PROGRAMID = %s
-                      AND UPPER(TRIM(TEAMNAME)) = UPPER(TRIM(%s))
-                    LIMIT 1;
-                """, (str(program_id), team_name))
-                if not existing.empty:
-                    st.warning(f"Team '{team_name}' already exists in program '{prog_pick}'.")
-                else:
-                    upsert_team(
-                        team_id=str(uuid.uuid4()),
-                        team_name=team_name,
-                        program_id=str(program_id),
-                        cost_per_fte=float(cost_per_fte or 0.0),
-                        team_fte=float(team_fte or 0.0),
+                try:
+                    teamid = str(uuid.uuid4())
+                    execute(
+                        """
+                        INSERT INTO TEAMS (TEAMID, TEAMNAME, PROGRAMID, TEAMFTE,
+                                           DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS,
+                                           PRODUCTOWNER)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                        """,
+                        (teamid, name, programid, teamfte, delivery_team_fte, contractor_c_fte, contractor_cs, po),
                     )
-                    st.success(f"Team '{team_name}' added to program '{prog_pick}'.")
-                    _invalidate_all()
+                    st.success("Team created.")
+                    st.cache_data.clear()
                     st.rerun()
+                except Exception as e:
+                    st.error(f"Create failed: {e}")
 
+# -------------------------------------------------------------------
+# Edit Existing Team
+# -------------------------------------------------------------------
+with st.expander("✏️ Edit Existing Team", expanded=True):
+    teams = _teams_df()
+    if teams is not None and not teams.empty:
+        selected = st.selectbox("Select Team", teams["TEAMNAME"], key="edit_select_team")
+        row = teams[teams["TEAMNAME"] == selected].iloc[0]
 
-st.divider()
+        new_name = st.text_input("Team Name", value=row["TEAMNAME"], key="edit_teamname")
+        new_product_owner = st.text_input("Product Owner (required)", value=row.get("PRODUCTOWNER") or "", key="edit_product_owner")
+        new_fte = st.number_input("Team FTE", value=float(row["TEAMFTE"] or 0), step=0.1, key="edit_teamfte")
+        new_delivery = st.number_input("Delivery Team FTE", value=float(row["DELIVERY_TEAM_FTE"] or 0), step=0.1, key="edit_delivery_team_fte")
+        new_cc = st.number_input("Contractor C FTE", value=float(row["CONTRACTOR_C_FTE"] or 0), step=0.1, key="edit_contractor_c_fte")
+        new_cs = st.number_input("Contractor CS", value=float(row["CONTRACTOR_CS"] or 0), step=0.1, key="edit_contractor_cs")
 
-# ---------------- Filters + List ----------------
-st.subheader("Teams")
+        if st.button("Update Team", key="edit_update_btn"):
+            name = (new_name or "").strip()
+            po = (new_product_owner or "").strip()
+            if not name:
+                st.error("Team Name is required.")
+            elif not po:
+                st.error("Product Owner is required.")
+            else:
+                # Ensure uniqueness against other rows
+                existing_id = _team_id_for_name_ci(name)
+                if existing_id and existing_id != row["TEAMID"]:
+                    st.error(f"A Team named '{name}' already exists. Team names must be unique.")
+                else:
+                    try:
+                        execute(
+                            """
+                            UPDATE TEAMS
+                            SET TEAMNAME=%s, TEAMFTE=%s, DELIVERY_TEAM_FTE=%s, CONTRACTOR_C_FTE=%s, CONTRACTOR_CS=%s,
+                                PRODUCTOWNER=%s
+                            WHERE TEAMID=%s
+                            """,
+                            (name, new_fte, new_delivery, new_cc, new_cs, po, row["TEAMID"]),
+                        )
+                        st.success("Team updated.")
+                        st.cache_data.clear()
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"Update failed: {e}")
+    else:
+        st.info("No teams yet.")
 
-df = get_teams_df_joined(st.session_state["db_rev"])
+# -------------------------------------------------------------------
+# Delete Team (blocked if linked groups or invoices exist)
+# -------------------------------------------------------------------
+with st.expander("🗑️ Delete Team", expanded=False):
+    teams = _teams_df()
+    if teams is not None and not teams.empty:
+        selected = st.selectbox("Select Team to Delete", teams["TEAMNAME"], key="delete_select_team")
+        row = teams[teams["TEAMNAME"] == selected].iloc[0]
 
-with st.expander("Filters", expanded=True):
-    col1, col2, col3, col4 = st.columns([2, 2, 2, 2])
-    with col1:
-        programs = sorted(df["PROGRAMNAME"].dropna().unique().tolist()) if not df.empty else []
-        # By default select ALL visible programs (including '(Unknown Program)')
-        sel_programs = st.multiselect("Program(s)", options=programs, default=programs)
-    with col2:
-        text = st.text_input("Team name contains", placeholder="e.g. Core, Payments...")
-    with col3:
-        fte_filter = st.selectbox("FTE filter", ["All", "> 0", "= 0"])
-    with col4:
-        show_unknown = st.checkbox("Show '(Unknown Program)' rows", value=True,
-                                   help="These indicate teams whose PROGRAMID doesn't match any PROGRAMS row.")
+        # Check dependencies: application groups linked to this team
+        dep_groups_df = fetch_df("SELECT COUNT(*) AS CNT FROM APPLICATION_GROUPS WHERE TEAMID=%s", (row["TEAMID"],))
+        group_count = int(dep_groups_df.iloc[0]["CNT"]) if dep_groups_df is not None and not dep_groups_df.empty else 0
 
-fdf = df.copy()
-if not fdf.empty:
-    if not show_unknown:
-        fdf = fdf[fdf["PROGRAMNAME"] != "(Unknown Program)"]
-    if sel_programs:
-        fdf = fdf[fdf["PROGRAMNAME"].isin(sel_programs)]
-    if text:
-        fdf = fdf[fdf["TEAMNAME"].str.contains(text, case=False, na=False)]
-    if fte_filter == "> 0":
-        fdf = fdf[(fdf["TEAMFTE"].fillna(0) > 0)]
-    elif fte_filter == "= 0":
-        fdf = fdf[(fdf["TEAMFTE"].fillna(0) == 0)]
+        # Check dependencies: invoices linked to this team
+        dep_inv_df = fetch_df("SELECT COUNT(*) AS CNT FROM INVOICES WHERE TEAMID=%s", (row["TEAMID"],))
+        inv_count = int(dep_inv_df.iloc[0]["CNT"]) if dep_inv_df is not None and not dep_inv_df.empty else 0
 
-m1, m2, m3 = st.columns(3)
-with m1: st.metric("Teams", int(fdf.shape[0]) if not fdf.empty else 0)
-with m2: st.metric("Programs", fdf["PROGRAMNAME"].nunique() if not fdf.empty else 0)
-with m3: st.metric("Total FTE", f"{float(fdf['TEAMFTE'].fillna(0).sum()) if not fdf.empty else 0.0:,.2f}")
+        if group_count > 0 or inv_count > 0:
+            reasons = []
+            if group_count > 0:
+                reasons.append(f"{group_count} application group(s)")
+            if inv_count > 0:
+                reasons.append(f"{inv_count} invoice(s)")
+            reason_text = " and ".join(reasons)
+            st.warning(
+                f"Cannot delete **{row['TEAMNAME']}** because it has **{reason_text}** linked. "
+                f"Delete or reassign those dependencies first."
+            )
+            st.button("Delete Selected Team", type="secondary", key="delete_btn_disabled", disabled=True)
+        else:
+            if st.button("Delete Selected Team", type="secondary", key="delete_btn"):
+                try:
+                    execute("DELETE FROM TEAMS WHERE TEAMID=%s", (row["TEAMID"],))
+                    st.warning("Team deleted.")
+                    st.cache_data.clear()
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+    else:
+        st.info("No teams to delete.")
 
-st.divider()
-
-if fdf.empty:
-    st.info("No teams found for the selected filters.")
-else:
-    show = fdf.rename(columns={
-        "PROGRAMNAME": "Program",
-        "TEAMNAME": "Team",
-        "TEAMFTE": "FTE",
-    })[["Program", "Team", "FTE"]]
-    st.dataframe(show, use_container_width=True, hide_index=True)
-
-
+# -------------------------------------------------------------------
+# Existing Teams (separate section after Delete)
+# -------------------------------------------------------------------
+with st.expander("📋 Existing Teams", expanded=False):
+    teams_table = _teams_df()
+    if teams_table is not None and not teams_table.empty:
+        st.dataframe(teams_table, use_container_width=True, hide_index=True)
+    else:
+        st.info("No teams yet.")

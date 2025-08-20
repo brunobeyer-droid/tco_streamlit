@@ -246,9 +246,8 @@ def _select_team_group_app(prefix: str) -> Tuple[Optional[str], Optional[str], O
         return sel_program_id, sel_team_id, sel_team_name, sel_group_id, None
 
     apps_df = apps_df.copy()
-    # Use ADD_INFO (replaces legacy SITE)
     apps_df["LABEL"] = apps_df.apply(
-        lambda r: f"{r['APPLICATIONNAME']}" + (f" — {r['ADD_INFO']}" if r.get("ADD_INFO") else ""),
+        lambda r: f"{r['APPLICATIONNAME']}" + (f" — {r['SITE']}" if r.get("SITE") else ""),
         axis=1
     )
     app_labels = apps_df["LABEL"].tolist()
@@ -478,7 +477,7 @@ def _search_invoices_enriched(
         where.append("i.STATUS = %s")
         params.append(status_filter)
     if invoice_type_filter and invoice_type_filter in ("Recurring Invoice", "Ad Hoc Invoice"):
-        where.append("COALESCE(i.INVOICE_TYPE, 'Recurring Invoice') = %s")
+        where.append("COALESCE(i.INVOICE_TYPE,'Recurring Invoice') = %s")
         params.append(invoice_type_filter)
     if agreement_like and agreement_like.strip():
         where.append("i.AGREEMENT_NUMBER ILIKE %s")
@@ -505,7 +504,6 @@ def _search_invoices_enriched(
     order_parts.extend(["t.TEAMNAME", "g.GROUPNAME", "a.APPLICATIONNAME"])
     order_sql = "ORDER BY " + ", ".join(order_parts)
 
-    # NOTE: replaced a.SITE with a.ADD_INFO
     sql = f"""
         SELECT
             i.INVOICEID,
@@ -517,7 +515,7 @@ def _search_invoices_enriched(
             i.AGREEMENT_NUMBER,
             t.TEAMID, t.TEAMNAME,
             g.GROUPID, g.GROUPNAME,
-            a.APPLICATIONID, a.APPLICATIONNAME, a.ADD_INFO, a.VENDORID
+            a.APPLICATIONID, a.APPLICATIONNAME, a.SITE, a.VENDORID
         FROM INVOICES i
         LEFT JOIN TEAMS t              ON t.TEAMID  = i.TEAMID
         LEFT JOIN APPLICATIONS a       ON a.APPLICATIONID = i.APPLICATIONID
@@ -540,9 +538,8 @@ def _search_invoices_enriched(
         return f"{typ} - {r.get('STATUS','')} - {float(amt):.2f} KUSD - {dte_str}"
 
     df["INVOICE_NAME"] = df.apply(_mk_label, axis=1)
-    # Use ADD_INFO instead of legacy SITE
     df["APP_LABEL"] = df.apply(
-        lambda r: f"{r['APPLICATIONNAME']}" + (f" — {r['ADD_INFO']}" if r.get("ADD_INFO") else ""),
+        lambda r: f"{r['APPLICATIONNAME']}" + (f" — {r['SITE']}" if r.get("SITE") else ""),
         axis=1
     )
 
@@ -692,8 +689,7 @@ with tab_search:
             apps = cached_list_applications()
         apps = apps.copy()
         if not apps.empty:
-            # Use ADD_INFO for label (legacy SITE removed)
-            apps["LABEL"] = apps.apply(lambda r: f"{r['APPLICATIONNAME']}" + (f" — {r['ADD_INFO']}" if r.get("ADD_INFO") else ""), axis=1)
+            apps["LABEL"] = apps.apply(lambda r: f"{r['APPLICATIONNAME']}" + (f" — {r['SITE']}" if r.get("SITE") else ""), axis=1)
         app_labels = ["All"] + (apps["LABEL"].tolist() if not apps.empty else [])
         sel_app_label = st.selectbox("Application Instance", options=app_labels, index=0, key="search_app")
         app_id_s = None
@@ -769,7 +765,7 @@ with tab_search:
         page_size = 12  # cards per page (grid)
         total = len(res)
         pages = max(1, (total + page_size - 1) // page_size)
-        pcol1, pcol2, _ = st.columns([0.2, 0.3, 0.5])
+        pcol1, pcol2, pcol3 = st.columns([0.2, 0.3, 0.5])
         with pcol1:
             page_num = st.number_input("Page", min_value=1, max_value=pages, value=1, step=1, key="search_page_num")
         with pcol2:
@@ -780,55 +776,58 @@ with tab_search:
         subset = res.iloc[start:end].reset_index(drop=True)
 
         # Grid: 3 cards per row
-        cols_per_row = 3
-        rows = (len(subset) + cols_per_row - 1) // cols_per_row
+    cols_per_row = 3
+    rows = (len(subset) + cols_per_row - 1) // cols_per_row
 
-        for r in range(rows):
-            start_idx = r * cols_per_row
-            end_idx = min(start_idx + cols_per_row, len(subset))
-            row_df = subset.iloc[start_idx:end_idx]
-            cols = st.columns(min(cols_per_row, len(row_df)), gap="small")
+    for r in range(rows):
+        start_idx = r * cols_per_row
+        end_idx = min(start_idx + cols_per_row, len(subset))
+        row_df = subset.iloc[start_idx:end_idx]  # ✅ correct iloc slicing
 
-            for col, (_, rec) in zip(cols, row_df.iterrows()):
-                rid = str(rec["INVOICEID"])
-                with col:
-                    st.markdown(
-                        f"""
-                        <div style="border:1px solid #eee;border-radius:10px;padding:12px;margin-bottom:8px;">
-                          <div style="font-weight:600;margin-bottom:6px;">{rec['Invoice Name']}</div>
-                          <div style="font-size:0.92em;opacity:0.85;">
-                            <b>Team:</b> {rec['Team']}<br/>
-                            <b>Group:</b> {rec['Application Group']}<br/>
-                            <b>App:</b> {rec['Application']}<br/>
-                            <b>FY:</b> {int(rec['Fiscal Year'])}<br/>
-                            <b>Type:</b> {rec.get('Invoice Type','Recurring Invoice')}<br/>
-                            <b>Agreement:</b> {rec.get('Agreement Number') or '—'}
-                          </div>
-                          <div style="margin-top:8px;">
-                        """,
-                        unsafe_allow_html=True
-                    )
-                    bcol1, bcol2 = st.columns([0.5, 0.5])
-                    with bcol1:
-                        if st.button("✏️ Edit", key=f"edit_btn_{rid}"):
-                            _clear_inline_edit_state()
-                            st.session_state["search_edit_invoice_id"] = rid
-                            st.session_state["search_edit_ctx"] = {
-                                "fiscal_year": int(rec["Fiscal Year"]),
-                                "team_id": rec["TEAMID"],
-                                "group_id": rec["GROUPID"],
-                                "application_id": rec["APPLICATIONID"],
-                                "team_name": rec["Team"],
-                                "group_name": rec["Application Group"],
-                                "app_label": rec.get("APP_LABEL") or rec["Application"],
-                                "invoice_label": rec["Invoice Name"],
-                                "invoice_type": rec.get("Invoice Type") or "Recurring Invoice",
-                            }
-                            st.session_state["search_keep_open"] = True
-                            st.rerun()
-                    with bcol2:
-                        st.write("")  # spacer
-                    st.markdown("</div></div>", unsafe_allow_html=True)
+    # Only create as many columns as we actually have cards for this row
+    cols = st.columns(min(cols_per_row, len(row_df)), gap="small")
+
+    for col, (_, rec) in zip(cols, row_df.iterrows()):
+        rid = str(rec["INVOICEID"])
+        with col:
+            st.markdown(
+                f"""
+                <div style="border:1px solid #eee;border-radius:10px;padding:12px;margin-bottom:8px;">
+                  <div style="font-weight:600;margin-bottom:6px;">{rec['Invoice Name']}</div>
+                  <div style="font-size:0.92em;opacity:0.85;">
+                    <b>Team:</b> {rec['Team']}<br/>
+                    <b>Group:</b> {rec['Application Group']}<br/>
+                    <b>App:</b> {rec['Application']}<br/>
+                    <b>FY:</b> {int(rec['Fiscal Year'])}<br/>
+                    <b>Type:</b> {rec.get('Invoice Type','Recurring Invoice')}<br/>
+                    <b>Agreement:</b> {rec.get('Agreement Number') or '—'}
+                  </div>
+                  <div style="margin-top:8px;">
+                """,
+                unsafe_allow_html=True
+            )
+            bcol1, bcol2 = st.columns([0.5, 0.5])
+            with bcol1:
+                if st.button("✏️ Edit", key=f"edit_btn_{rid}"):
+                    _clear_inline_edit_state()
+                    st.session_state["search_edit_invoice_id"] = rid
+                    st.session_state["search_edit_ctx"] = {
+                        "fiscal_year": int(rec["Fiscal Year"]),
+                        "team_id": rec["TEAMID"],
+                        "group_id": rec["GROUPID"],
+                        "application_id": rec["APPLICATIONID"],
+                        "team_name": rec["Team"],
+                        "group_name": rec["Application Group"],
+                        "app_label": rec.get("APP_LABEL") or rec["Application"],
+                        "invoice_label": rec["Invoice Name"],
+                        "invoice_type": rec.get("Invoice Type") or "Recurring Invoice",
+                    }
+                    st.session_state["search_keep_open"] = True
+                    st.rerun()
+            with bcol2:
+                st.write("")  # spacer
+            st.markdown("</div></div>", unsafe_allow_html=True)
+
 
         # Inline edit panel (inside Search) — shown only if opened via Edit button
         inv_id = st.session_state.get("search_edit_invoice_id")

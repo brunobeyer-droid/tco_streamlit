@@ -1,0 +1,264 @@
+"""
+ADO Client for TCO APP
+----------------------
+
+Minimal Azure DevOps client to fetch **Feature** work items and normalize them
+for insertion into your Snowflake `ADO_FEATURES` table.
+
+✅ Works with your current fields:
+   - Effort: "Effort"
+   - Team: "Team"
+   - Application: "Custom_ApplicationName"
+   - Iteration: "Iteration Path" (or similar)
+
+🔧 Can be reconfigured in `.streamlit/secrets.toml`:
+
+[ado]
+organization_url = "https://dev.azure.com/your-org"
+personal_access_token = "azdopat_*********"
+default_project = "YourProject"
+
+# Optional: override the field names if your org uses different ones
+[ado.fields]
+effort = "Effort"
+team = "Team"
+application = "Custom_ApplicationName"
+iteration = "System.IterationPath"         # a safe default
+state = "System.State"                      # don't usually change these
+title = "System.Title"
+id = "System.Id"
+created_date = "System.CreatedDate"
+changed_date = "System.ChangedDate"
+
+Usage (inside a Streamlit page):
+    from ado_client import ADOClient
+    client = ADOClient()
+    ids = client.wiql_features(changed_since="2025-01-01")  # or None
+    df = client.fetch_features_df(ids)
+    # df columns match ADO_FEATURES schema:
+    # FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT
+"""
+
+from __future__ import annotations
+
+import base64
+import time
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+
+import requests
+import pandas as pd
+
+try:
+    # Optional: nice if you're calling this from Streamlit
+    import streamlit as st
+    _HAS_ST = True
+except Exception:
+    _HAS_ST = False
+
+
+API_VERSION = "7.1-preview.2"
+BATCH_API_VERSION = "7.1-preview.1"
+
+
+def _get_secrets() -> Dict:
+    if _HAS_ST and "ado" in st.secrets:
+        cfg = dict(st.secrets["ado"])
+        # Nested fields section might be a Config object; coerce to plain dict
+        fields = cfg.get("fields", {}) or {}
+        cfg["fields"] = dict(fields)
+        return cfg
+    # If not running in Streamlit, you can hardcode/test here:
+    raise RuntimeError("ADO secrets not found. Define [ado] in .streamlit/secrets.toml")
+
+
+def _b64_pat(pat: str) -> str:
+    # ADO uses Basic with empty username and PAT as password
+    return base64.b64encode(f":{pat}".encode("utf-8")).decode("utf-8")
+
+
+def _chunked(seq: Sequence, n: int) -> Iterable[Sequence]:
+    for i in range(0, len(seq), n):
+        yield seq[i : i + n]
+
+
+class ADOClient:
+    def __init__(self, organization_url: Optional[str] = None,
+                 personal_access_token: Optional[str] = None,
+                 default_project: Optional[str] = None):
+        cfg = _get_secrets()
+        self.org = (organization_url or cfg["organization_url"]).rstrip("/")
+        self.pat = personal_access_token or cfg["personal_access_token"]
+        self.project = default_project or cfg.get("default_project")
+
+        # Headers
+        self._headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Basic {_b64_pat(self.pat)}",
+        }
+
+        # Field map (customizable)
+        fcfg = cfg.get("fields", {})
+        # Safe defaults
+        self.field_id           = fcfg.get("id", "System.Id")
+        self.field_title        = fcfg.get("title", "System.Title")
+        self.field_state        = fcfg.get("state", "System.State")
+        self.field_effort       = fcfg.get("effort", "Effort")
+        self.field_team         = fcfg.get("team", "Team")
+        self.field_application  = fcfg.get("application", "Custom_ApplicationName")
+        self.field_iteration    = fcfg.get("iteration", "System.IterationPath")
+        self.field_created      = fcfg.get("created_date", "System.CreatedDate")
+        self.field_changed      = fcfg.get("changed_date", "System.ChangedDate")
+
+    # ---------------------------
+    # Core HTTP helpers (with retries)
+    # ---------------------------
+    def _request(self, method: str, url: str, **kwargs) -> requests.Response:
+        # Simple retry/backoff
+        backoff = 1.0
+        for attempt in range(5):
+            resp = requests.request(method, url, headers=self._headers, timeout=60, **kwargs)
+            # Respect ADO throttling/status
+            if resp.status_code in (429, 502, 503, 504):
+                time.sleep(backoff)
+                backoff = min(backoff * 2, 8)
+                continue
+            if 200 <= resp.status_code < 300:
+                return resp
+            # other client errors: raise now with details
+            try:
+                detail = resp.json()
+            except Exception:
+                detail = resp.text
+            raise requests.HTTPError(f"ADO {method} {url} -> {resp.status_code}: {detail}")
+        resp.raise_for_status()
+        return resp
+
+    # ---------------------------
+    # WIQL (query Feature IDs)
+    # ---------------------------
+    def wiql_features(
+        self,
+        changed_since: Optional[str] = None,
+        states_in: Optional[Sequence[str]] = None,
+        area_path_startswith: Optional[str] = None,
+    ) -> List[int]:
+        """
+        Returns Feature IDs using WIQL.
+        - changed_since: 'YYYY-MM-DD' (optional)
+        - states_in: e.g. ["New","Active","Resolved"] (optional)
+        - area_path_startswith: filter by Area Path prefix (optional)
+        """
+        if not self.project:
+            raise ValueError("default_project is missing in ado_client config/secrets.")
+
+        where = [f"[System.TeamProject] = '{self.project}'", "[System.WorkItemType] = 'Feature'"]
+        if changed_since:
+            where.append(f"[System.ChangedDate] >= '{changed_since}'")
+        if states_in:
+            states = ",".join([f"'{s}'" for s in states_in])
+            where.append(f"[System.State] IN ({states})")
+        if area_path_startswith:
+            where.append(f"[System.AreaPath] UNDER '{area_path_startswith}'")
+
+        wiql = " AND ".join(where)
+        body = {"query": f"SELECT [System.Id] FROM WorkItems WHERE {wiql} ORDER BY [System.ChangedDate] DESC"}
+
+        url = f"{self.org}/{self.project}/_apis/wit/wiql?api-version={API_VERSION}"
+        resp = self._request("POST", url, json=body)
+        data = resp.json()
+        return [int(it["id"]) for it in data.get("workItems", [])]
+
+    # ---------------------------
+    # Batch fetch work items → normalized dicts
+    # ---------------------------
+    def get_features(self, ids: List[int]) -> List[Dict]:
+        """
+        Given Feature IDs, fetch fields in batches and return normalized dicts
+        with keys that match the ADO_FEATURES schema.
+        """
+        if not ids:
+            return []
+
+        # Build the full field list you want to receive
+        fields = [
+            self.field_id,
+            self.field_title,
+            self.field_state,
+            self.field_effort,
+            self.field_team,
+            self.field_application,
+            self.field_iteration,
+            self.field_created,
+            self.field_changed,
+        ]
+
+        results: List[Dict] = []
+        for batch in _chunked(ids, 200):
+            url = f"{self.org}/_apis/wit/workitemsbatch?api-version={BATCH_API_VERSION}"
+            body = {"ids": list(batch), "fields": fields}
+            resp = self._request("POST", url, json=body)
+            payload = resp.json()
+
+            for wi in payload.get("value", []):
+                f = wi.get("fields", {})
+
+                # Gracefully get values (some may be absent)
+                def g(name: str):
+                    return f.get(name)
+
+                results.append({
+                    "FEATURE_ID": str(g(self.field_id) or wi.get("id")),
+                    "TITLE": g(self.field_title),
+                    "STATE": g(self.field_state),
+                    "TEAM_RAW": g(self.field_team),
+                    "APP_NAME_RAW": g(self.field_application),
+                    "EFFORT_POINTS": g(self.field_effort),
+                    "ITERATION_PATH": g(self.field_iteration),
+                    "CREATED_AT": g(self.field_created),
+                    "CHANGED_AT": g(self.field_changed),
+                })
+
+        return results
+
+    # ---------------------------
+    # Convenience: return a pandas DataFrame already normalized
+    # ---------------------------
+    def fetch_features_df(
+        self,
+        changed_since: Optional[str] = None,
+        states_in: Optional[Sequence[str]] = None,
+        area_path_startswith: Optional[str] = None,
+    ) -> pd.DataFrame:
+        """
+        One-shot convenience:
+          - runs WIQL
+          - fetches batches
+          - returns a pandas DataFrame with normalized columns
+
+        Columns:
+          FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW,
+          EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT
+        """
+        ids = self.wiql_features(
+            changed_since=changed_since,
+            states_in=states_in,
+            area_path_startswith=area_path_startswith,
+        )
+        if not ids:
+            return pd.DataFrame(columns=[
+                "FEATURE_ID","TITLE","STATE","TEAM_RAW","APP_NAME_RAW",
+                "EFFORT_POINTS","ITERATION_PATH","CREATED_AT","CHANGED_AT"
+            ])
+
+        feats = self.get_features(ids)
+        df = pd.DataFrame(feats)
+        # Types / coercions for safety
+        if "FEATURE_ID" in df:
+            df["FEATURE_ID"] = df["FEATURE_ID"].astype(str)
+        if "EFFORT_POINTS" in df:
+            df["EFFORT_POINTS"] = pd.to_numeric(df["EFFORT_POINTS"], errors="coerce")
+        # Datetimes
+        for col in ("CREATED_AT","CHANGED_AT"):
+            if col in df.columns:
+                df[col] = pd.to_datetime(df[col], errors="coerce")
+        return df.reset_index(drop=True)

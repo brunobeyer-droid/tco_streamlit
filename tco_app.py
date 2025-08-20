@@ -1,61 +1,161 @@
-
+# tco_app.py
 import streamlit as st
-import snowflake.connector
-import os
-from utils.app_refresh import refresh_all_data
+import pandas as pd
+import datetime as dt
 
-# Load credentials from environment variables
-conn = snowflake.connector.connect(
-    user="brunobeyer",
-    password="BernardoMatheus.1981",
-    account="UDWQRGU-TV52099",
-    warehouse="COMPUTE_WH",
-    database="TCODB",
-    schema="PUBLIC"
-)
+# Adjust this import if snowflake_db.py is under utils/
+from snowflake_db import ensure_tables, fetch_df
 
-st.title("MOIT COST")
+# Optional: sidebar helper
+try:
+    from utils.sidebar import render_global_actions
+except Exception:
+    def render_global_actions():
+        pass
 
-cur = conn.cursor()
-cur.execute("SELECT CURRENT_TIMESTAMP, CURRENT_USER, CURRENT_DATABASE();")
-row = cur.fetchone()
+st.set_page_config(page_title="TCO Home", page_icon="📊", layout="wide")
+render_global_actions()
 
-st.write("Connected to Snowflake ✅")
-st.write(f"User: {row[1]}, Database: {row[2]}")
+# Ensure schema once per session
+if "_tco_init" not in st.session_state:
+    ensure_tables()
+    st.session_state["_tco_init"] = True
 
-st.set_page_config(
-    page_title="TCO Calculator",
-    page_icon="📊",
-)
+st.title("📊 TCO – Total Cost Overview")
 
-st.session_state.setdefault("db_rev", 0)
+# -----------------------------------
+# Data loader
+# -----------------------------------
+@st.cache_data(show_spinner=False)
+def load_overview_df() -> pd.DataFrame:
+    # Use snapshots (PROGRAMID_AT_BOOKING/VENDORID_AT_BOOKING) when present, so history is stable per year
+    sql = """
+        SELECT
+          i.INVOICEID,
+          i.FISCAL_YEAR,
+          i.INVOICEDATE,
+          i.RENEWALDATE,
+          i.AMOUNT,
+          i.STATUS,
 
-with st.sidebar:
-    st.header("Actions")
-    if st.button("🔄 Refresh All Data", use_container_width=True):
-        refresh_all_data()
-        st.success("Caches cleared. Data will be reloaded from Snowflake.")
-        st.rerun()
-        
-st.title("Application Total Cost of Ownership (TCO) Calculator")
-
-st.sidebar.success("Select a page above.")
-
-st.markdown(
+          -- Team/program/application/vendor (prefer frozen snapshots where available)
+          t.TEAMID, t.TEAMNAME,
+          COALESCE(i.PROGRAMID_AT_BOOKING, t.PROGRAMID) AS PROGRAMID,
+          p.PROGRAMNAME,
+          a.APPLICATIONID, a.APPLICATIONNAME,
+          COALESCE(i.VENDORID_AT_BOOKING, a.VENDORID) AS VENDORID,
+          v.VENDORNAME
+        FROM INVOICES i
+        LEFT JOIN TEAMS t ON t.TEAMID = i.TEAMID
+        LEFT JOIN PROGRAMS p ON p.PROGRAMID = COALESCE(i.PROGRAMID_AT_BOOKING, t.PROGRAMID)
+        LEFT JOIN APPLICATIONS a ON a.APPLICATIONID = i.APPLICATIONID
+        LEFT JOIN VENDORS v ON v.VENDORID = COALESCE(i.VENDORID_AT_BOOKING, a.VENDORID)
     """
-    Welcome to the Application Total Cost of Ownership (TCO) Calculator!
+    return fetch_df(sql)
 
-    This application helps product owners estimate and manage the Total Cost of Ownership for their applications by breaking down costs by programs and teams.
+df_all = load_overview_df()
 
-    **👈 Select a page from the sidebar** to get started:
+# -----------------------------------
+# Filters
+# -----------------------------------
+with st.expander("🔎 Filters", expanded=True):
+    # Year first
+    current_year = dt.date.today().year
+    years = sorted(df_all["FISCAL_YEAR"].dropna().astype(int).unique().tolist()) if not df_all.empty else [current_year]
+    default_year = current_year if current_year in years else (years[-1] if years else current_year)
+    year = st.number_input("Fiscal Year", value=int(default_year), step=1, format="%d")
 
-    *   **Detailed TCO Summary:** View a detailed summary of the TCO calculation results.
-    *   **Summary and Edit Data:** View an overview of your data and navigate to edit sections.
-    *   **Programs and Workforce:** Define your programs and the overall workforce composition.
-    *   **Team Composition:** Define the teams within each program and their specific roles.
-    *   **Cost Details & Calculation:** Input various cost categories and calculate the overall TCO.
+    # Build options safely even if frame is empty
+    prog_opts = sorted(df_all["PROGRAMNAME"].dropna().unique().tolist()) if not df_all.empty else []
+    team_opts = sorted(df_all["TEAMNAME"].dropna().unique().tolist()) if not df_all.empty else []
+    vend_opts = sorted(df_all["VENDORNAME"].dropna().unique().tolist()) if not df_all.empty else []
+    app_opts  = sorted(df_all["APPLICATIONNAME"].dropna().unique().tolist()) if not df_all.empty else []
 
-    """
-)
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        sel_prog = st.multiselect("Program", prog_opts, key="flt_prog")
+    with c2:
+        sel_team = st.multiselect("Team", team_opts, key="flt_team")
+    with c3:
+        sel_vend = st.multiselect("Vendor", vend_opts, key="flt_vend")
+    with c4:
+        sel_app = st.multiselect("Application", app_opts, key="flt_app")
 
+    cc1, cc2 = st.columns([1, 5])
+    with cc1:
+        if st.button("Clear filters"):
+            st.session_state.pop("flt_prog", None)
+            st.session_state.pop("flt_team", None)
+            st.session_state.pop("flt_vend", None)
+            st.session_state.pop("flt_app", None)
+            st.experimental_rerun()
+    with cc2:
+        st.caption("Filters apply to the selected fiscal year.")
 
+# Apply filters in pandas
+df = df_all.copy()
+if not df.empty:
+    df = df[df["FISCAL_YEAR"].fillna(0).astype(int) == int(year)]
+    if sel_prog:
+        df = df[df["PROGRAMNAME"].isin(sel_prog)]
+    if sel_team:
+        df = df[df["TEAMNAME"].isin(sel_team)]
+    if sel_vend:
+        df = df[df["VENDORNAME"].isin(sel_vend)]
+    if sel_app:
+        df = df[df["APPLICATIONNAME"].isin(sel_app)]
+
+# -----------------------------------
+# KPI cards based on filtered set
+# -----------------------------------
+col1, col2, col3, col4, col5, col6 = st.columns(6)
+if df.empty:
+    col1.metric("Programs", 0)
+    col2.metric("Teams", 0)
+    col3.metric("Vendors", 0)
+    col4.metric("Applications", 0)
+    col5.metric(f"Invoices ({int(year)})", 0)
+    col6.metric("Amount (sum)", "0.00")
+else:
+    col1.metric("Programs", df["PROGRAMNAME"].nunique())
+    col2.metric("Teams", df["TEAMNAME"].nunique())
+    col3.metric("Vendors", df["VENDORNAME"].nunique())
+    col4.metric("Applications", df["APPLICATIONNAME"].nunique())
+    col5.metric(f"Invoices ({int(year)})", df["INVOICEID"].nunique())
+    col6.metric("Amount (sum)", f"{df['AMOUNT'].fillna(0).sum():,.2f}")
+
+st.divider()
+
+# -----------------------------------
+# Table + CSV download
+# -----------------------------------
+st.subheader(f"Invoices (Fiscal Year {int(year)})")
+if df.empty:
+    st.info("No data for the current filters.")
+else:
+    # Friendly column order for display
+    display_cols = [
+        "INVOICEID", "FISCAL_YEAR", "INVOICEDATE", "RENEWALDATE", "STATUS", "AMOUNT",
+        "PROGRAMNAME", "TEAMNAME", "VENDORNAME", "APPLICATIONNAME"
+    ]
+    show_cols = [c for c in display_cols if c in df.columns]
+    table = df[show_cols].sort_values(by=["INVOICEDATE"], ascending=False)
+    st.dataframe(table, use_container_width=True)
+
+    # Download filtered data
+    csv = table.to_csv(index=False).encode("utf-8")
+    st.download_button(
+        label="⬇️ Download filtered CSV",
+        data=csv,
+        file_name=f"tco_filtered_invoices_{int(year)}.csv",
+        mime="text/csv",
+    )
+
+# Helpful tips
+with st.expander("ℹ️ Tips"):
+    st.markdown(
+        "- Use **Fiscal Year** + the filters to slice the data.\n"
+        "- Metrics reflect your current selections.\n"
+        "- To add/rename Applications, use the **Applications** page.\n"
+        "- To create invoices, use **Invoices**; for deletions/rollover, see **Edit (advanced)**."
+    )

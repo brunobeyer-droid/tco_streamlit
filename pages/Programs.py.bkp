@@ -2,6 +2,7 @@ import streamlit as st
 import uuid
 from typing import Optional
 
+# If your DB utils live under utils/, change import accordingly.
 from snowflake_db import ensure_tables, fetch_df, upsert_program, execute
 
 try:
@@ -15,25 +16,12 @@ ensure_tables()
 
 st.title("🗂️ Programs")
 
-@st.cache_data(ttl=180, show_spinner=False)
 def _programs_df():
     return fetch_df("""
         SELECT PROGRAMID, PROGRAMNAME, PROGRAMOWNER, PROGRAMFTE
         FROM PROGRAMS
         ORDER BY PROGRAMNAME
     """)
-
-def _program_id_for_name_ci(name: str) -> Optional[str]:
-    """Return PROGRAMID if a program exists with the same name (case-insensitive)."""
-    if not name:
-        return None
-    df = fetch_df(
-        "SELECT PROGRAMID FROM PROGRAMS WHERE UPPER(PROGRAMNAME) = UPPER(%s) LIMIT 1",
-        (name.strip(),),
-    )
-    if df is not None and not df.empty:
-        return str(df.iloc[0]["PROGRAMID"])
-    return None
 
 # ---------------------------
 # Create / Edit flow (no Program ID field)
@@ -53,9 +41,9 @@ if mode == "Edit Existing":
     if progs is None or progs.empty:
         st.warning("No programs yet. Switch to 'Create New'.")
     else:
-        progs = progs.copy()
         progs["LABEL"] = progs["PROGRAMNAME"].astype(str) + " · " + progs["PROGRAMID"].astype(str)
         choice = st.selectbox("Select a program to edit", progs["LABEL"].tolist(), key="prog_edit_select")
+        # pull row
         row = progs[progs["LABEL"] == choice].iloc[0]
         edit_program_id = row["PROGRAMID"]
         prefill_name = str(row.get("PROGRAMNAME") or "")
@@ -76,31 +64,22 @@ with col3:
                                   value=prefill_fte, key="prog_fte")
 
 if st.button("💾 Save Program", key="prog_save_btn"):
-    name = (program_name or "").strip()
-    mgr = (program_manager or "").strip()
-    if not name:
+    if not program_name.strip():
         st.error("Program Name is required.")
-    elif not mgr:
+    elif not program_manager.strip():
         st.error("Program Manager is required.")
     else:
-        # Uniqueness (case-insensitive) on PROGRAMNAME
-        existing_id = _program_id_for_name_ci(name)
-        if existing_id and existing_id != (edit_program_id or ""):
-            st.error(f"A Program named '{name}' already exists. Program names must be unique.")
-        else:
-            program_id = edit_program_id or str(uuid.uuid4())
-            try:
-                upsert_program(
-                    program_id=program_id,
-                    name=name,
-                    owner=mgr,
-                    fte=float(program_fte) if program_fte is not None else None
-                )
-                st.success(f"Program saved (PROGRAMID: {program_id}).")
-                st.cache_data.clear()
-                st.rerun()
-            except Exception as e:
-                st.error(f"Save failed: {e}")
+        # If editing, keep the same PROGRAMID. If creating, generate a new one.
+        program_id = edit_program_id or str(uuid.uuid4())
+        # Store Program Manager into PROGRAMOWNER column (no schema change needed).
+        upsert_program(
+            program_id=program_id,
+            name=program_name.strip(),
+            owner=program_manager.strip(),
+            fte=float(program_fte) if program_fte is not None else None
+        )
+        st.success(f"Program saved (PROGRAMID: {program_id}).")
+        st.cache_data.clear()
 
 st.markdown("---")
 
@@ -121,11 +100,10 @@ else:
 # Danger zone: delete
 # ---------------------------
 with st.expander("Danger zone: Delete a Program"):
-    progs = _programs_df()
     if progs is None or progs.empty:
         st.info("No programs to delete.")
     else:
-        progs = progs.copy()
+        # pick via dropdown instead of raw ID to avoid mistakes
         progs["LABEL"] = progs["PROGRAMNAME"].astype(str) + " · " + progs["PROGRAMID"].astype(str)
         del_choice = st.selectbox("Select a program to delete", progs["LABEL"].tolist(), key="prog_delete_select")
         confirm = st.text_input("Type DELETE to confirm", key="prog_delete_confirm")
@@ -138,6 +116,5 @@ with st.expander("Danger zone: Delete a Program"):
                     execute("DELETE FROM PROGRAMS WHERE PROGRAMID = %s", (pid,))
                     st.success("Program deleted.")
                     st.cache_data.clear()
-                    st.rerun()
                 except Exception as e:
                     st.error(f"Delete failed: {e}")
