@@ -368,6 +368,65 @@ def normalize_team_numeric_types() -> None:
         except Exception:
             pass
 
+# =========================
+# TEAM_CALC: rates & calcs
+# =========================
+
+def ensure_team_calc_table() -> None:
+    """
+    TEAM_CALC stores editable rate columns per team (no duplication of counts).
+    Columns created here are NEW per your spec:
+      - XOM_RATE
+      - CONTRACTOR_CS_RATE
+      - CONTRACTOR_C_RATE
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.TEAM_CALC (
+        TEAMID STRING PRIMARY KEY,
+        XOM_RATE NUMBER(18,2),
+        CONTRACTOR_CS_RATE NUMBER(18,2),
+        CONTRACTOR_C_RATE NUMBER(18,2),
+        UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+      )
+    """)
+
+def upsert_team_calc_rates(team_id: str,
+                           xom_rate: Optional[float],
+                           contractor_cs_rate: Optional[float],
+                           contractor_c_rate: Optional[float]) -> None:
+    """
+    Insert or update TEAM_CALC rates for a team.
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      MERGE INTO {db}.{sch}.TEAM_CALC t
+      USING (
+        SELECT %s TEAMID, %s XOM_RATE, %s CONTRACTOR_CS_RATE, %s CONTRACTOR_C_RATE
+      ) s
+      ON t.TEAMID = s.TEAMID
+      WHEN MATCHED THEN UPDATE SET
+        XOM_RATE = s.XOM_RATE,
+        CONTRACTOR_CS_RATE = s.CONTRACTOR_CS_RATE,
+        CONTRACTOR_C_RATE = s.CONTRACTOR_C_RATE,
+        UPDATED_AT = CURRENT_TIMESTAMP()
+      WHEN NOT MATCHED THEN INSERT (TEAMID, XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE)
+      VALUES (s.TEAMID, s.XOM_RATE, s.CONTRACTOR_CS_RATE, s.CONTRACTOR_C_RATE)
+    """, (team_id, xom_rate, contractor_cs_rate, contractor_c_rate))
+
+def list_team_calc() -> pd.DataFrame:
+    """
+    Current TEAM_CALC rows with team names.
+    """
+    return fetch_df(f"""
+      SELECT
+        tc.TEAMID, t.TEAMNAME,
+        tc.XOM_RATE, tc.CONTRACTOR_CS_RATE, tc.CONTRACTOR_C_RATE,
+        tc.UPDATED_AT
+      FROM { _fq('TEAM_CALC') } tc
+      LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = tc.TEAMID
+      ORDER BY t.TEAMNAME
+    """)
 
 # =========================================================
 # Upserts
@@ -1021,6 +1080,90 @@ def reset_ado_calc_artifacts(drop_mappings: bool = False) -> None:
 # Views: list & drop helpers
 # =========================================================
 
+def ensure_team_cost_view() -> None:
+    """
+    Creates a per-feature view that computes the four NEW columns using your math
+    and ALSO exposes the underlying FTE and rate columns so diagnostics pages can reference them.
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
+      WITH j AS (
+        SELECT
+          af.FEATURE_ID,
+          af.TITLE,
+          af.TEAM_RAW,
+          af.APP_NAME_RAW,
+          af.EFFORT_POINTS,
+          af.ITERATION_PATH,
+          m.TEAMID,
+          t.TEAMNAME,
+          -- FTE counts from TEAMS
+          COALESCE(t.DELIVERY_TEAM_FTE, 0)  AS DELIVERY_TEAM_FTE,
+          COALESCE(t.CONTRACTOR_CS_FTE, 0)  AS CONTRACTOR_CS_FTE,
+          COALESCE(t.CONTRACTOR_C_FTE, 0)   AS CONTRACTOR_C_FTE,
+          COALESCE(t.TEAMFTE, 0)            AS TEAMFTE,
+          -- Rates from TEAM_CALC
+          COALESCE(tc.XOM_RATE, 0)           AS XOM_RATE,
+          COALESCE(tc.CONTRACTOR_CS_RATE, 0) AS CONTRACTOR_CS_RATE,
+          COALESCE(tc.CONTRACTOR_C_RATE, 0)  AS CONTRACTOR_C_RATE
+        FROM {db}.{sch}.ADO_FEATURES af
+        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
+          ON m.ADO_TEAM = af.TEAM_RAW
+        LEFT JOIN {db}.{sch}.TEAMS t
+          ON t.TEAMID = m.TEAMID
+        LEFT JOIN {db}.{sch}.TEAM_CALC tc
+          ON tc.TEAMID = t.TEAMID
+      )
+      SELECT
+        FEATURE_ID,
+        TITLE,
+        TEAM_RAW,
+        TEAMID,
+        TEAMNAME,
+        APP_NAME_RAW,
+        EFFORT_POINTS,
+        ITERATION_PATH,
+
+        -- Expose component FTEs and rates so downstream queries can filter/diagnose
+        DELIVERY_TEAM_FTE,
+        CONTRACTOR_CS_FTE,
+        CONTRACTOR_C_FTE,
+        TEAMFTE,
+        XOM_RATE,
+        CONTRACTOR_CS_RATE,
+        CONTRACTOR_C_RATE,
+
+        -- Denominator and safe helper
+        (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) AS COMP_DENOM,
+        CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN NULL ELSE TEAMFTE END AS TEAMFTE_SAFE,
+
+        -- 1) TEAM_COST_PERPI (does not depend on EFFORT_POINTS)
+        (TEAMFTE * XOM_RATE / 4) AS TEAM_COST_PERPI,
+
+        -- 2) Delivery share * effort * XOM rate
+        CASE
+          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+          ELSE (DELIVERY_TEAM_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+        END * EFFORT_POINTS * XOM_RATE AS DEL_TEAM_COST_PERPI,
+
+        -- 3) Contractor CS share * effort * CS rate
+        CASE
+          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+          ELSE (CONTRACTOR_CS_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+        END * EFFORT_POINTS * CONTRACTOR_CS_RATE AS TEAM_CONTRACTOR_CS_COST_PERPI,
+
+        -- 4) Contractor C share * effort * C rate
+        CASE
+          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+          ELSE (CONTRACTOR_C_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+        END * EFFORT_POINTS * CONTRACTOR_C_RATE AS TEAM_CONTRACTOR_C_COST_PERPI
+
+      FROM j
+    """)
+
+
+
 def list_views(pattern: Optional[str] = None) -> pd.DataFrame:
     """List views in the current database/schema."""
     db, sch = _db_and_schema()
@@ -1093,4 +1236,7 @@ def rename_column(table: str, old: str, new: str) -> None:
 if not st.session_state.get("_tco_db_init_done"):
     ensure_tables()
     normalize_team_numeric_types()
+    ensure_team_calc_table()
+    ensure_team_cost_view()
     st.session_state["_tco_db_init_done"] = True
+
