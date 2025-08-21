@@ -698,21 +698,20 @@ with tab_explore:
     """, tuple(params) if params else None)
     st.dataframe(df_team_iter, use_container_width=True, height=300)
 
-# =========================
-# Tab: 📊 Reconciliation
-# =========================
+# =========================================================
+# 📊 Reconciliation
+# =========================================================
 with tab_recon:
     st.subheader("Reconciliation: mappings + effort + calculated costs")
-    st.caption("Now grouped by **Team, ADO Year & Iteration**. Costs per PI reflect the values used for those rows in the view.")
+    st.caption("TEAM_COST_PERPI is split equally across all features within each Team × Year × Iteration. Delivery/Contractor terms remain effort-based.")
 
     # Quick issues panel
     colA, colB, colC = st.columns(3)
     try:
         unmapped_team = fetch_df("""
           SELECT TEAM_RAW, COUNT(*) AS N
-          FROM ADO_FEATURES af
-          LEFT JOIN MAP_ADO_TEAM_TO_TCO_TEAM m ON m.ADO_TEAM = af.TEAM_RAW
-          WHERE m.TEAMID IS NULL
+          FROM VW_TEAM_COSTS_PER_FEATURE v
+          WHERE v.TEAMID IS NULL
           GROUP BY TEAM_RAW
           ORDER BY N DESC
         """)
@@ -742,117 +741,134 @@ with tab_recon:
     except Exception as e:
         colC.warning(f"Rate check failed: {e}")
 
-    # ===== Filters (add ADO Year) =====
     st.markdown("#### Filters")
-    fc1, fc2, fc3, fc4 = st.columns([2,2,2,2])
+    fc1, fc2, fc3 = st.columns([2,2,2])
+    team_like2 = fc1.text_input("TCO Team contains", "", key="recon_team_contains")
+    app_like2  = fc2.text_input("ADO App contains", "", key="recon_app_contains")
+    iter_like2 = fc3.text_input("Iteration contains", "", key="recon_iter_contains")
 
-    # Year options from data
-    year_opts_df = fetch_df("SELECT DISTINCT ADO_YEAR FROM ADO_FEATURES WHERE ADO_YEAR IS NOT NULL ORDER BY ADO_YEAR")
-    year_options = year_opts_df["ADO_YEAR"].dropna().astype(int).tolist() if not year_opts_df.empty else []
-    year_sel = fc1.multiselect("ADO Year", options=year_options, default=[], key="recon_years")
-
-    team_like2 = fc2.text_input("TCO Team contains", "", key="recon_team_contains")
-    app_like2  = fc3.text_input("ADO App contains", "", key="recon_app_contains")
-    iter_like2 = fc4.text_input("Iteration contains", "", key="recon_iter_contains")
-
-    # Build WHERE using aliases v (view) and f (features)
     where2 = []
     params2: list = []
     if team_like2.strip():
-        where2.append("UPPER(v.TEAMNAME) LIKE UPPER(%s)")
+        where2.append("UPPER(TEAMNAME) LIKE UPPER(%s)")
         params2.append(f"%{team_like2.strip()}%")
     if app_like2.strip():
-        where2.append("UPPER(v.APP_NAME_RAW) LIKE UPPER(%s)")
+        where2.append("UPPER(APP_NAME_RAW) LIKE UPPER(%s)")
         params2.append(f"%{app_like2.strip()}%")
     if iter_like2.strip():
-        where2.append("UPPER(v.ITERATION_PATH) LIKE UPPER(%s)")
+        where2.append("UPPER(ITERATION_PATH) LIKE UPPER(%s)")
         params2.append(f"%{iter_like2.strip()}%")
-    if year_sel:
-        where2.append("f.ADO_YEAR IN (" + ",".join(["%s"] * len(year_sel)) + ")")
-        params2.extend(year_sel)
-
     where_sql2 = " WHERE " + " AND ".join(where2) if where2 else ""
 
-    # Pull detail with ADO_YEAR added (join view to features)
+    # === Load from the view and do equal-split TEAM cost in SQL (robust) ===
     try:
         base_sql = f"""
+        WITH v AS (
           SELECT
-            v.TEAMNAME, v.TEAMID, v.FEATURE_ID, v.TITLE, v.APP_NAME_RAW,
-            f.ADO_YEAR,
-            v.ITERATION_PATH,
-            v.EFFORT_POINTS,
-            v.TEAM_COST_PERPI,
-            v.DEL_TEAM_COST_PERPI,
-            v.TEAM_CONTRACTOR_CS_COST_PERPI,
-            v.TEAM_CONTRACTOR_C_COST_PERPI
-          FROM VW_TEAM_COSTS_PER_FEATURE v
-          LEFT JOIN ADO_FEATURES f
-            ON f.FEATURE_ID = v.FEATURE_ID
+            TEAMNAME, TEAMID,
+            /* Use provided ADO_YEAR / ITERATION_NUM if available; else derive */
+            COALESCE(ADO_YEAR, YEAR(COALESCE(CHANGED_AT, CREATED_AT))) AS ADO_YEAR,
+            COALESCE(ITERATION_NUM, TRY_TO_NUMBER(REGEXP_SUBSTR(ITERATION_PATH,'I[[:space:]]*([0-9]+)',1,1,'i',1))) AS ITERATION_NUM,
+            ITERATION_PATH,
+            FEATURE_ID, TITLE, APP_NAME_RAW, EFFORT_POINTS,
+            /* Keep component FTEs & rates for diagnostics and effort-cost terms */
+            TEAMFTE, XOM_RATE,
+            DELIVERY_TEAM_FTE, CONTRACTOR_CS_FTE, CONTRACTOR_C_FTE,
+            /* Original costs from view (delivery/contractors used as-is) */
+            TEAM_COST_PERPI,
+            DEL_TEAM_COST_PERPI,
+            TEAM_CONTRACTOR_CS_COST_PERPI,
+            TEAM_CONTRACTOR_C_COST_PERPI
+          FROM VW_TEAM_COSTS_PER_FEATURE
           {where_sql2}
-          ORDER BY v.TEAMNAME, f.ADO_YEAR, v.ITERATION_PATH, v.FEATURE_ID
+        ),
+        tp AS (
+          SELECT
+            TEAMID,
+            ADO_YEAR,
+            ITERATION_NUM,
+            COUNT(*) AS FEATURES_IN_PI,
+            MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
+          FROM v
+          GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
+        )
+        SELECT
+          v.*,
+          tp.FEATURES_IN_PI,
+          tp.TEAM_PI_FIXED_COST,
+          /* Equal split across features in the same Team × Year × Iteration */
+          CASE WHEN tp.FEATURES_IN_PI > 0
+               THEN tp.TEAM_PI_FIXED_COST / tp.FEATURES_IN_PI
+               ELSE 0
+          END AS TEAM_COST_PERPI_EQSPLIT
+        FROM v
+        LEFT JOIN tp
+          ON tp.TEAMID = v.TEAMID
+         AND tp.ADO_YEAR = v.ADO_YEAR
+         AND tp.ITERATION_NUM = v.ITERATION_NUM
+        ORDER BY v.TEAMNAME, v.ADO_YEAR, v.ITERATION_NUM, v.FEATURE_ID
         """
         df_calc = fetch_df(base_sql, tuple(params2) if params2 else None)
     except Exception as e:
-        st.error(f"Could not read reconciliation data: {e}")
+        st.error(f"Could not read VW_TEAM_COSTS_PER_FEATURE: {e}")
         df_calc = pd.DataFrame()
 
     if df_calc.empty:
         st.info("No rows found with the current filters.")
-    else:
-        # ===== Aggregates by Team, Year & Iteration =====
-        st.markdown("#### Effort & Cost by Team, Year & Iteration")
-        ag = df_calc.groupby(["TEAMNAME","ADO_YEAR","ITERATION_PATH"], dropna=False).agg(
-            FEATURES=("FEATURE_ID","count"),
-            EFFORT_POINTS_SUM=("EFFORT_POINTS","sum"),
-            TEAM_COST_PERPI=("TEAM_COST_PERPI","sum"),
-            DEL_TEAM_COST_PERPI=("DEL_TEAM_COST_PERPI","sum"),
-            TEAM_CONTRACTOR_CS_COST_PERPI=("TEAM_CONTRACTOR_CS_COST_PERPI","sum"),
-            TEAM_CONTRACTOR_C_COST_PERPI=("TEAM_CONTRACTOR_C_COST_PERPI","sum"),
-        ).reset_index()
+        st.stop()
 
-        # Ensure numeric types are floats (avoid Decimal/float mix)
-        for col in [
-            "TEAM_COST_PERPI",
-            "DEL_TEAM_COST_PERPI",
-            "TEAM_CONTRACTOR_CS_COST_PERPI",
-            "TEAM_CONTRACTOR_C_COST_PERPI",
-            "EFFORT_POINTS_SUM",
-        ]:
-            if col in ag.columns:
-                ag[col] = pd.to_numeric(ag[col], errors="coerce").astype(float)
+    # Replace TEAM_COST_PERPI with the equal-split value (display/aggregation)
+    if "TEAM_COST_PERPI_EQSPLIT" in df_calc.columns:
+        df_calc["TEAM_COST_PERPI"] = pd.to_numeric(df_calc["TEAM_COST_PERPI_EQSPLIT"], errors="coerce").fillna(0.0)
 
-        ag["TOTAL_COST_PERPI"] = ag[
-            ["TEAM_COST_PERPI","DEL_TEAM_COST_PERPI","TEAM_CONTRACTOR_CS_COST_PERPI","TEAM_CONTRACTOR_C_COST_PERPI"]
-        ].sum(axis=1)
+    # =========================
+    # Aggregates
+    # =========================
+    st.markdown("#### Effort & Cost by Team, Year & Iteration")
+    ag = df_calc.groupby(["TEAMNAME","ADO_YEAR","ITERATION_NUM"], dropna=False).agg(
+        FEATURES=("FEATURE_ID","count"),
+        EFFORT_POINTS_SUM=("EFFORT_POINTS","sum"),
+        TEAM_COST_PERPI=("TEAM_COST_PERPI","sum"),
+        DEL_TEAM_COST_PERPI=("DEL_TEAM_COST_PERPI","sum"),
+        TEAM_CONTRACTOR_CS_COST_PERPI=("TEAM_CONTRACTOR_CS_COST_PERPI","sum"),
+        TEAM_CONTRACTOR_C_COST_PERPI=("TEAM_CONTRACTOR_C_COST_PERPI","sum"),
+    ).reset_index()
+    ag["TOTAL_COST_PERPI"] = ag[
+        ["TEAM_COST_PERPI","DEL_TEAM_COST_PERPI","TEAM_CONTRACTOR_CS_COST_PERPI","TEAM_CONTRACTOR_C_COST_PERPI"]
+    ].sum(axis=1)
 
-        st.dataframe(ag, use_container_width=True, height=360)
+    st.dataframe(ag, use_container_width=True, height=320)
 
-        # ===== Per-Feature Detail (includes ADO_YEAR) =====
-        st.markdown("#### Per-Feature Detail (to spot anomalies)")
-        st.dataframe(df_calc, use_container_width=True, height=420)
+    st.markdown("#### Per-Feature Detail (to spot anomalies)")
+    cols_order = [
+        "TEAMNAME","ADO_YEAR","ITERATION_NUM","ITERATION_PATH",
+        "FEATURE_ID","TITLE","APP_NAME_RAW","EFFORT_POINTS",
+        "FEATURES_IN_PI","TEAM_PI_FIXED_COST","TEAM_COST_PERPI",
+        "DEL_TEAM_COST_PERPI","TEAM_CONTRACTOR_CS_COST_PERPI","TEAM_CONTRACTOR_C_COST_PERPI"
+    ]
+    cols_present = [c for c in cols_order if c in df_calc.columns]
+    st.dataframe(df_calc[cols_present], use_container_width=True, height=460)
 
-        # ===== Unmapped teams list (unchanged) =====
-        st.markdown("#### Unmapped ADO Teams (with counts)")
-        st.dataframe(unmapped_team, use_container_width=True, height=220)
+    st.markdown("#### Unmapped ADO Teams (with counts)")
+    st.dataframe(unmapped_team, use_container_width=True, height=220)
 
-        # ===== Diagnostics for missing rates / zero composition =====
-        st.markdown("#### Rows with missing rates or zero composition (diagnostics)")
-        try:
-            diag = fetch_df("""
-              SELECT
-                TEAMNAME, FEATURE_ID, APP_NAME_RAW, ITERATION_PATH, EFFORT_POINTS,
-                DELIVERY_TEAM_FTE, CONTRACTOR_CS_FTE, CONTRACTOR_C_FTE,
-                XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE
-              FROM VW_TEAM_COSTS_PER_FEATURE
-              WHERE (TEAMID IS NOT NULL) AND
-                    (
-                     (COALESCE(DELIVERY_TEAM_FTE,0) + COALESCE(CONTRACTOR_CS_FTE,0) + COALESCE(CONTRACTOR_C_FTE,0)) = 0
-                     OR COALESCE(XOM_RATE,0)=0
-                     OR COALESCE(CONTRACTOR_CS_RATE,0)=0
-                     OR COALESCE(CONTRACTOR_C_RATE,0)=0
-                    )
-              ORDER BY TEAMNAME, FEATURE_ID
-            """)
-            st.dataframe(diag, use_container_width=True, height=260)
-        except Exception as e:
-            st.warning(f"Diagnostics view failed: {e}")
+    st.markdown("#### Rows with missing rates or zero composition (diagnostics)")
+    try:
+        diag = fetch_df("""
+          SELECT
+            TEAMNAME, FEATURE_ID, APP_NAME_RAW, ITERATION_PATH, EFFORT_POINTS,
+            DELIVERY_TEAM_FTE, CONTRACTOR_CS_FTE, CONTRACTOR_C_FTE,
+            XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE
+          FROM VW_TEAM_COSTS_PER_FEATURE
+          WHERE (TEAMID IS NOT NULL) AND
+                (
+                 (COALESCE(DELIVERY_TEAM_FTE,0) + COALESCE(CONTRACTOR_CS_FTE,0) + COALESCE(CONTRACTOR_C_FTE,0)) = 0
+                 OR COALESCE(XOM_RATE,0)=0
+                 OR COALESCE(CONTRACTOR_CS_RATE,0)=0
+                 OR COALESCE(CONTRACTOR_C_RATE,0)=0
+                )
+          ORDER BY TEAMNAME, FEATURE_ID
+        """)
+        st.dataframe(diag, use_container_width=True, height=260)
+    except Exception as e:
+        st.warning(f"Diagnostics view failed: {e}")

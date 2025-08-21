@@ -1286,6 +1286,282 @@ def list_map_ado_app() -> pd.DataFrame:
 
 def ensure_team_cost_view() -> None:
     """
+    Per‑feature cost view:
+      - TEAM_COST_PERPI = (TEAMFTE * XOM_RATE / 4) / (# of features in Team × ADO_YEAR × Iteration)
+      - Delivery/Contractor terms remain effort‑weighted (unchanged)
+      - Exposes ADO_YEAR, ITERATION_NUM, ADO_PI_KEY and all component FTEs/rates
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
+      WITH f AS (
+        SELECT
+          af.FEATURE_ID,
+          af.TITLE,
+          af.STATE,
+          af.TEAM_RAW,
+          af.APP_NAME_RAW,
+          af.EFFORT_POINTS,
+          af.ITERATION_PATH,
+          af.CREATED_AT,
+          af.CHANGED_AT,
+          /* Prefer explicit ADO_YEAR column if present, else derive from timestamps */
+          COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
+          /* Extract iteration number from patterns like 'I1', 'I 2', 'Iteration 3' */
+          TRY_TO_NUMBER(
+            REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)
+          ) AS ITERATION_NUM
+        FROM {db}.{sch}.ADO_FEATURES af
+      ),
+      j AS (
+        SELECT
+          f.*,
+          m.TEAMID,
+          t.TEAMNAME,
+          /* FTEs cast to FLOAT */
+          COALESCE(CAST(t.DELIVERY_TEAM_FTE  AS FLOAT), 0.0) AS DELIVERY_TEAM_FTE,
+          COALESCE(CAST(t.CONTRACTOR_CS_FTE  AS FLOAT), 0.0) AS CONTRACTOR_CS_FTE,
+          COALESCE(CAST(t.CONTRACTOR_C_FTE   AS FLOAT), 0.0) AS CONTRACTOR_C_FTE,
+          COALESCE(CAST(t.TEAMFTE            AS FLOAT), 0.0) AS TEAMFTE,
+          /* Rates cast to FLOAT */
+          COALESCE(CAST(tc.XOM_RATE           AS FLOAT), 0.0) AS XOM_RATE,
+          COALESCE(CAST(tc.CONTRACTOR_CS_RATE AS FLOAT), 0.0) AS CONTRACTOR_CS_RATE,
+          COALESCE(CAST(tc.CONTRACTOR_C_RATE  AS FLOAT), 0.0) AS CONTRACTOR_C_RATE
+        FROM f
+        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
+          ON m.ADO_TEAM = f.TEAM_RAW
+        LEFT JOIN {db}.{sch}.TEAMS t
+          ON t.TEAMID = m.TEAMID
+        LEFT JOIN {db}.{sch}.TEAM_CALC tc
+          ON tc.TEAMID = t.TEAMID
+      ),
+      /* Per Team × Year × Iteration aggregates to split the fixed team PI cost equally */
+      team_pi AS (
+        SELECT
+          TEAMID,
+          ADO_YEAR,
+          ITERATION_NUM,
+          COUNT(*) AS FEATURE_COUNT,
+          /* Fixed PI cost pool for that team/period */
+          MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
+        FROM j
+        GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
+      )
+      SELECT
+        j.FEATURE_ID,
+        j.TITLE,
+        j.STATE,
+        j.TEAM_RAW,
+        j.APP_NAME_RAW,
+        j.EFFORT_POINTS,
+        j.ITERATION_PATH,
+        j.CREATED_AT,
+        j.CHANGED_AT,
+        j.ADO_YEAR,
+        j.ITERATION_NUM,
+        CASE
+          WHEN j.ADO_YEAR IS NOT NULL AND j.ITERATION_NUM IS NOT NULL
+          THEN j.ADO_YEAR || '-I' || j.ITERATION_NUM
+          ELSE NULL
+        END AS ADO_PI_KEY,
+
+        /* Context */
+        j.TEAMID,
+        j.TEAMNAME,
+        j.DELIVERY_TEAM_FTE,
+        j.CONTRACTOR_CS_FTE,
+        j.CONTRACTOR_C_FTE,
+        j.TEAMFTE,
+        j.XOM_RATE,
+        j.CONTRACTOR_CS_RATE,
+        j.CONTRACTOR_C_RATE,
+
+        /* Denominator for effort-based split (for delivery/contractor parts) */
+        (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
+
+        /* === COSTS PER FEATURE (PI) ====================================== */
+
+        /* TEAM fixed PI cost split evenly across features in the period */
+        CAST(
+          CASE
+            WHEN tp.FEATURE_COUNT > 0 THEN tp.TEAM_PI_FIXED_COST / tp.FEATURE_COUNT
+            ELSE 0
+          END
+        AS FLOAT) AS TEAM_COST_PERPI,
+
+        /* Delivery share * effort * XOM rate (unchanged) */
+        CAST(
+          CASE
+            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
+              THEN 0
+            ELSE (j.DELIVERY_TEAM_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.XOM_RATE
+        AS FLOAT) AS DEL_TEAM_COST_PERPI,
+
+        /* Contractor CS share * effort * CS rate (unchanged) */
+        CAST(
+          CASE
+            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
+              THEN 0
+            ELSE (j.CONTRACTOR_CS_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_CS_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
+
+        /* Contractor C share * effort * C rate (unchanged) */
+        CAST(
+          CASE
+            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
+              THEN 0
+            ELSE (j.CONTRACTOR_C_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_C_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
+
+      FROM j
+      LEFT JOIN team_pi tp
+        ON tp.TEAMID        = j.TEAMID
+       AND tp.ADO_YEAR      = j.ADO_YEAR
+       AND tp.ITERATION_NUM = j.ITERATION_NUM
+    """)
+
+    """
+    Per‑feature cost view:
+      - TEAM_COST_PERPI = (TEAMFTE * XOM_RATE / 4) / (# of features in Team × ADO_YEAR × Iteration)
+      - Delivery/Contractor terms remain effort‑weighted (unchanged)
+      - Exposes ADO_YEAR, ITERATION_NUM, ADO_PI_KEY and all component FTEs/rates
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
+      WITH f AS (
+        SELECT
+          af.FEATURE_ID,
+          af.TITLE,
+          af.STATE,
+          af.TEAM_RAW,
+          af.APP_NAME_RAW,
+          af.EFFORT_POINTS,
+          af.ITERATION_PATH,
+          af.CREATED_AT,
+          af.CHANGED_AT,
+          /* Prefer explicit ADO_YEAR column if present, else derive from timestamps */
+          COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
+          /* Extract iteration number from patterns like 'I1', 'I 2', 'Iteration 3' */
+          TRY_TO_NUMBER(
+            REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)
+          ) AS ITERATION_NUM
+        FROM {db}.{sch}.ADO_FEATURES af
+      ),
+      j AS (
+        SELECT
+          f.*,
+          m.TEAMID,
+          t.TEAMNAME,
+          /* FTEs cast to FLOAT */
+          COALESCE(CAST(t.DELIVERY_TEAM_FTE  AS FLOAT), 0.0) AS DELIVERY_TEAM_FTE,
+          COALESCE(CAST(t.CONTRACTOR_CS_FTE  AS FLOAT), 0.0) AS CONTRACTOR_CS_FTE,
+          COALESCE(CAST(t.CONTRACTOR_C_FTE   AS FLOAT), 0.0) AS CONTRACTOR_C_FTE,
+          COALESCE(CAST(t.TEAMFTE            AS FLOAT), 0.0) AS TEAMFTE,
+          /* Rates cast to FLOAT */
+          COALESCE(CAST(tc.XOM_RATE           AS FLOAT), 0.0) AS XOM_RATE,
+          COALESCE(CAST(tc.CONTRACTOR_CS_RATE AS FLOAT), 0.0) AS CONTRACTOR_CS_RATE,
+          COALESCE(CAST(tc.CONTRACTOR_C_RATE  AS FLOAT), 0.0) AS CONTRACTOR_C_RATE
+        FROM f
+        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
+          ON m.ADO_TEAM = f.TEAM_RAW
+        LEFT JOIN {db}.{sch}.TEAMS t
+          ON t.TEAMID = m.TEAMID
+        LEFT JOIN {db}.{sch}.TEAM_CALC tc
+          ON tc.TEAMID = t.TEAMID
+      ),
+      /* Per Team × Year × Iteration aggregates to split the fixed team PI cost equally */
+      team_pi AS (
+        SELECT
+          TEAMID,
+          ADO_YEAR,
+          ITERATION_NUM,
+          COUNT(*) AS FEATURE_COUNT,
+          /* Fixed PI cost pool for that team/period */
+          MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
+        FROM j
+        GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
+      )
+      SELECT
+        j.FEATURE_ID,
+        j.TITLE,
+        j.STATE,
+        j.TEAM_RAW,
+        j.APP_NAME_RAW,
+        j.EFFORT_POINTS,
+        j.ITERATION_PATH,
+        j.CREATED_AT,
+        j.CHANGED_AT,
+        j.ADO_YEAR,
+        j.ITERATION_NUM,
+        CASE
+          WHEN j.ADO_YEAR IS NOT NULL AND j.ITERATION_NUM IS NOT NULL
+          THEN j.ADO_YEAR || '-I' || j.ITERATION_NUM
+          ELSE NULL
+        END AS ADO_PI_KEY,
+
+        /* Context */
+        j.TEAMID,
+        j.TEAMNAME,
+        j.DELIVERY_TEAM_FTE,
+        j.CONTRACTOR_CS_FTE,
+        j.CONTRACTOR_C_FTE,
+        j.TEAMFTE,
+        j.XOM_RATE,
+        j.CONTRACTOR_CS_RATE,
+        j.CONTRACTOR_C_RATE,
+
+        /* Denominator for effort-based split (for delivery/contractor parts) */
+        (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
+
+        /* === COSTS PER FEATURE (PI) ====================================== */
+
+        /* TEAM fixed PI cost split evenly across features in the period */
+        CAST(
+          CASE
+            WHEN tp.FEATURE_COUNT > 0 THEN tp.TEAM_PI_FIXED_COST / tp.FEATURE_COUNT
+            ELSE 0
+          END
+        AS FLOAT) AS TEAM_COST_PERPI,
+
+        /* Delivery share * effort * XOM rate (unchanged) */
+        CAST(
+          CASE
+            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
+              THEN 0
+            ELSE (j.DELIVERY_TEAM_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.XOM_RATE
+        AS FLOAT) AS DEL_TEAM_COST_PERPI,
+
+        /* Contractor CS share * effort * CS rate (unchanged) */
+        CAST(
+          CASE
+            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
+              THEN 0
+            ELSE (j.CONTRACTOR_CS_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_CS_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
+
+        /* Contractor C share * effort * C rate (unchanged) */
+        CAST(
+          CASE
+            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
+              THEN 0
+            ELSE (j.CONTRACTOR_C_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_C_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
+
+      FROM j
+      LEFT JOIN team_pi tp
+        ON tp.TEAMID        = j.TEAMID
+       AND tp.ADO_YEAR      = j.ADO_YEAR
+       AND tp.ITERATION_NUM = j.ITERATION_NUM
+    """)
+
+    """
     Creates a per-feature view that:
       - exposes ADO_YEAR and ITERATION_NUM (parsed from ITERATION_PATH)
       - uses team FTE composition + rates
