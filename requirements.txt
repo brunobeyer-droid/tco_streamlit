@@ -6,3 +6,4 @@ python-dotenv
 openpyxl==3.1.2     # xlsx / xlsm
 xlrd==1.2.0         # old .xls (this pinned version still supports xls)
 pyxlsb==1.0.10      # .xlsb
+plotly==6.3.0

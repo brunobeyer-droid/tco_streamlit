@@ -72,10 +72,7 @@ def _get_connection():
 # =========================================================
 
 def execute(sql: str, params: Optional[Iterable[Any]] = None, many: bool = False) -> None:
-    """
-    Execute a statement. Use many=True with 'params' as list of tuples for executemany.
-    Commits after execution.
-    """
+    """Execute a statement. Use many=True with 'params' as list of tuples for executemany."""
     conn = _get_connection()
     with conn.cursor() as cur:
         if many and params is not None:
@@ -242,10 +239,10 @@ def ensure_tables() -> None:
     """)
     _add_unique_if_absent("TEAMS", "TEAMNAME", "UQ_TEAMS_TEAMNAME")
 
-    # Ensure numeric columns exist
+    # Ensure numeric columns exist/correct
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
-    # NEW NAME: CONTRACTOR_CS_FTE (rename from old if present)
+    # Rename legacy CONTRACTOR_CS -> CONTRACTOR_CS_FTE if needed, then ensure column
     db, sch = _db_and_schema()
     try:
         if _table_has_column(db, sch, "TEAMS", "CONTRACTOR_CS") and not _table_has_column(db, sch, "TEAMS", "CONTRACTOR_CS_FTE"):
@@ -253,8 +250,7 @@ def ensure_tables() -> None:
     except Exception:
         pass
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS_FTE FLOAT")
-
-    # NEW: Product Owner on Teams
+    # Optional ProductOwner
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS PRODUCTOWNER STRING")
 
     # VENDORS
@@ -286,7 +282,7 @@ def ensure_tables() -> None:
     except Exception:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD COLUMN IF NOT EXISTS ADD_INFO STRING")
 
-    # FK + uniqueness
+    # FKs / uniqueness
     try:
         execute(f"""
             ALTER TABLE { _fq('APPLICATIONS') }
@@ -359,27 +355,20 @@ def ensure_tables() -> None:
 
 
 def normalize_team_numeric_types() -> None:
-    """
-    Normalize team numeric columns to NUMBER(18,2) to match Team FTE behavior.
-    """
+    """Normalize team numeric columns to NUMBER(18,2)."""
     for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
         try:
             execute(f"ALTER TABLE { _fq('TEAMS') } ALTER COLUMN {col} SET DATA TYPE NUMBER(18,2)")
         except Exception:
             pass
 
+
 # =========================
 # TEAM_CALC: rates & calcs
 # =========================
 
 def ensure_team_calc_table() -> None:
-    """
-    TEAM_CALC stores editable rate columns per team (no duplication of counts).
-    Columns created here are NEW per your spec:
-      - XOM_RATE
-      - CONTRACTOR_CS_RATE
-      - CONTRACTOR_C_RATE
-    """
+    """TEAM_CALC stores editable rate columns per team."""
     db, sch = _db_and_schema()
     execute(f"""
       CREATE TABLE IF NOT EXISTS {db}.{sch}.TEAM_CALC (
@@ -395,9 +384,7 @@ def upsert_team_calc_rates(team_id: str,
                            xom_rate: Optional[float],
                            contractor_cs_rate: Optional[float],
                            contractor_c_rate: Optional[float]) -> None:
-    """
-    Insert or update TEAM_CALC rates for a team.
-    """
+    """Insert or update TEAM_CALC rates for a team."""
     db, sch = _db_and_schema()
     execute(f"""
       MERGE INTO {db}.{sch}.TEAM_CALC t
@@ -415,9 +402,7 @@ def upsert_team_calc_rates(team_id: str,
     """, (team_id, xom_rate, contractor_cs_rate, contractor_c_rate))
 
 def list_team_calc() -> pd.DataFrame:
-    """
-    Current TEAM_CALC rows with team names.
-    """
+    """Current TEAM_CALC rows with team names."""
     return fetch_df(f"""
       SELECT
         tc.TEAMID, t.TEAMNAME,
@@ -427,6 +412,7 @@ def list_team_calc() -> pd.DataFrame:
       LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = tc.TEAMID
       ORDER BY t.TEAMNAME
     """)
+
 
 # =========================================================
 # Upserts (core)
@@ -680,64 +666,9 @@ def upsert_invoice(
         eff_type,
     ))
 
-# Backward compatibility wrapper
-def upsert_invoice_extended(
-    invoice_id: str,
-    application_id: str,
-    team_id: str,
-    renewal_date,
-    amount: float,
-    status: str,
-    fiscal_year: Optional[int] = None,
-    product_owner: Optional[str] = None,
-    amount_next_year: Optional[float] = None,
-    contract_active: Optional[bool] = True,
-    company_code: Optional[str] = None,
-    cost_center: Optional[str] = None,
-    serial_number: Optional[str] = None,
-    work_order: Optional[str] = None,
-    agreement_number: Optional[str] = None,
-    contract_due: Optional[int] = None,
-    service_type: Optional[str] = None,
-    notes: Optional[str] = None,
-    group_id: Optional[str] = None,
-    programid_at_booking: Optional[str] = None,
-    vendorid_at_booking: Optional[str] = None,
-    groupid_at_booking: Optional[str] = None,
-    rollover_batch_id: Optional[str] = None,
-    rolled_over_from_year: Optional[int] = None,
-    invoice_type: Optional[str] = None,
-) -> None:
-    return upsert_invoice(
-        invoice_id=invoice_id,
-        application_id=application_id,
-        team_id=team_id,
-        renewal_date=renewal_date,
-        amount=amount,
-        status=status,
-        fiscal_year=fiscal_year,
-        product_owner=product_owner,
-        amount_next_year=amount_next_year,
-        contract_active=contract_active,
-        company_code=company_code,
-        cost_center=cost_center,
-        serial_number=serial_number,
-        work_order=work_order,
-        agreement_number=agreement_number,
-        contract_due=contract_due,
-        service_type=service_type,
-        notes=notes,
-        group_id=group_id,
-        programid_at_booking=programid_at_booking,
-        vendorid_at_booking=vendorid_at_booking,
-        groupid_at_booking=groupid_at_booking,
-        rollover_batch_id=rollover_batch_id,
-        rolled_over_from_year=rolled_over_from_year,
-        invoice_type=invoice_type,
-    )
 
 # =========================================================
-# Deletes (with safety checks)
+# Deletes
 # =========================================================
 
 def delete_program(program_id: str) -> None:
@@ -868,9 +799,7 @@ def list_group_team_links(team_id: Optional[str] = None) -> pd.DataFrame:
 
 
 def list_applications(team_id: Optional[str] = None, group_id: Optional[str] = None) -> pd.DataFrame:
-    """
-    List application instances. Optionally filter by team (via group’s team) and/or group.
-    """
+    """List application instances. Optionally filter by team (via group’s team) and/or group."""
     ensure_groups_teamid()
     where_clauses = []
     params: List[Any] = []
@@ -1003,10 +932,6 @@ def repair_programs_programfte() -> None:
 def repair_team_fte_values() -> None:
     """
     Coerce TEAMS FTE columns that might be stored as VARCHAR (e.g., '5,0') into numeric.
-    - Replaces comma decimals with dots
-    - Trims blanks to NULL
-    - Uses TRY_TO_DECIMAL to avoid errors
-    - Then enforces NUMBER(18,2) on the columns
     """
     db, sch = _db_and_schema()
     for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
@@ -1022,8 +947,6 @@ def repair_team_fte_values() -> None:
             """)
         except Exception:
             pass
-
-    # Enforce numeric data types after cleaning
     for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
         try:
             execute(f"ALTER TABLE {db}.{sch}.TEAMS ALTER COLUMN {col} SET DATA TYPE NUMBER(18,2)")
@@ -1049,17 +972,17 @@ def ensure_ado_minimal_tables() -> None:
         ITERATION_PATH STRING,
         CREATED_AT     TIMESTAMP_NTZ,
         CHANGED_AT     TIMESTAMP_NTZ,
-        ADO_YEAR       NUMBER(4)           -- <-- NEW (nullable, from Excel "Year")
+        ADO_YEAR       NUMBER(4)           -- from Excel "Year" (nullable)
       )
     """)
 
-    # If table already exists but column doesn't, add it now:
+    # Add ADO_YEAR if table pre-existed without it
     try:
         execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES ADD COLUMN IF NOT EXISTS ADO_YEAR NUMBER(4)")
     except Exception:
         pass
 
-    # Mapping tables (unchanged)...
+    # Mapping tables
     execute(f"""
       CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM (
         ADO_TEAM STRING PRIMARY KEY,
@@ -1074,20 +997,14 @@ def ensure_ado_minimal_tables() -> None:
     """)
 
 
-
 def reset_ado_calc_artifacts(drop_mappings: bool = False) -> None:
-    """
-    Remove calculation artifacts (tables/columns) created earlier.
-    """
+    """Remove earlier calc artifacts (safe to call)."""
     db, sch = _db_and_schema()
-
     for tbl in ["ADO_FEATURE_COST_ESTIMATE", "EFFORT_SPLIT_RULES"]:
         try:
             execute(f"DROP TABLE IF EXISTS {db}.{sch}.{tbl}")
         except Exception:
             pass
-
-    # Try to drop any known calc columns on ADO_FEATURES
     for col in [
         "ADO_YEAR", "POINTS_PER_FTE_PER_PI",
         "EFF_TEAM","EFF_DELIVERY","EFF_CS","EFF_C",
@@ -1100,33 +1017,22 @@ def reset_ado_calc_artifacts(drop_mappings: bool = False) -> None:
                 execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES DROP COLUMN {col}")
         except Exception:
             pass
-
     if drop_mappings:
         for tbl in ["MAP_ADO_TEAM_TO_TCO_TEAM", "MAP_ADO_APP_TO_TCO_GROUP"]:
             try:
                 execute(f"DROP TABLE IF EXISTS {db}.{sch}.{tbl}")
             except Exception:
                 pass
-
     ensure_ado_minimal_tables()
 
 
-# ---------- NEW: EFFORT_POINTS precision repair & upserts ----------
-
 def repair_ado_effort_points_precision() -> None:
-    """
-    1) Ensure ADO_FEATURES.EFFORT_POINTS is FLOAT (keeps decimals).
-    2) Clean existing rows where points may be strings or use comma decimals.
-       Anything unparsable becomes NULL.
-    """
+    """Ensure ADO_FEATURES.EFFORT_POINTS is FLOAT and normalized."""
     db, sch = _db_and_schema()
-    # Ensure type is FLOAT
     try:
         execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES ALTER COLUMN EFFORT_POINTS SET DATA TYPE FLOAT")
     except Exception:
         pass
-
-    # Normalize values: to_varchar -> replace comma -> try_to_decimal -> cast float
     try:
         execute(f"""
             UPDATE {db}.{sch}.ADO_FEATURES
@@ -1136,11 +1042,14 @@ def repair_ado_effort_points_precision() -> None:
                     18, 6
                 ) AS FLOAT
             )
-            WHERE TRUE
         """)
     except Exception:
         pass
 
+
+# =========================================================
+# ADO upserts + mappings
+# =========================================================
 
 def upsert_ado_feature(
     feature_id: str,
@@ -1152,8 +1061,9 @@ def upsert_ado_feature(
     iteration_path: Optional[str] = None,
     created_at: Optional[str] = None,
     changed_at: Optional[str] = None,
+    ado_year: Optional[int] = None,
 ) -> None:
-    """Insert/update a single ADO feature with decimal-preserving effort points."""
+    """Insert/update a single ADO feature."""
     db, sch = _db_and_schema()
     ensure_ado_minimal_tables()
 
@@ -1161,7 +1071,7 @@ def upsert_ado_feature(
       MERGE INTO {db}.{sch}.ADO_FEATURES t
       USING (
         SELECT %s FEATURE_ID, %s TITLE, %s STATE, %s TEAM_RAW, %s APP_NAME_RAW,
-               %s EFFORT_POINTS, %s ITERATION_PATH, %s CREATED_AT, %s CHANGED_AT
+               %s EFFORT_POINTS, %s ITERATION_PATH, %s CREATED_AT, %s CHANGED_AT, %s ADO_YEAR
       ) s
       ON t.FEATURE_ID = s.FEATURE_ID
       WHEN MATCHED THEN UPDATE SET
@@ -1172,21 +1082,19 @@ def upsert_ado_feature(
         EFFORT_POINTS  = s.EFFORT_POINTS,
         ITERATION_PATH = s.ITERATION_PATH,
         CREATED_AT     = s.CREATED_AT,
-        CHANGED_AT     = s.CHANGED_AT
+        CHANGED_AT     = s.CHANGED_AT,
+        ADO_YEAR       = s.ADO_YEAR
       WHEN NOT MATCHED THEN INSERT
-        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT, ADO_YEAR)
       VALUES
-        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT, s.ADO_YEAR)
     """
-    execute(sql, (
-        feature_id, title, state, team_raw, app_name_raw,
-        None if effort_points is None else float(str(effort_points).replace(",", ".")),
-        iteration_path, created_at, changed_at
-    ))
+    ep = None if effort_points is None else float(str(effort_points).replace(",", "."))
+    execute(sql, (feature_id, title, state, team_raw, app_name_raw, ep, iteration_path, created_at, changed_at, ado_year))
 
 
 def bulk_upsert_ado_features(rows: Iterable[Dict[str, Any]]) -> None:
-    """Batch upsert for ADO features; keeps decimal effort points intact."""
+    """Batch upsert for ADO features."""
     db, sch = _db_and_schema()
     ensure_ado_minimal_tables()
 
@@ -1204,6 +1112,7 @@ def bulk_upsert_ado_features(rows: Iterable[Dict[str, Any]]) -> None:
             r.get("iteration_path"),
             r.get("created_at"),
             r.get("changed_at"),
+            r.get("ado_year"),
         ))
 
     sql = f"""
@@ -1211,7 +1120,7 @@ def bulk_upsert_ado_features(rows: Iterable[Dict[str, Any]]) -> None:
       USING (
         SELECT
           %s AS FEATURE_ID, %s AS TITLE, %s AS STATE, %s AS TEAM_RAW, %s AS APP_NAME_RAW,
-          %s AS EFFORT_POINTS, %s AS ITERATION_PATH, %s AS CREATED_AT, %s AS CHANGED_AT
+          %s AS EFFORT_POINTS, %s AS ITERATION_PATH, %s AS CREATED_AT, %s AS CHANGED_AT, %s AS ADO_YEAR
       ) s
       ON t.FEATURE_ID = s.FEATURE_ID
       WHEN MATCHED THEN UPDATE SET
@@ -1222,16 +1131,15 @@ def bulk_upsert_ado_features(rows: Iterable[Dict[str, Any]]) -> None:
         EFFORT_POINTS  = s.EFFORT_POINTS,
         ITERATION_PATH = s.ITERATION_PATH,
         CREATED_AT     = s.CREATED_AT,
-        CHANGED_AT     = s.CHANGED_AT
+        CHANGED_AT     = s.CHANGED_AT,
+        ADO_YEAR       = s.ADO_YEAR
       WHEN NOT MATCHED THEN INSERT
-        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT, ADO_YEAR)
       VALUES
-        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT, s.ADO_YEAR)
     """
     execute(sql, params, many=True)
 
-
-# ---------- NEW: Mapping helpers ----------
 
 def upsert_map_ado_team_to_tco_team(ado_team: str, team_id: Optional[str]) -> None:
     """Map an ADO team name to a TCO TEAMID (nullable unmaps)."""
@@ -1281,442 +1189,19 @@ def list_map_ado_app() -> pd.DataFrame:
 
 
 # =========================================================
-# Views: list & drop helpers
+# Views
 # =========================================================
 
 def ensure_team_cost_view() -> None:
     """
-    Per‑feature cost view:
-      - TEAM_COST_PERPI = (TEAMFTE * XOM_RATE / 4) / (# of features in Team × ADO_YEAR × Iteration)
-      - Delivery/Contractor terms remain effort‑weighted (unchanged)
-      - Exposes ADO_YEAR, ITERATION_NUM, ADO_PI_KEY and all component FTEs/rates
+    Per-feature cost view (equal-split team fixed PI cost):
+      TEAM_COST_PERPI = (TEAMFTE * XOM_RATE / 4) / (# of features in Team×ADO_YEAR×Iteration)
+      Delivery/Contractor parts remain effort-weighted.
     """
     db, sch = _db_and_schema()
     execute(f"""
       CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
       WITH f AS (
-        SELECT
-          af.FEATURE_ID,
-          af.TITLE,
-          af.STATE,
-          af.TEAM_RAW,
-          af.APP_NAME_RAW,
-          af.EFFORT_POINTS,
-          af.ITERATION_PATH,
-          af.CREATED_AT,
-          af.CHANGED_AT,
-          /* Prefer explicit ADO_YEAR column if present, else derive from timestamps */
-          COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
-          /* Extract iteration number from patterns like 'I1', 'I 2', 'Iteration 3' */
-          TRY_TO_NUMBER(
-            REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)
-          ) AS ITERATION_NUM
-        FROM {db}.{sch}.ADO_FEATURES af
-      ),
-      j AS (
-        SELECT
-          f.*,
-          m.TEAMID,
-          t.TEAMNAME,
-          /* FTEs cast to FLOAT */
-          COALESCE(CAST(t.DELIVERY_TEAM_FTE  AS FLOAT), 0.0) AS DELIVERY_TEAM_FTE,
-          COALESCE(CAST(t.CONTRACTOR_CS_FTE  AS FLOAT), 0.0) AS CONTRACTOR_CS_FTE,
-          COALESCE(CAST(t.CONTRACTOR_C_FTE   AS FLOAT), 0.0) AS CONTRACTOR_C_FTE,
-          COALESCE(CAST(t.TEAMFTE            AS FLOAT), 0.0) AS TEAMFTE,
-          /* Rates cast to FLOAT */
-          COALESCE(CAST(tc.XOM_RATE           AS FLOAT), 0.0) AS XOM_RATE,
-          COALESCE(CAST(tc.CONTRACTOR_CS_RATE AS FLOAT), 0.0) AS CONTRACTOR_CS_RATE,
-          COALESCE(CAST(tc.CONTRACTOR_C_RATE  AS FLOAT), 0.0) AS CONTRACTOR_C_RATE
-        FROM f
-        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
-          ON m.ADO_TEAM = f.TEAM_RAW
-        LEFT JOIN {db}.{sch}.TEAMS t
-          ON t.TEAMID = m.TEAMID
-        LEFT JOIN {db}.{sch}.TEAM_CALC tc
-          ON tc.TEAMID = t.TEAMID
-      ),
-      /* Per Team × Year × Iteration aggregates to split the fixed team PI cost equally */
-      team_pi AS (
-        SELECT
-          TEAMID,
-          ADO_YEAR,
-          ITERATION_NUM,
-          COUNT(*) AS FEATURE_COUNT,
-          /* Fixed PI cost pool for that team/period */
-          MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
-        FROM j
-        GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
-      )
-      SELECT
-        j.FEATURE_ID,
-        j.TITLE,
-        j.STATE,
-        j.TEAM_RAW,
-        j.APP_NAME_RAW,
-        j.EFFORT_POINTS,
-        j.ITERATION_PATH,
-        j.CREATED_AT,
-        j.CHANGED_AT,
-        j.ADO_YEAR,
-        j.ITERATION_NUM,
-        CASE
-          WHEN j.ADO_YEAR IS NOT NULL AND j.ITERATION_NUM IS NOT NULL
-          THEN j.ADO_YEAR || '-I' || j.ITERATION_NUM
-          ELSE NULL
-        END AS ADO_PI_KEY,
-
-        /* Context */
-        j.TEAMID,
-        j.TEAMNAME,
-        j.DELIVERY_TEAM_FTE,
-        j.CONTRACTOR_CS_FTE,
-        j.CONTRACTOR_C_FTE,
-        j.TEAMFTE,
-        j.XOM_RATE,
-        j.CONTRACTOR_CS_RATE,
-        j.CONTRACTOR_C_RATE,
-
-        /* Denominator for effort-based split (for delivery/contractor parts) */
-        (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
-
-        /* === COSTS PER FEATURE (PI) ====================================== */
-
-        /* TEAM fixed PI cost split evenly across features in the period */
-        CAST(
-          CASE
-            WHEN tp.FEATURE_COUNT > 0 THEN tp.TEAM_PI_FIXED_COST / tp.FEATURE_COUNT
-            ELSE 0
-          END
-        AS FLOAT) AS TEAM_COST_PERPI,
-
-        /* Delivery share * effort * XOM rate (unchanged) */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.DELIVERY_TEAM_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END * COALESCE(j.EFFORT_POINTS,0) * j.XOM_RATE
-        AS FLOAT) AS DEL_TEAM_COST_PERPI,
-
-        /* Contractor CS share * effort * CS rate (unchanged) */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.CONTRACTOR_CS_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_CS_RATE
-        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
-
-        /* Contractor C share * effort * C rate (unchanged) */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.CONTRACTOR_C_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_C_RATE
-        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
-
-      FROM j
-      LEFT JOIN team_pi tp
-        ON tp.TEAMID        = j.TEAMID
-       AND tp.ADO_YEAR      = j.ADO_YEAR
-       AND tp.ITERATION_NUM = j.ITERATION_NUM
-    """)
-
-    """
-    Per‑feature cost view:
-      - TEAM_COST_PERPI = (TEAMFTE * XOM_RATE / 4) / (# of features in Team × ADO_YEAR × Iteration)
-      - Delivery/Contractor terms remain effort‑weighted (unchanged)
-      - Exposes ADO_YEAR, ITERATION_NUM, ADO_PI_KEY and all component FTEs/rates
-    """
-    db, sch = _db_and_schema()
-    execute(f"""
-      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
-      WITH f AS (
-        SELECT
-          af.FEATURE_ID,
-          af.TITLE,
-          af.STATE,
-          af.TEAM_RAW,
-          af.APP_NAME_RAW,
-          af.EFFORT_POINTS,
-          af.ITERATION_PATH,
-          af.CREATED_AT,
-          af.CHANGED_AT,
-          /* Prefer explicit ADO_YEAR column if present, else derive from timestamps */
-          COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
-          /* Extract iteration number from patterns like 'I1', 'I 2', 'Iteration 3' */
-          TRY_TO_NUMBER(
-            REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)
-          ) AS ITERATION_NUM
-        FROM {db}.{sch}.ADO_FEATURES af
-      ),
-      j AS (
-        SELECT
-          f.*,
-          m.TEAMID,
-          t.TEAMNAME,
-          /* FTEs cast to FLOAT */
-          COALESCE(CAST(t.DELIVERY_TEAM_FTE  AS FLOAT), 0.0) AS DELIVERY_TEAM_FTE,
-          COALESCE(CAST(t.CONTRACTOR_CS_FTE  AS FLOAT), 0.0) AS CONTRACTOR_CS_FTE,
-          COALESCE(CAST(t.CONTRACTOR_C_FTE   AS FLOAT), 0.0) AS CONTRACTOR_C_FTE,
-          COALESCE(CAST(t.TEAMFTE            AS FLOAT), 0.0) AS TEAMFTE,
-          /* Rates cast to FLOAT */
-          COALESCE(CAST(tc.XOM_RATE           AS FLOAT), 0.0) AS XOM_RATE,
-          COALESCE(CAST(tc.CONTRACTOR_CS_RATE AS FLOAT), 0.0) AS CONTRACTOR_CS_RATE,
-          COALESCE(CAST(tc.CONTRACTOR_C_RATE  AS FLOAT), 0.0) AS CONTRACTOR_C_RATE
-        FROM f
-        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
-          ON m.ADO_TEAM = f.TEAM_RAW
-        LEFT JOIN {db}.{sch}.TEAMS t
-          ON t.TEAMID = m.TEAMID
-        LEFT JOIN {db}.{sch}.TEAM_CALC tc
-          ON tc.TEAMID = t.TEAMID
-      ),
-      /* Per Team × Year × Iteration aggregates to split the fixed team PI cost equally */
-      team_pi AS (
-        SELECT
-          TEAMID,
-          ADO_YEAR,
-          ITERATION_NUM,
-          COUNT(*) AS FEATURE_COUNT,
-          /* Fixed PI cost pool for that team/period */
-          MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
-        FROM j
-        GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
-      )
-      SELECT
-        j.FEATURE_ID,
-        j.TITLE,
-        j.STATE,
-        j.TEAM_RAW,
-        j.APP_NAME_RAW,
-        j.EFFORT_POINTS,
-        j.ITERATION_PATH,
-        j.CREATED_AT,
-        j.CHANGED_AT,
-        j.ADO_YEAR,
-        j.ITERATION_NUM,
-        CASE
-          WHEN j.ADO_YEAR IS NOT NULL AND j.ITERATION_NUM IS NOT NULL
-          THEN j.ADO_YEAR || '-I' || j.ITERATION_NUM
-          ELSE NULL
-        END AS ADO_PI_KEY,
-
-        /* Context */
-        j.TEAMID,
-        j.TEAMNAME,
-        j.DELIVERY_TEAM_FTE,
-        j.CONTRACTOR_CS_FTE,
-        j.CONTRACTOR_C_FTE,
-        j.TEAMFTE,
-        j.XOM_RATE,
-        j.CONTRACTOR_CS_RATE,
-        j.CONTRACTOR_C_RATE,
-
-        /* Denominator for effort-based split (for delivery/contractor parts) */
-        (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
-
-        /* === COSTS PER FEATURE (PI) ====================================== */
-
-        /* TEAM fixed PI cost split evenly across features in the period */
-        CAST(
-          CASE
-            WHEN tp.FEATURE_COUNT > 0 THEN tp.TEAM_PI_FIXED_COST / tp.FEATURE_COUNT
-            ELSE 0
-          END
-        AS FLOAT) AS TEAM_COST_PERPI,
-
-        /* Delivery share * effort * XOM rate (unchanged) */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.DELIVERY_TEAM_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END * COALESCE(j.EFFORT_POINTS,0) * j.XOM_RATE
-        AS FLOAT) AS DEL_TEAM_COST_PERPI,
-
-        /* Contractor CS share * effort * CS rate (unchanged) */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.CONTRACTOR_CS_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_CS_RATE
-        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
-
-        /* Contractor C share * effort * C rate (unchanged) */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.CONTRACTOR_C_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_C_RATE
-        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
-
-      FROM j
-      LEFT JOIN team_pi tp
-        ON tp.TEAMID        = j.TEAMID
-       AND tp.ADO_YEAR      = j.ADO_YEAR
-       AND tp.ITERATION_NUM = j.ITERATION_NUM
-    """)
-
-    """
-    Creates a per-feature view that:
-      - exposes ADO_YEAR and ITERATION_NUM (parsed from ITERATION_PATH)
-      - uses team FTE composition + rates
-      - allocates the fixed team PI cost across features so that summing over features
-        for a Team/Year/Iteration equals the team’s PI cost exactly.
-    """
-    db, sch = _db_and_schema()
-    execute(f"""
-      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
-      WITH f AS (
-        SELECT
-          af.FEATURE_ID,
-          af.TITLE,
-          af.STATE,
-          af.TEAM_RAW,
-          af.APP_NAME_RAW,
-          af.EFFORT_POINTS,
-          af.ITERATION_PATH,
-          af.CREATED_AT,
-          af.CHANGED_AT,
-          /* Take ADO_YEAR from ADO_FEATURES if present; fall back to year of CHANGED/CREATED */
-          COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
-          /* Iteration number like I1, I 2, Iteration 3 → 1/2/3 */
-          TRY_TO_NUMBER(REGEXP_SUBSTR(af.ITERATION_PATH,
-                     'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)) AS ITERATION_NUM
-        FROM {db}.{sch}.ADO_FEATURES af
-      ),
-      j AS (
-        SELECT
-          f.*,
-          m.TEAMID,
-          t.TEAMNAME,
-          /* Team FTEs (coerced to FLOAT) */
-          COALESCE(CAST(t.DELIVERY_TEAM_FTE  AS FLOAT), 0.0) AS DELIVERY_TEAM_FTE,
-          COALESCE(CAST(t.CONTRACTOR_CS_FTE  AS FLOAT), 0.0) AS CONTRACTOR_CS_FTE,
-          COALESCE(CAST(t.CONTRACTOR_C_FTE   AS FLOAT), 0.0) AS CONTRACTOR_C_FTE,
-          COALESCE(CAST(t.TEAMFTE            AS FLOAT), 0.0) AS TEAMFTE,
-          /* Rates (FLOAT) */
-          COALESCE(CAST(tc.XOM_RATE           AS FLOAT), 0.0) AS XOM_RATE,
-          COALESCE(CAST(tc.CONTRACTOR_CS_RATE AS FLOAT), 0.0) AS CONTRACTOR_CS_RATE,
-          COALESCE(CAST(tc.CONTRACTOR_C_RATE  AS FLOAT), 0.0) AS CONTRACTOR_C_RATE
-        FROM f
-        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
-          ON m.ADO_TEAM = f.TEAM_RAW
-        LEFT JOIN {db}.{sch}.TEAMS t
-          ON t.TEAMID = m.TEAMID
-        LEFT JOIN {db}.{sch}.TEAM_CALC tc
-          ON tc.TEAMID = t.TEAMID
-      ),
-      /* Team-year-iteration aggregates to allocate fixed team PI cost */
-      team_pi AS (
-        SELECT
-          TEAMID,
-          ADO_YEAR,
-          ITERATION_NUM,
-          SUM(COALESCE(EFFORT_POINTS, 0))            AS TOTAL_EFFORT_POINTS,
-          COUNT(*)                                    AS FEATURE_COUNT,
-          /* This is the fixed per-PI team cost for the period */
-          MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
-        FROM j
-        GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
-      )
-      SELECT
-        j.FEATURE_ID,
-        j.TITLE,
-        j.STATE,
-        j.TEAM_RAW,
-        j.APP_NAME_RAW,
-        j.EFFORT_POINTS,
-        j.ITERATION_PATH,
-        j.CREATED_AT,
-        j.CHANGED_AT,
-        j.ADO_YEAR,
-        j.ITERATION_NUM,
-        /* Composite key like 2025-I1 (nullable-friendly) */
-        CASE
-          WHEN j.ADO_YEAR IS NOT NULL AND j.ITERATION_NUM IS NOT NULL
-          THEN j.ADO_YEAR || '-I' || j.ITERATION_NUM
-          ELSE NULL
-        END AS ADO_PI_KEY,
-
-        /* Team & Rates context */
-        j.TEAMID,
-        j.TEAMNAME,
-        j.DELIVERY_TEAM_FTE,
-        j.CONTRACTOR_CS_FTE,
-        j.CONTRACTOR_C_FTE,
-        j.TEAMFTE,
-        j.XOM_RATE,
-        j.CONTRACTOR_CS_RATE,
-        j.CONTRACTOR_C_RATE,
-
-        /* Denominator for effort‑based split */
-        (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
-
-        /* Allocation helpers from team_pi */
-        tp.TOTAL_EFFORT_POINTS,
-        tp.FEATURE_COUNT,
-        tp.TEAM_PI_FIXED_COST,
-
-        /* === COSTS PER FEATURE (PI) ====================================== */
-
-        /* (A) Fixed Team PI cost ALLOCATED to features.
-           Prefer effort‑proportional allocation. If total effort is 0, split evenly. */
-        CAST(
-          CASE
-            WHEN tp.TOTAL_EFFORT_POINTS > 0
-              THEN tp.TEAM_PI_FIXED_COST * (COALESCE(j.EFFORT_POINTS,0) / tp.TOTAL_EFFORT_POINTS)
-            WHEN tp.FEATURE_COUNT > 0
-              THEN tp.TEAM_PI_FIXED_COST / tp.FEATURE_COUNT
-            ELSE 0
-          END
-        AS FLOAT) AS TEAM_COST_PERPI,
-
-        /* (B) Delivery share * effort * XOM rate */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.DELIVERY_TEAM_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END
-          * COALESCE(j.EFFORT_POINTS,0) * j.XOM_RATE
-        AS FLOAT) AS DEL_TEAM_COST_PERPI,
-
-        /* (C) Contractor CS share * effort * CS rate */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.CONTRACTOR_CS_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END
-          * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_CS_RATE
-        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
-
-        /* (D) Contractor C share * effort * C rate */
-        CAST(
-          CASE
-            WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0
-              THEN 0
-            ELSE (j.CONTRACTOR_C_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
-          END
-          * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_C_RATE
-        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
-
-      FROM j
-      LEFT JOIN team_pi tp
-        ON tp.TEAMID        = j.TEAMID
-       AND tp.ADO_YEAR      = j.ADO_YEAR
-       AND tp.ITERATION_NUM = j.ITERATION_NUM
-    """)
-
-    db, sch = _db_and_schema()
-    execute(f"""
-      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
-      WITH j AS (
         SELECT
           af.FEATURE_ID,
           af.TITLE,
@@ -1727,113 +1212,233 @@ def ensure_team_cost_view() -> None:
           af.ITERATION_PATH,
           af.CREATED_AT,
           af.CHANGED_AT,
-          af.ADO_YEAR                                               AS ADO_YEAR_EXCEL,   -- <-- from Excel
-
+          COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
+          TRY_TO_NUMBER(REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)) AS ITERATION_NUM
+        FROM {db}.{sch}.ADO_FEATURES af
+      ),
+      j AS (
+        SELECT
+          f.*,
           m.TEAMID,
           t.TEAMNAME,
-
-          -- FTEs (robust cast to FLOAT)
-          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.DELIVERY_TEAM_FTE)), ''), ',', '.'), 18, 6), 0) AS FLOAT) AS DELIVERY_TEAM_FTE,
-          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.CONTRACTOR_CS_FTE)), ''), ',', '.'), 18, 6), 0) AS FLOAT) AS CONTRACTOR_CS_FTE,
-          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.CONTRACTOR_C_FTE)), ''), ',', '.'), 18, 6), 0) AS FLOAT) AS CONTRACTOR_C_FTE,
-          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.TEAMFTE)), ''), ',', '.'), 18, 6), 0) AS FLOAT) AS TEAMFTE,
-
-          -- Rates
-          CAST(COALESCE(tc.XOM_RATE, 0) AS FLOAT)           AS XOM_RATE,
+          CAST(COALESCE(t.DELIVERY_TEAM_FTE,  0) AS FLOAT) AS DELIVERY_TEAM_FTE,
+          CAST(COALESCE(t.CONTRACTOR_CS_FTE,  0) AS FLOAT) AS CONTRACTOR_CS_FTE,
+          CAST(COALESCE(t.CONTRACTOR_C_FTE,   0) AS FLOAT) AS CONTRACTOR_C_FTE,
+          CAST(COALESCE(t.TEAMFTE,            0) AS FLOAT) AS TEAMFTE,
+          CAST(COALESCE(tc.XOM_RATE,           0) AS FLOAT) AS XOM_RATE,
           CAST(COALESCE(tc.CONTRACTOR_CS_RATE, 0) AS FLOAT) AS CONTRACTOR_CS_RATE,
-          CAST(COALESCE(tc.CONTRACTOR_C_RATE, 0) AS FLOAT)  AS CONTRACTOR_C_RATE,
-
-          -- Regex helpers (Snowflake: pass 'i' for case-insensitive)
-          REGEXP_SUBSTR(af.ITERATION_PATH, '(19|20)[0-9]{2}')                                           AS YEAR4_STR,
-          REGEXP_REPLACE(af.ITERATION_PATH, '.*FY\\s*([0-9]{2,4}).*', '\\1', 1, 1, 'i')                  AS FY_DIGITS_STR,
-          REGEXP_REPLACE(af.ITERATION_PATH, '.*(PI|ITERATION|I)\\s*-?\\s*([0-9]+).*', '\\2', 1, 1, 'i')  AS ITER_NUM_STR
-        FROM {db}.{sch}.ADO_FEATURES af
-        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
-          ON m.ADO_TEAM = af.TEAM_RAW
-        LEFT JOIN {db}.{sch}.TEAMS t
-          ON t.TEAMID = m.TEAMID
-        LEFT JOIN {db}.{sch}.TEAM_CALC tc
-          ON tc.TEAMID = t.TEAMID
-      )
-      , parsed AS (
+          CAST(COALESCE(tc.CONTRACTOR_C_RATE,  0) AS FLOAT) AS CONTRACTOR_C_RATE
+        FROM f
+        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m ON m.ADO_TEAM = f.TEAM_RAW
+        LEFT JOIN {db}.{sch}.TEAMS t ON t.TEAMID = m.TEAMID
+        LEFT JOIN {db}.{sch}.TEAM_CALC tc ON tc.TEAMID = t.TEAMID
+      ),
+      team_pi AS (
         SELECT
-          FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT,
-          TEAMID, TEAMNAME,
-          DELIVERY_TEAM_FTE, CONTRACTOR_CS_FTE, CONTRACTOR_C_FTE, TEAMFTE,
-          XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE,
-
-          -- Year precedence: Excel ADO_YEAR -> explicit YYYY -> FYxx/FYyyyy -> timestamp year
-          COALESCE(
-            ADO_YEAR_EXCEL,
-            TRY_TO_NUMBER(YEAR4_STR),
-            CASE
-              WHEN TRY_TO_NUMBER(FY_DIGITS_STR) IS NOT NULL THEN
-                CASE WHEN LENGTH(FY_DIGITS_STR) = 2
-                     THEN 2000 + TRY_TO_NUMBER(FY_DIGITS_STR)  -- FY25 -> 2025
-                     ELSE TRY_TO_NUMBER(FY_DIGITS_STR)
-                END
-              ELSE NULL
-            END,
-            CASE WHEN COALESCE(CHANGED_AT, CREATED_AT) IS NOT NULL THEN YEAR(COALESCE(CHANGED_AT, CREATED_AT)) END
-          ) AS ADO_YEAR,
-
-          TRY_TO_NUMBER(ITER_NUM_STR) AS ITERATION_NUM
+          TEAMID,
+          ADO_YEAR,
+          ITERATION_NUM,
+          COUNT(*) AS FEATURE_COUNT,
+          MAX(COALESCE(TEAMFTE,0) * COALESCE(XOM_RATE,0) / 4.0) AS TEAM_PI_FIXED_COST
         FROM j
+        GROUP BY TEAMID, ADO_YEAR, ITERATION_NUM
+      )
+      SELECT
+        j.FEATURE_ID,
+        j.TITLE,
+        j.STATE,
+        j.TEAM_RAW,
+        j.APP_NAME_RAW,
+        j.EFFORT_POINTS,
+        j.ITERATION_PATH,
+        j.CREATED_AT,
+        j.CHANGED_AT,
+        j.ADO_YEAR,
+        j.ITERATION_NUM,
+        CASE WHEN j.ADO_YEAR IS NOT NULL AND j.ITERATION_NUM IS NOT NULL
+             THEN j.ADO_YEAR || '-I' || j.ITERATION_NUM END AS ADO_PI_KEY,
+
+        j.TEAMID,
+        j.TEAMNAME,
+        j.DELIVERY_TEAM_FTE,
+        j.CONTRACTOR_CS_FTE,
+        j.CONTRACTOR_C_FTE,
+        j.TEAMFTE,
+        j.XOM_RATE,
+        j.CONTRACTOR_CS_RATE,
+        j.CONTRACTOR_C_RATE,
+
+        (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
+
+        /* Equal-split Team PI cost */
+        CAST(CASE WHEN tp.FEATURE_COUNT > 0 THEN tp.TEAM_PI_FIXED_COST / tp.FEATURE_COUNT ELSE 0 END AS FLOAT) AS TEAM_COST_PERPI,
+
+        /* Delivery share * effort * XOM rate */
+        CAST(
+          CASE WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0 THEN 0
+               ELSE (j.DELIVERY_TEAM_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.XOM_RATE
+        AS FLOAT) AS DEL_TEAM_COST_PERPI,
+
+        /* Contractor CS share * effort * CS rate */
+        CAST(
+          CASE WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0 THEN 0
+               ELSE (j.CONTRACTOR_CS_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_CS_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
+
+        /* Contractor C share * effort * C rate */
+        CAST(
+          CASE WHEN (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) = 0 THEN 0
+               ELSE (j.CONTRACTOR_C_FTE / (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE))
+          END * COALESCE(j.EFFORT_POINTS,0) * j.CONTRACTOR_C_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
+
+      FROM j
+      LEFT JOIN team_pi tp
+        ON tp.TEAMID        = j.TEAMID
+       AND tp.ADO_YEAR      = j.ADO_YEAR
+       AND tp.ITERATION_NUM = j.ITERATION_NUM
+    """)
+
+
+def ensure_feature_costs_long_view() -> None:
+    """
+    Tidy (long) feature costs with UNPIVOT (no VARIANT/FLATTEN anywhere).
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_FEATURE_COSTS_LONG AS
+      WITH base AS (
+        SELECT
+          v.FEATURE_ID, v.TITLE, v.APP_NAME_RAW, v.ITERATION_PATH,
+          v.ADO_YEAR, v.ITERATION_NUM,
+          v.TEAMID, v.TEAMNAME,
+          t.PROGRAMID, p.PROGRAMNAME,
+          g.GROUPID, g.GROUPNAME,
+          /* force numeric early so UNPIVOT yields NUMBER, not VARIANT */
+          CAST(v.TEAM_COST_PERPI               AS NUMBER(18,2)) AS TEAM_COST_PERPI_EQSPLIT,
+          CAST(v.DEL_TEAM_COST_PERPI           AS NUMBER(18,2)) AS DEL_TEAM_COST_PERPI,
+          CAST(v.TEAM_CONTRACTOR_CS_COST_PERPI AS NUMBER(18,2)) AS TEAM_CONTRACTOR_CS_COST_PERPI,
+          CAST(v.TEAM_CONTRACTOR_C_COST_PERPI  AS NUMBER(18,2)) AS TEAM_CONTRACTOR_C_COST_PERPI
+        FROM {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE v
+        LEFT JOIN {db}.{sch}.TEAMS t ON t.TEAMID = v.TEAMID
+        LEFT JOIN {db}.{sch}.PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
+        LEFT JOIN {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP mag ON mag.ADO_APP = v.APP_NAME_RAW
+        LEFT JOIN {db}.{sch}.APPLICATION_GROUPS g ON g.GROUPID = mag.APP_GROUP
       )
       SELECT
         FEATURE_ID,
         TITLE,
-        STATE,
-        TEAM_RAW,
-        TEAMID,
-        TEAMNAME,
         APP_NAME_RAW,
-        EFFORT_POINTS,
         ITERATION_PATH,
-        CREATED_AT,
-        CHANGED_AT,
-
         ADO_YEAR,
         ITERATION_NUM,
-        CASE
-          WHEN ADO_YEAR IS NOT NULL AND ITERATION_NUM IS NOT NULL
-            THEN ADO_YEAR::STRING || '-I' || ITERATION_NUM::STRING
-          ELSE NULL
-        END AS ADO_PI_KEY,
-
-        DELIVERY_TEAM_FTE,
-        CONTRACTOR_CS_FTE,
-        CONTRACTOR_C_FTE,
-        TEAMFTE,
-        XOM_RATE,
-        CONTRACTOR_CS_RATE,
-        CONTRACTOR_C_RATE,
-
-        CAST(DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE AS FLOAT) AS COMP_DENOM,
-
-        CAST(TEAMFTE * XOM_RATE / 4 AS FLOAT) AS TEAM_COST_PERPI,
-
-        CAST(
-          CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
-               ELSE (DELIVERY_TEAM_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
-          END * EFFORT_POINTS * XOM_RATE AS FLOAT
-        ) AS DEL_TEAM_COST_PERPI,
-
-        CAST(
-          CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
-               ELSE (CONTRACTOR_CS_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
-          END * EFFORT_POINTS * CONTRACTOR_CS_RATE AS FLOAT
-        ) AS TEAM_CONTRACTOR_CS_COST_PERPI,
-
-        CAST(
-          CASE WHEN (CONTRACTOR_C_FTE + CONTRACTOR_CS_FTE + DELIVERY_TEAM_FTE) = 0 THEN 0
-               ELSE (CONTRACTOR_C_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
-          END * EFFORT_POINTS * CONTRACTOR_C_RATE AS FLOAT
-        ) AS TEAM_CONTRACTOR_C_COST_PERPI
-
-      FROM parsed
+        TEAMID,
+        TEAMNAME,
+        PROGRAMID,
+        PROGRAMNAME,
+        GROUPID,
+        GROUPNAME,
+        CASE EMPLOYEE_TYPE
+          WHEN 'TEAM_COST_PERPI_EQSPLIT'          THEN 'TEAM'
+          WHEN 'DEL_TEAM_COST_PERPI'              THEN 'DELIVERY'
+          WHEN 'TEAM_CONTRACTOR_CS_COST_PERPI'    THEN 'CONTRACTOR_CS'
+          WHEN 'TEAM_CONTRACTOR_C_COST_PERPI'     THEN 'CONTRACTOR_C'
+          ELSE EMPLOYEE_TYPE
+        END AS EMPLOYEE_TYPE,
+        COST_PERPI,
+        COST_PERPI AS COST_PERPI_VALUE
+      FROM base
+      UNPIVOT (
+        COST_PERPI FOR EMPLOYEE_TYPE IN (
+          TEAM_COST_PERPI_EQSPLIT,
+          DEL_TEAM_COST_PERPI,
+          TEAM_CONTRACTOR_CS_COST_PERPI,
+          TEAM_CONTRACTOR_C_COST_PERPI
+        )
+      )
     """)
 
+
+def ensure_invoice_spend_view() -> None:
+    """Annual invoice spend by Program/Team/Group."""
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_INVOICE_SPEND AS
+      SELECT
+        t.PROGRAMID,
+        p.PROGRAMNAME,
+        i.TEAMID,
+        t.TEAMNAME,
+        COALESCE(i.GROUPID, i.GROUPID_AT_BOOKING, a.GROUPID) AS GROUPID,
+        g.GROUPNAME,
+        COALESCE(i.FISCAL_YEAR, YEAR(i.RENEWALDATE)) AS FISCAL_YEAR,
+        COALESCE(i.INVOICE_TYPE, 'Recurring Invoice') AS INVOICE_TYPE,
+        CAST(COALESCE(i.AMOUNT, 0) AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.INVOICES i
+      LEFT JOIN {db}.{sch}.APPLICATIONS a  ON a.APPLICATIONID = i.APPLICATIONID
+      LEFT JOIN {db}.{sch}.APPLICATION_GROUPS g ON g.GROUPID = COALESCE(i.GROUPID, i.GROUPID_AT_BOOKING, a.GROUPID)
+      LEFT JOIN {db}.{sch}.TEAMS t ON t.TEAMID = i.TEAMID
+      LEFT JOIN {db}.{sch}.PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
+    """)
+
+
+def ensure_costs_and_invoices_view() -> None:
+    """
+    Unified fact view: per-feature PI costs + annual invoices.
+    YEAR = ADO_YEAR (features) or FISCAL_YEAR (invoices).
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_COSTS_AND_INVOICES AS
+      SELECT
+        'FEATURE' AS SOURCE,
+        f.ADO_YEAR      AS YEAR,
+        f.ITERATION_NUM AS PI,
+        f.PROGRAMID, f.PROGRAMNAME,
+        f.TEAMID, f.TEAMNAME,
+        f.GROUPID, f.GROUPNAME,
+        f.EMPLOYEE_TYPE,
+        CAST(f.COST_PERPI AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.VW_FEATURE_COSTS_LONG f
+
+      UNION ALL
+
+      SELECT
+        'INVOICE' AS SOURCE,
+        s.FISCAL_YEAR   AS YEAR,
+        NULL            AS PI,
+        s.PROGRAMID, s.PROGRAMNAME,
+        s.TEAMID, s.TEAMNAME,
+        s.GROUPID, s.GROUPNAME,
+        NULL            AS EMPLOYEE_TYPE,
+        CAST(s.AMOUNT AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.VW_INVOICE_SPEND s
+    """)
+
+
+def ensure_all_views_ok() -> None:
+    """Drop & rebuild views in the correct order; smoke test the unified view."""
+    # Drop first to avoid stale definitions
+    for v in ("VW_COSTS_AND_INVOICES", "VW_FEATURE_COSTS_LONG", "VW_TEAM_COSTS_PER_FEATURE", "VW_INVOICE_SPEND"):
+        try:
+            drop_view(v)
+        except Exception:
+            pass
+
+    ensure_team_cost_view()          # base per-feature
+    ensure_feature_costs_long_view() # long (UNPIVOT)
+    ensure_invoice_spend_view()      # yearly invoices
+    ensure_costs_and_invoices_view() # union fact
+
+    # Smoke test: ensure view exists/compiles
+    _ = fetch_df(f"SELECT 1 FROM { _fq('VW_COSTS_AND_INVOICES') } LIMIT 1")
+
+
+# =========================================================
+# Views admin helpers
+# =========================================================
 
 def list_views(pattern: Optional[str] = None) -> pd.DataFrame:
     """List views in the current database/schema."""
@@ -1904,18 +1509,14 @@ def rename_column(table: str, old: str, new: str) -> None:
 
 if not st.session_state.get("_tco_db_init_done"):
     ensure_tables()
-    # Sanitize any legacy string FTEs like '5,0' -> 5.00 before enforcing numeric
-    repair_team_fte_values()            # <<< ADDED
+    repair_team_fte_values()
     normalize_team_numeric_types()
     ensure_team_calc_table()
 
-    # Ensure ADO raw + mapping tables exist BEFORE the cost view
     ensure_ado_minimal_tables()
-
-    # Clean/normalize EFFORT_POINTS once per session (idempotent and fast)
     repair_ado_effort_points_precision()
 
-    # Now the view can safely reference decimals and sanitized FTEs
-    ensure_team_cost_view()
+    # Build all analytics views in correct order
+    ensure_all_views_ok()
 
     st.session_state["_tco_db_init_done"] = True

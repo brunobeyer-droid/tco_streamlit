@@ -1,78 +1,237 @@
-import streamlit as st
+# pages/Dashboard.py
+import sys, subprocess, json
 import pandas as pd
-import plotly.express as px
-from snowflake_db import fetch_df
+import streamlit as st
+
+# ---- self-heal Plotly if missing ----
+def _ensure_plotly():
+    try:
+        import plotly.express as px
+        return px
+    except ModuleNotFoundError:
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "plotly>=5.20"])
+            import plotly.express as px
+            return px
+        except Exception as e:
+            raise RuntimeError("Plotly is required. Install with: pip install 'plotly>=5.20'") from e
+
+px = _ensure_plotly()
+
+# ---- Snowflake helpers ----
+try:
+    from snowflake_db import fetch_df, ensure_all_views_ok
+    try:
+        ensure_all_views_ok()
+    except Exception:
+        pass
+except ImportError:
+    from snowflake_db import fetch_df
 
 st.set_page_config(page_title="TCO Dashboard", layout="wide")
-st.title("📊 TCO Dashboard (Working + Non‑Working)")
 
-programs = fetch_df("SELECT PROGRAMID, PROGRAMNAME FROM PROGRAMS ORDER BY PROGRAMNAME").reset_index(drop=True)
-teams    = fetch_df("SELECT TEAMID, TEAMNAME, PROGRAMID FROM TEAMS ORDER BY TEAMNAME").reset_index(drop=True)
+# =========================
+# Query helpers
+# =========================
+@st.cache_data(ttl=120)
+def _choices(col: str) -> list:
+    sql = f"SELECT DISTINCT {col} AS V FROM VW_COSTS_AND_INVOICES ORDER BY 1"
+    df = fetch_df(sql)
+    if df.empty:
+        return []
+    return [v for v in df["V"].tolist() if v is not None and v != ""]
 
-colf1, colf2 = st.columns(2)
-program_pick = colf1.multiselect("Program(s)", programs["PROGRAMNAME"].tolist())
-team_pick    = colf2.multiselect("Team(s)", teams["TEAMNAME"].tolist())
+@st.cache_data(ttl=120)
+def _fetch_filtered(years, programs, teams, groups, sources, emp_types) -> pd.DataFrame:
+    where = ["1=1"]
+    params = []
 
-# Working Force (from estimate table)
-wf_sql = """
-SELECT
-  e.FEATURE_ID, e.TITLE, e.STATE,
-  e.TEAMID, t.TEAMNAME,
-  COALESCE(ag.PROGRAMID, t.PROGRAMID) AS PROGRAMID,
-  p.PROGRAMNAME,
-  e.APP_GROUP,
-  e.EFFORT_POINTS, e.EST_FTE_PI, e.EST_COST_PI, e.ITERATION_PATH
-FROM ADO_FEATURE_COST_ESTIMATE e
-LEFT JOIN TEAMS t ON t.TEAMID = e.TEAMID
-LEFT JOIN APPLICATION_GROUPS ag ON ag.GROUPNAME = e.APP_GROUP
-LEFT JOIN PROGRAMS p ON p.PROGRAMID = COALESCE(ag.PROGRAMID, t.PROGRAMID)
-"""
-wf = fetch_df(wf_sql).fillna({"PROGRAMNAME":"(Unassigned)","TEAMNAME":"(Unmapped)","APP_GROUP":"(Unmapped)"}).reset_index(drop=True)
+    def _json_in(col, values, as_number=False):
+        if not values:
+            return
+        where.append(
+            f"""{col} IN (
+                  SELECT VALUE::{'NUMBER' if as_number else 'STRING'}
+                  FROM TABLE(FLATTEN(input=>PARSE_JSON(%s)))
+                )"""
+        )
+        params.append(json.dumps(values))
 
-# Non‑Working (Invoices)
-nwf_sql = """
-SELECT
-  COALESCE(ag.PROGRAMID, i.PROGRAMID_AT_BOOKING) AS PROGRAMID,
-  i.FISCAL_YEAR,
-  i.AMOUNT
-FROM INVOICES i
-LEFT JOIN APPLICATIONS a ON a.APPLICATIONID = i.APPLICATIONID
-LEFT JOIN APPLICATION_GROUPS ag ON ag.GROUPID = a.GROUPID
-"""
-nwf = fetch_df(nwf_sql).reset_index(drop=True)
+    _json_in("YEAR", years, as_number=True)
+    _json_in("PROGRAMNAME", programs)
+    _json_in("TEAMNAME", teams)
+    _json_in("GROUPNAME", groups)
+    _json_in("SOURCE", sources)
+    _json_in("EMPLOYEE_TYPE", emp_types)
 
-# Apply filters
-if program_pick:
-    prog_ids = programs[programs["PROGRAMNAME"].isin(program_pick)]["PROGRAMID"].tolist()
-    wf = wf[wf["PROGRAMID"].isin(prog_ids)]
-    nwf = nwf[nwf["PROGRAMID"].isin(prog_ids)]
-if team_pick:
-    wf = wf[wf["TEAMNAME"].isin(team_pick)]
+    sql = f"""
+        SELECT
+            SOURCE, YEAR, PI,
+            PROGRAMID, PROGRAMNAME, TEAMID, TEAMNAME, GROUPID, GROUPNAME,
+            EMPLOYEE_TYPE, AMOUNT
+        FROM VW_COSTS_AND_INVOICES
+        WHERE {' AND '.join(where)}
+    """
+    df = fetch_df(sql, tuple(params) if params else None)
+    return df if not df.empty else pd.DataFrame(
+        columns=["SOURCE","YEAR","PI","PROGRAMID","PROGRAMNAME","TEAMID","TEAMNAME",
+                 "GROUPID","GROUPNAME","EMPLOYEE_TYPE","AMOUNT"]
+    )
 
-# KPIs
-wf_cost = float(wf["EST_COST_PI"].sum()) if "EST_COST_PI" in wf else 0.0
-nwf_cost = float(nwf["AMOUNT"].sum()) if "AMOUNT" in nwf else 0.0
-k1, k2, k3 = st.columns(3)
-k1.metric("Working Force (Estimated)", f"${wf_cost:,.0f}")
-k2.metric("Non‑Working (Invoices)", f"${nwf_cost:,.0f}")
-k3.metric("Total Cost of Ownership", f"${wf_cost + nwf_cost:,.0f}")
+# =========================
+# Layout
+# =========================
+st.title("Cost & Invoice Dashboard")
 
-st.divider()
-st.subheader("Working Force")
-if not wf.empty:
-    wf_prog = wf.groupby(["PROGRAMNAME"], as_index=False)["EST_COST_PI"].sum()
-    st.plotly_chart(px.bar(wf_prog, x="PROGRAMNAME", y="EST_COST_PI", title="WF Cost by Program"), use_container_width=True)
-    wf_team = wf.groupby(["TEAMNAME"], as_index=False)["EST_COST_PI"].sum()
-    st.plotly_chart(px.bar(wf_team, x="TEAMNAME", y="EST_COST_PI", title="WF Cost by Team"), use_container_width=True)
-    wf_app = wf.groupby(["APP_GROUP"], as_index=False)["EST_COST_PI"].sum()
-    st.plotly_chart(px.bar(wf_app, x="APP_GROUP", y="EST_COST_PI", title="WF Cost by App Group"), use_container_width=True)
-else:
-    st.info("No Working Force data yet. Run the estimation on the ADO page.")
+left, right = st.columns([3, 1], gap="large")
 
-st.divider()
-st.subheader("Non‑Working (Invoices) per Fiscal Year")
-if not nwf.empty:
-    inv_year = nwf.groupby(["FISCAL_YEAR"], as_index=False)["AMOUNT"].sum()
-    st.plotly_chart(px.bar(inv_year, x="FISCAL_YEAR", y="AMOUNT", title="Invoices per Year"), use_container_width=True)
-else:
-    st.info("No invoice data found.")
+# ---------- Filters (right) ----------
+with right:
+    st.subheader("Filters")
+
+    years_all      = _choices("YEAR")
+    sources_all    = _choices("SOURCE")
+    programs_all   = _choices("PROGRAMNAME")
+    teams_all      = _choices("TEAMNAME")
+    groups_all     = _choices("GROUPNAME")
+    emp_types_all  = _choices("EMPLOYEE_TYPE")
+
+    years      = st.multiselect("Year", years_all, default=[])
+    sources    = st.multiselect("Source (FEATURE / INVOICE)", sources_all, default=[])
+    programs   = st.multiselect("Program", programs_all, default=[])
+    teams      = st.multiselect("Team", teams_all, default=[])
+    groups     = st.multiselect("Application Group", groups_all, default=[])
+    emp_types  = st.multiselect("Employee Type (Feature rows)", emp_types_all, default=[])
+
+    if st.button("Clear filters", use_container_width=True):
+        st.experimental_rerun()
+
+# ---------- Data (uses right-side selections) ----------
+df = _fetch_filtered(years, programs, teams, groups, sources, emp_types)
+
+with left:
+    if df.empty:
+        st.info("No data for the current filters.")
+    else:
+        # ==== KPI strip (Amount, Programs, Teams) ====
+        total_amount = float(df["AMOUNT"].sum()) if "AMOUNT" in df else 0.0
+        prog_count   = int(df["PROGRAMID"].nunique()) if "PROGRAMID" in df else 0
+        team_count   = int(df["TEAMID"].nunique()) if "TEAMID" in df else 0
+
+        k1, k2, k3 = st.columns(3)
+        with k1:
+            st.metric("Total Amount", f"${total_amount:,.0f}")
+        with k2:
+            st.metric("Programs", f"{prog_count:,}")
+        with k3:
+            st.metric("Teams", f"{team_count:,}")
+
+        # Optional sanity note if IDs vs names don’t align (can happen if invoices use a different TEAMID)
+        if df["TEAMID"].nunique() != df["TEAMNAME"].nunique():
+            st.caption(
+                "⚠️ Team count differs by **ID** vs **Name**. "
+                "This usually means some rows reference a different TEAMID for the same team "
+                "(e.g., features vs invoices). Check mappings."
+            )
+
+        # ---------------- Row 1 ----------------
+        r1c1, r1c2 = st.columns(2)
+        with r1c1:
+            # Total by Year
+            d = df.groupby("YEAR", as_index=False)["AMOUNT"].sum().sort_values("YEAR")
+            fig = px.bar(d, x="YEAR", y="AMOUNT", title="Total Amount by Year")
+            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+        with r1c2:
+            # Source by Year (stacked)
+            d = df.groupby(["YEAR","SOURCE"], as_index=False)["AMOUNT"].sum()
+            fig = px.bar(d, x="YEAR", y="AMOUNT", color="SOURCE", barmode="stack",
+                         title="Amount by Year & Source")
+            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0), legend_title_text="")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ---------------- Row 2 ----------------
+        r2c1, r2c2 = st.columns(2)
+        with r2c1:
+            # Top Programs
+            d = (df.groupby("PROGRAMNAME", as_index=False)["AMOUNT"].sum()
+                   .sort_values("AMOUNT", ascending=False)
+                   .head(12))
+            fig = px.bar(d, x="AMOUNT", y="PROGRAMNAME", orientation="h",
+                         title="Top Programs by Amount")
+            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0), yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with r2c2:
+            # Top Teams
+            d = (df.groupby("TEAMNAME", as_index=False)["AMOUNT"].sum()
+                   .sort_values("AMOUNT", ascending=False)
+                   .head(12))
+            fig = px.bar(d, x="AMOUNT", y="TEAMNAME", orientation="h",
+                         title="Top Teams by Amount")
+            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0), yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ---------------- Row 3 ----------------
+        r3c1, r3c2 = st.columns(2)
+        with r3c1:
+            # Top Groups
+            d = (df.groupby("GROUPNAME", as_index=False)["AMOUNT"].sum()
+                   .sort_values("AMOUNT", ascending=False)
+                   .head(12))
+            fig = px.bar(d, x="AMOUNT", y="GROUPNAME", orientation="h",
+                         title="Top Application Groups by Amount")
+            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0), yaxis_title="")
+            st.plotly_chart(fig, use_container_width=True)
+
+        with r3c2:
+            # Employee Type mix (feature rows only)
+            d = df[df["SOURCE"] == "FEATURE"].copy()
+            if not d.empty:
+                d = d.groupby("EMPLOYEE_TYPE", as_index=False)["AMOUNT"].sum()
+                fig = px.pie(d, values="AMOUNT", names="EMPLOYEE_TYPE",
+                             title="Employee Type Mix (Features)")
+                fig.update_layout(margin=dict(l=0,r=0,t=40,b=0))
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No feature rows in current selection for Employee Type chart.")
+
+        # ---------------- Row 4 ----------------
+        r4c1, r4c2 = st.columns(2)
+        with r4c1:
+            # Year & PI (features only)
+            d = df[(df["SOURCE"] == "FEATURE") & df["PI"].notna()].copy()
+            if not d.empty:
+                d["PI"] = d["PI"].astype(str)
+                d2 = d.groupby(["YEAR","PI"], as_index=False)["AMOUNT"].sum()
+                fig = px.bar(d2, x="YEAR", y="AMOUNT", color="PI",
+                             title="Feature Cost by Year & PI (Stacked)")
+                fig.update_layout(margin=dict(l=0,r=0,t=40,b=0), legend_title_text="PI")
+                st.plotly_chart(fig, use_container_width=True)
+            else:
+                st.info("No PI data in current selection.")
+
+        with r4c2:
+            # Source split donut
+            d = df.groupby("SOURCE", as_index=False)["AMOUNT"].sum()
+            fig = px.pie(d, values="AMOUNT", names="SOURCE", hole=0.5,
+                         title="SOURCE Split (Feature vs Invoice)")
+            fig.update_layout(margin=dict(l=0,r=0,t=40,b=0))
+            st.plotly_chart(fig, use_container_width=True)
+
+        # ---- Optional: quick peek at distinct programs/teams under current filters
+        with st.expander("Distinct Programs & Teams in current selection"):
+            a, b = st.columns(2)
+            with a:
+                st.write("Programs")
+                prog_list = (df[["PROGRAMID","PROGRAMNAME"]]
+                             .drop_duplicates()
+                             .sort_values(["PROGRAMNAME","PROGRAMID"]))
+                st.dataframe(prog_list, hide_index=True, use_container_width=True)
+            with b:
+                st.write("Teams")
+                team_list = (df[["TEAMID","TEAMNAME"]]
+                             .drop_duplicates()
+                             .sort_values(["TEAMNAME","TEAMID"]))
+                st.dataframe(team_list, hide_index=True, use_container_width=True)
