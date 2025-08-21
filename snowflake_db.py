@@ -140,16 +140,14 @@ def _add_unique_if_absent(table: str, columns: str, constraint_name: str) -> Non
     try:
         execute(f"ALTER TABLE { _fq(table) } ADD CONSTRAINT {constraint_name} UNIQUE ({columns})")
     except Exception:
-        # If the table currently contains duplicate data, adding the constraint will fail.
-        # We still block duplicates at the app level in the upserts below.
+        # If duplicates exist, Snowflake will reject; we still enforce in app.
         pass
 
 
 def ensure_groups_teamid() -> None:
     """
     Ensure APPLICATION_GROUPS exists and has TEAMID column; add FK.
-    Additionally maintain a denormalized PROGRAMID column for convenience,
-    synced from TEAMS.PROGRAMID. Safe to run multiple times.
+    Maintain denormalized PROGRAMID column synced from TEAMS.PROGRAMID.
     """
     db, sch = _db_and_schema()
 
@@ -176,11 +174,11 @@ def ensure_groups_teamid() -> None:
         except Exception:
             pass
 
-    # Denormalized PROGRAMID convenience column
+    # Denormalized PROGRAMID
     if not _table_has_column(db, sch, "APPLICATION_GROUPS", "PROGRAMID"):
         execute(f"ALTER TABLE {db}.{sch}.APPLICATION_GROUPS ADD COLUMN PROGRAMID STRING")
 
-    # Backfill/sync PROGRAMID from TEAMS
+    # Sync PROGRAMID from TEAMS
     execute(f"""
       UPDATE {db}.{sch}.APPLICATION_GROUPS g
       SET PROGRAMID = t.PROGRAMID
@@ -189,7 +187,7 @@ def ensure_groups_teamid() -> None:
         AND (g.PROGRAMID IS NULL OR g.PROGRAMID <> t.PROGRAMID)
     """)
 
-    # Optional legacy backfill for TEAMID if a many-to-many existed
+    # Optional legacy backfill (if TEAMS_APP_GROUPS existed)
     try:
         _ = fetch_df(f"SELECT 1 FROM {db}.{sch}.TEAMS_APP_GROUPS LIMIT 1")
         rows = fetch_df(f"""
@@ -201,14 +199,13 @@ def ensure_groups_teamid() -> None:
             updates = []
             for _, r in rows.iterrows():
                 if int(r["CNT"]) == 1 and r["THE_TEAM"]:
-                    updates.append((r["THE_TEAM"], r["GROUPID"]))  # (TEAMID, GROUPID)
+                    updates.append((r["THE_TEAM"], r["GROUPID"]))
             if updates:
                 execute(f"""
                   UPDATE {db}.{sch}.APPLICATION_GROUPS
                   SET TEAMID = %s
                   WHERE GROUPID = %s AND TEAMID IS NULL
                 """, updates, many=True)
-                # re-sync PROGRAMID after TEAMID backfill
                 execute(f"""
                   UPDATE {db}.{sch}.APPLICATION_GROUPS g
                   SET PROGRAMID = t.PROGRAMID
@@ -221,8 +218,8 @@ def ensure_groups_teamid() -> None:
 
 
 def ensure_tables() -> None:
-    """Create/patch all tables & constraints; safe to call repeatedly."""
-    # Core
+    """Create/patch core tables & constraints; safe to call repeatedly."""
+    # PROGRAMS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("PROGRAMS") } (
             PROGRAMID    STRING PRIMARY KEY,
@@ -231,6 +228,9 @@ def ensure_tables() -> None:
             PROGRAMFTE   FLOAT
         )
     """)
+    _add_unique_if_absent("PROGRAMS", "PROGRAMNAME", "UQ_PROGRAMS_PROGRAMNAME")
+
+    # TEAMS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("TEAMS") } (
             TEAMID       STRING PRIMARY KEY,
@@ -240,29 +240,36 @@ def ensure_tables() -> None:
             COSTPERFTE   FLOAT
         )
     """)
-    # Ensure extended numeric team columns exist
+    _add_unique_if_absent("TEAMS", "TEAMNAME", "UQ_TEAMS_TEAMNAME")
+
+    # Ensure numeric columns exist
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
-    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS FLOAT")
-    # NEW: Product Owner on Teams (for your Teams page linkage)
+    # NEW NAME: CONTRACTOR_CS_FTE (rename from old if present)
+    db, sch = _db_and_schema()
+    try:
+        if _table_has_column(db, sch, "TEAMS", "CONTRACTOR_CS") and not _table_has_column(db, sch, "TEAMS", "CONTRACTOR_CS_FTE"):
+            execute(f"ALTER TABLE {db}.{sch}.TEAMS RENAME COLUMN CONTRACTOR_CS TO CONTRACTOR_CS_FTE")
+    except Exception:
+        pass
+    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS_FTE FLOAT")
+
+    # NEW: Product Owner on Teams
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS PRODUCTOWNER STRING")
 
+    # VENDORS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("VENDORS") } (
             VENDORID   STRING PRIMARY KEY,
             VENDORNAME STRING
         )
     """)
+    _add_unique_if_absent("VENDORS", "VENDORNAME", "UQ_VENDORS_VENDORNAME")
 
-    # Add DB-level uniqueness to PROGRAMNAME, TEAMNAME, VENDORNAME (idempotent attempts)
-    _add_unique_if_absent("PROGRAMS", "PROGRAMNAME", "UQ_PROGRAMS_PROGRAMNAME")
-    _add_unique_if_absent("TEAMS",    "TEAMNAME",    "UQ_TEAMS_TEAMNAME")
-    _add_unique_if_absent("VENDORS",  "VENDORNAME",  "UQ_VENDORS_VENDORNAME")
-
-    # Groups (1 Team → many Groups) + PROGRAMID sync
+    # GROUPS + PROGRAMID sync
     ensure_groups_teamid()
 
-    # Applications (each belongs to a group; optional vendor; optional additional info)
+    # APPLICATIONS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("APPLICATIONS") } (
             APPLICATIONID   STRING PRIMARY KEY,
@@ -272,16 +279,14 @@ def ensure_tables() -> None:
             ADD_INFO        STRING
         )
     """)
-    # --- MIGRATION: rename old SITE -> ADD_INFO safely ---
-    db, sch = _db_and_schema()
+    # Migrate old SITE->ADD_INFO if necessary
     try:
         if _table_has_column(db, sch, "APPLICATIONS", "SITE") and not _table_has_column(db, sch, "APPLICATIONS", "ADD_INFO"):
             execute(f"ALTER TABLE {db}.{sch}.APPLICATIONS RENAME COLUMN SITE TO ADD_INFO")
     except Exception:
-        # If RENAME not permitted, ensure ADD_INFO exists (we'll just keep both and ignore SITE)
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD COLUMN IF NOT EXISTS ADD_INFO STRING")
 
-    # Add FK/unique constraints if not present
+    # FK + uniqueness
     try:
         execute(f"""
             ALTER TABLE { _fq('APPLICATIONS') }
@@ -290,25 +295,20 @@ def ensure_tables() -> None:
         """)
     except Exception:
         pass
-
-    # Drop legacy uniqueness (GROUPID,SITE) if present
     try:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } DROP CONSTRAINT UQ_APP_GROUP_SITE")
     except Exception:
         pass
-    # New uniqueness on (GROUPID, ADD_INFO) — informational for Snowflake
     try:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD CONSTRAINT UQ_APP_GROUP_ADD_INFO UNIQUE (GROUPID, ADD_INFO)")
     except Exception:
         pass
-
-    # Metadata uniqueness on ApplicationName (UI also enforces)
     try:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD CONSTRAINT UQ_APPLICATIONS_NAME UNIQUE (APPLICATIONNAME)")
     except Exception:
         pass
 
-    # Invoices (with extended fields)
+    # INVOICES (+ extended fields)
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("INVOICES") } (
             INVOICEID     STRING PRIMARY KEY,
@@ -342,11 +342,9 @@ def ensure_tables() -> None:
     ]:
         execute(f"ALTER TABLE { _fq('INVOICES') } ADD COLUMN IF NOT EXISTS {col_ddl}")
 
-    # NEW: type column for Recurring vs Ad Hoc + safe backfill
+    # INVOICE_TYPE + uniqueness across annual recurring rows
     execute(f"ALTER TABLE { _fq('INVOICES') } ADD COLUMN IF NOT EXISTS INVOICE_TYPE STRING")
     execute(f"UPDATE { _fq('INVOICES') } SET INVOICE_TYPE = 'Recurring Invoice' WHERE INVOICE_TYPE IS NULL")
-
-    # ---- Uniqueness constraints (informational in Snowflake) ----
     try:
         execute(f"ALTER TABLE { _fq('INVOICES') } DROP CONSTRAINT UQ_INVOICE_ANNUAL")
     except Exception:
@@ -363,9 +361,8 @@ def ensure_tables() -> None:
 def normalize_team_numeric_types() -> None:
     """
     Normalize team numeric columns to NUMBER(18,2) to match Team FTE behavior.
-    Safe to run multiple times.
     """
-    for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS"):
+    for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
         try:
             execute(f"ALTER TABLE { _fq('TEAMS') } ALTER COLUMN {col} SET DATA TYPE NUMBER(18,2)")
         except Exception:
@@ -373,150 +370,10 @@ def normalize_team_numeric_types() -> None:
 
 
 # =========================================================
-# ADO tables / rates / capacity and cost view (idempotent)
-# =========================================================
-def ensure_ado_tables() -> None:
-    """
-    Creates ADO_FEATURES and supporting mapping/rate tables,
-    plus a view to compute blended rate per FTE-PI.
-    Safe to call multiple times.
-    """
-    # ADO raw features
-    execute("""
-    CREATE TABLE IF NOT EXISTS ADO_FEATURES (
-      FEATURE_ID STRING,
-      TITLE STRING,
-      STATE STRING,
-      TEAM_RAW STRING,
-      APP_NAME_RAW STRING,
-      EFFORT_POINTS NUMBER(18,2),
-      ITERATION_PATH STRING,
-      CREATED_AT TIMESTAMP_NTZ,
-      CHANGED_AT TIMESTAMP_NTZ
-    )
-    """)
-    try:
-        execute("ALTER TABLE ADO_FEATURES ADD CONSTRAINT UQ_ADO_FEATURE UNIQUE (FEATURE_ID)")
-    except Exception:
-        pass
-
-    # Mappings (ADO → TCO)
-    execute("""
-    CREATE TABLE IF NOT EXISTS MAP_ADO_TEAM_TO_TCO_TEAM (
-      ADO_TEAM STRING PRIMARY KEY,
-      TEAMID STRING
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS MAP_ADO_APP_TO_TCO_GROUP (
-      ADO_APP STRING PRIMARY KEY,
-      APP_GROUP STRING
-    )
-    """)
-
-    # Rates and capacity
-    execute("""
-    CREATE TABLE IF NOT EXISTS FTE_RATES (
-      EMPLOYEE_TYPE STRING,
-      EFFECTIVE_FROM DATE,
-      RATE_PER_PI NUMBER(18,2)
-    )
-    """)
-    try:
-        execute("ALTER TABLE FTE_RATES ADD CONSTRAINT UQ_FTE_RATE UNIQUE (EMPLOYEE_TYPE, EFFECTIVE_FROM)")
-    except Exception:
-        pass
-
-    execute("""
-    CREATE TABLE IF NOT EXISTS TEAM_CAPACITY (
-      TEAMID STRING,
-      EFFECTIVE_FROM DATE,
-      POINTS_PER_FTE_PER_PI NUMBER(18,4)
-    )
-    """)
-    try:
-        execute("ALTER TABLE TEAM_CAPACITY ADD CONSTRAINT UQ_TEAM_CAP UNIQUE (TEAMID, EFFECTIVE_FROM)")
-    except Exception:
-        pass
-
-    # Team FTE composition (optional but powerful for blended rates)
-    execute("""
-    CREATE TABLE IF NOT EXISTS TEAM_FTE_COMPOSITION (
-      TEAMID STRING,
-      ROLE_NAME STRING,
-      EMPLOYEE_TYPE STRING,
-      FTE_COUNT NUMBER(10,2)
-    )
-    """)
-    try:
-        execute("ALTER TABLE TEAM_FTE_COMPOSITION ADD CONSTRAINT UQ_TEAM_COMP UNIQUE (TEAMID, ROLE_NAME, EMPLOYEE_TYPE)")
-    except Exception:
-        pass
-
-    # View: blended rate and latest capacity as-of (uses your TEAMS)
-    execute("""
-    CREATE OR REPLACE VIEW V_TEAM_BLENDED_RATE_ASOF AS
-    WITH latest_rate AS (
-      SELECT EMPLOYEE_TYPE, RATE_PER_PI,
-             EFFECTIVE_FROM,
-             ROW_NUMBER() OVER (PARTITION BY EMPLOYEE_TYPE ORDER BY EFFECTIVE_FROM DESC) AS rn
-      FROM FTE_RATES
-    ),
-    latest_capacity AS (
-      SELECT TEAMID, POINTS_PER_FTE_PER_PI, EFFECTIVE_FROM,
-             ROW_NUMBER() OVER (PARTITION BY TEAMID ORDER BY EFFECTIVE_FROM DESC) AS rn
-      FROM TEAM_CAPACITY
-    ),
-    comp AS (
-      SELECT TEAMID, EMPLOYEE_TYPE, SUM(FTE_COUNT) AS FTE_COUNT
-      FROM TEAM_FTE_COMPOSITION
-      GROUP BY TEAMID, EMPLOYEE_TYPE
-    ),
-    rate AS (
-      SELECT EMPLOYEE_TYPE, RATE_PER_PI
-      FROM latest_rate WHERE rn=1
-    ),
-    cap AS (
-      SELECT TEAMID, POINTS_PER_FTE_PER_PI
-      FROM latest_capacity WHERE rn=1
-    )
-    SELECT
-      t.TEAMID,
-      COALESCE(SUM(comp.FTE_COUNT * rate.RATE_PER_PI),0) / NULLIF(SUM(comp.FTE_COUNT),0) AS BLENDED_RATE_PER_FTE_PI,
-      cap.POINTS_PER_FTE_PER_PI
-    FROM TEAMS t
-    LEFT JOIN comp ON comp.TEAMID = t.TEAMID
-    LEFT JOIN rate ON rate.EMPLOYEE_TYPE = comp.EMPLOYEE_TYPE
-    LEFT JOIN cap ON cap.TEAMID = t.TEAMID
-    GROUP BY t.TEAMID, cap.POINTS_PER_FTE_PER_PI
-    """)
-
-    # Materialized estimation table for dashboards
-    execute("""
-    CREATE TABLE IF NOT EXISTS ADO_FEATURE_COST_ESTIMATE (
-      FEATURE_ID STRING,
-      TITLE STRING,
-      STATE STRING,
-      TEAMID STRING,
-      APP_GROUP STRING,
-      EFFORT_POINTS NUMBER(18,2),
-      POINTS_PER_FTE_PER_PI NUMBER(18,4),
-      BLENDED_RATE_PER_FTE_PI NUMBER(18,2),
-      EST_FTE_PI NUMBER(18,4),
-      EST_COST_PI NUMBER(18,2),
-      ITERATION_PATH STRING,
-      CREATED_AT TIMESTAMP_NTZ,
-      CHANGED_AT TIMESTAMP_NTZ
-    )
-    """)
-
-
-# =========================================================
 # Upserts
 # =========================================================
 
 def upsert_program(program_id: str, name: str, owner: Optional[str], fte: Optional[float]) -> None:
-    # App-level uniqueness guard (case-insensitive)
     if name and str(name).strip():
         dup = fetch_df(
             f"SELECT PROGRAMID FROM { _fq('PROGRAMS') } WHERE UPPER(PROGRAMNAME)=UPPER(%s) AND PROGRAMID <> %s LIMIT 1",
@@ -543,7 +400,7 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
                 team_fte: Optional[float],
                 delivery_team_fte: Optional[float] = None,
                 contractor_c_fte: Optional[float] = None,
-                contractor_cs: Optional[float] = None) -> None:
+                contractor_cs_fte: Optional[float] = None) -> None:
     # App-level uniqueness guard (case-insensitive)
     if name and str(name).strip():
         dup = fetch_df(
@@ -553,15 +410,16 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
         if not dup.empty:
             raise ValueError(f"Team name '{name.strip()}' already exists.")
 
+    # Ensure columns exist (idempotent)
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
-    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS FLOAT")
+    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS_FTE FLOAT")
 
     sql = f"""
     MERGE INTO { _fq('TEAMS') } t
     USING (
       SELECT %s AS TEAMID, %s AS TEAMNAME, %s AS PROGRAMID,
-             %s AS TEAMFTE, %s AS DELIVERY_TEAM_FTE, %s AS CONTRACTOR_C_FTE, %s AS CONTRACTOR_CS
+             %s AS TEAMFTE, %s AS DELIVERY_TEAM_FTE, %s AS CONTRACTOR_C_FTE, %s AS CONTRACTOR_CS_FTE
     ) s
     ON t.TEAMID = s.TEAMID
     WHEN MATCHED THEN UPDATE SET
@@ -570,17 +428,16 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
       TEAMFTE = s.TEAMFTE,
       DELIVERY_TEAM_FTE = s.DELIVERY_TEAM_FTE,
       CONTRACTOR_C_FTE = s.CONTRACTOR_C_FTE,
-      CONTRACTOR_CS = s.CONTRACTOR_CS
+      CONTRACTOR_CS_FTE = s.CONTRACTOR_CS_FTE
     WHEN NOT MATCHED THEN INSERT
-      (TEAMID, TEAMNAME, PROGRAMID, TEAMFTE, DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS)
+      (TEAMID, TEAMNAME, PROGRAMID, TEAMFTE, DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS_FTE)
     VALUES
-      (s.TEAMID, s.TEAMNAME, s.PROGRAMID, s.TEAMFTE, s.DELIVERY_TEAM_FTE, s.CONTRACTOR_C_FTE, s.CONTRACTOR_CS)
+      (s.TEAMID, s.TEAMNAME, s.PROGRAMID, s.TEAMFTE, s.DELIVERY_TEAM_FTE, s.CONTRACTOR_C_FTE, s.CONTRACTOR_CS_FTE)
     """
-    execute(sql, (team_id, name, program_id, team_fte, delivery_team_fte, contractor_c_fte, contractor_cs))
+    execute(sql, (team_id, name, program_id, team_fte, delivery_team_fte, contractor_c_fte, contractor_cs_fte))
 
 
 def upsert_vendor(vendor_id: str, vendor_name: str) -> None:
-    # App-level uniqueness guard (case-insensitive)
     if vendor_name and str(vendor_name).strip():
         dup = fetch_df(
             f"SELECT VENDORID FROM { _fq('VENDORS') } WHERE UPPER(VENDORNAME)=UPPER(%s) AND VENDORID <> %s LIMIT 1",
@@ -636,18 +493,8 @@ def upsert_application_instance(application_id: str, group_id: str,
                                 application_name: str,
                                 add_info: Optional[str] = None,
                                 vendor_id: Optional[str] = None,
-                                # --- compatibility kw-only: old callers might pass site=...
                                 **kwargs) -> None:
-    """
-    Insert or update an application instance.
-
-    New canonical param:
-      - add_info: Optional[str]
-
-    Backward compatible:
-      - if a caller passes site="...", we will map it to add_info IF add_info is None.
-    """
-    # Map deprecated 'site' kwarg to add_info if needed
+    """Insert or update an application instance (SITE→ADD_INFO migration compatible)."""
     if add_info is None and "site" in kwargs and kwargs["site"] is not None:
         add_info = kwargs["site"]
 
@@ -695,7 +542,7 @@ def upsert_invoice(
     groupid_at_booking: Optional[str] = None,
     rollover_batch_id: Optional[str] = None,
     rolled_over_from_year: Optional[int] = None,
-    invoice_type: Optional[str] = None,              # NEW
+    invoice_type: Optional[str] = None,
 ) -> None:
     eff_type = invoice_type or "Recurring Invoice"
     if eff_type == "Recurring Invoice" and fiscal_year is not None:
@@ -779,9 +626,9 @@ def upsert_invoice_extended(
     invoice_id: str,
     application_id: str,
     team_id: str,
-    renewal_date,               # date or ISO string
+    renewal_date,
     amount: float,
-    status: str,                # "Planned" | "Completed"
+    status: str,
     fiscal_year: Optional[int] = None,
     product_owner: Optional[str] = None,
     amount_next_year: Optional[float] = None,
@@ -800,7 +647,7 @@ def upsert_invoice_extended(
     groupid_at_booking: Optional[str] = None,
     rollover_batch_id: Optional[str] = None,
     rolled_over_from_year: Optional[int] = None,
-    invoice_type: Optional[str] = None,          # NEW
+    invoice_type: Optional[str] = None,
 ) -> None:
     return upsert_invoice(
         invoice_id=invoice_id,
@@ -847,8 +694,7 @@ def delete_application_group(group_id: str) -> None:
     df = fetch_df(f"SELECT COUNT(*) AS N FROM { _fq('APPLICATIONS') } WHERE GROUPID = %s", (group_id,))
     n = int(df.iloc[0]["N"]) if not df.empty else 0
     if n > 0:
-        raise ValueError("Cannot delete this Application Group because it has Application Instances. "
-                         "Delete the instances first.")
+        raise ValueError("Cannot delete this Application Group because it has Application Instances. Delete the instances first.")
     execute(f"DELETE FROM { _fq('APPLICATION_GROUPS') } WHERE GROUPID = %s", (group_id,))
 
 def delete_application(application_id: str) -> None:
@@ -884,7 +730,7 @@ def list_teams() -> pd.DataFrame:
             TO_DECIMAL(TEAMFTE,           18, 2) AS TEAMFTE,
             TO_DECIMAL(DELIVERY_TEAM_FTE, 18, 2) AS DELIVERY_TEAM_FTE,
             TO_DECIMAL(CONTRACTOR_C_FTE,  18, 2) AS CONTRACTOR_C_FTE,
-            TO_DECIMAL(CONTRACTOR_CS,     18, 2) AS CONTRACTOR_CS
+            TO_DECIMAL(CONTRACTOR_CS_FTE, 18, 2) AS CONTRACTOR_CS_FTE
         FROM { _fq('TEAMS') }
         ORDER BY TEAMNAME
     """)
@@ -965,7 +811,6 @@ def list_group_team_links(team_id: Optional[str] = None) -> pd.DataFrame:
 def list_applications(team_id: Optional[str] = None, group_id: Optional[str] = None) -> pd.DataFrame:
     """
     List application instances. Optionally filter by team (via group’s team) and/or group.
-    Returns ADD_INFO; no legacy SITE column.
     """
     ensure_groups_teamid()
     where_clauses = []
@@ -1098,11 +943,154 @@ def repair_programs_programfte() -> None:
 
 
 # =========================================================
+# ADO minimal schema + cleanup (kept from earlier reset)
+# =========================================================
+
+def ensure_ado_minimal_tables() -> None:
+    """
+    Keep only raw ADO features + mapping tables.
+    """
+    db, sch = _db_and_schema()
+
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.ADO_FEATURES (
+        FEATURE_ID     STRING PRIMARY KEY,
+        TITLE          STRING,
+        STATE          STRING,
+        TEAM_RAW       STRING,
+        APP_NAME_RAW   STRING,
+        EFFORT_POINTS  FLOAT,
+        ITERATION_PATH STRING,
+        CREATED_AT     TIMESTAMP_NTZ,
+        CHANGED_AT     TIMESTAMP_NTZ
+      )
+    """)
+
+    # Mapping tables
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM (
+        ADO_TEAM STRING PRIMARY KEY,
+        TEAMID   STRING
+      )
+    """)
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP (
+        ADO_APP   STRING PRIMARY KEY,
+        APP_GROUP STRING
+      )
+    """)
+
+
+def reset_ado_calc_artifacts(drop_mappings: bool = False) -> None:
+    """
+    Remove calculation artifacts (tables/columns) created earlier.
+    """
+    db, sch = _db_and_schema()
+
+    for tbl in ["ADO_FEATURE_COST_ESTIMATE", "EFFORT_SPLIT_RULES"]:
+        try:
+            execute(f"DROP TABLE IF EXISTS {db}.{sch}.{tbl}")
+        except Exception:
+            pass
+
+    # Try to drop any known calc columns on ADO_FEATURES
+    for col in [
+        "ADO_YEAR", "POINTS_PER_FTE_PER_PI",
+        "EFF_TEAM","EFF_DELIVERY","EFF_CS","EFF_C",
+        "FTEPI_TEAM","FTEPI_DELIVERY","FTEPI_CS","FTEPI_C",
+        "COST_TEAM","COST_DELIVERY","COST_CS","COST_C",
+        "EST_FTE_PI","EST_COST_PI"
+    ]:
+        try:
+            if _table_has_column(db, sch, "ADO_FEATURES", col):
+                execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES DROP COLUMN {col}")
+        except Exception:
+            pass
+
+    if drop_mappings:
+        for tbl in ["MAP_ADO_TEAM_TO_TCO_TEAM", "MAP_ADO_APP_TO_TCO_GROUP"]:
+            try:
+                execute(f"DROP TABLE IF EXISTS {db}.{sch}.{tbl}")
+            except Exception:
+                pass
+
+    ensure_ado_minimal_tables()
+
+
+# =========================================================
+# Views: list & drop helpers
+# =========================================================
+
+def list_views(pattern: Optional[str] = None) -> pd.DataFrame:
+    """List views in the current database/schema."""
+    db, sch = _db_and_schema()
+    if pattern:
+        return fetch_df(f"""
+            SELECT TABLE_CATALOG AS DATABASE_NAME,
+                   TABLE_SCHEMA  AS SCHEMA_NAME,
+                   TABLE_NAME    AS VIEW_NAME
+            FROM {db}.INFORMATION_SCHEMA.VIEWS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME LIKE %s
+            ORDER BY TABLE_NAME
+        """, (sch, pattern))
+    else:
+        return fetch_df(f"""
+            SELECT TABLE_CATALOG AS DATABASE_NAME,
+                   TABLE_SCHEMA  AS SCHEMA_NAME,
+                   TABLE_NAME    AS VIEW_NAME
+            FROM {db}.INFORMATION_SCHEMA.VIEWS
+            WHERE TABLE_SCHEMA = %s
+            ORDER BY TABLE_NAME
+        """, (sch,))
+
+
+def drop_view(view_name: str) -> None:
+    """Drop a single view by name (in current DB/schema)."""
+    db, sch = _db_and_schema()
+    execute(f'DROP VIEW IF EXISTS {db}.{sch}."{view_name}"')
+
+
+def drop_views_by_prefix(prefix: str = "V_") -> List[str]:
+    """Drop all views whose name begins with the given prefix."""
+    like = prefix.replace("_", "\\_") + "%"
+    df = list_views(pattern=like)
+    dropped: List[str] = []
+    for _, r in df.iterrows():
+        vname = str(r["VIEW_NAME"])
+        try:
+            drop_view(vname)
+            dropped.append(vname)
+        except Exception:
+            pass
+    return dropped
+
+
+# =========================================================
+# Column admin helpers (NEW)
+# =========================================================
+
+def drop_column(table: str, column: str) -> None:
+    """Drop a column from a table (idempotent safe call)."""
+    db, sch = _db_and_schema()
+    try:
+        execute(f'ALTER TABLE {db}.{sch}.{table} DROP COLUMN "{column}"')
+    except Exception:
+        # Ignore if not exists / no-op
+        pass
+
+
+def rename_column(table: str, old: str, new: str) -> None:
+    """Rename a column on a table."""
+    db, sch = _db_and_schema()
+    execute(f'ALTER TABLE {db}.{sch}.{table} RENAME COLUMN "{old}" TO "{new}"')
+
+
+# =========================================================
 # One-time init per session
 # =========================================================
 
 if not st.session_state.get("_tco_db_init_done"):
     ensure_tables()
-    ensure_ado_tables()   # <-- ADO tables/view bootstrap added
     normalize_team_numeric_types()
     st.session_state["_tco_db_init_done"] = True
