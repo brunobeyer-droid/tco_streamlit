@@ -52,6 +52,8 @@ EXPECTED = {
     "ID": ["ID", "Work Item ID", "System.Id", "WorkItemId", "Work Item Id"],
     "CreatedDate": ["Created Date", "System.CreatedDate", "CreatedDate"],
     "ChangedDate": ["Changed Date", "System.ChangedDate", "ChangedDate"],
+    # New: explicit Year column from Excel (will become ADO_YEAR)
+    "Year": ["Year", "ADO Year", "ADO_YEAR"],
 }
 
 # -------------------------
@@ -216,6 +218,11 @@ def read_ado_upload_any(upl, sheet_name: Optional[str], effort_uses_comma: bool,
         if dcol in df.columns:
             df[dcol] = pd.to_datetime(df[dcol], errors="coerce")
 
+    # Year (keep numeric if present)
+    if "Year" in df.columns:
+        df["Year"] = df["Year"].astype(str).str.replace(",", ".", regex=False)
+        df["Year"] = pd.to_numeric(df["Year"], errors="coerce").astype("Int64")
+
     return df
 
 def normalize_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
@@ -229,10 +236,16 @@ def normalize_to_canonical(df: pd.DataFrame) -> pd.DataFrame:
     out["ITERATION_PATH"] = df.get("Iteration")
     out["CREATED_AT"]     = df.get("CreatedDate")
     out["CHANGED_AT"]     = df.get("ChangedDate")
+    # New: ADO_YEAR from Excel "Year"
+    out["ADO_YEAR"]       = df.get("Year")
 
     out["EFFORT_POINTS"]  = pd.to_numeric(out["EFFORT_POINTS"], errors="coerce")
     out["CREATED_AT"]     = pd.to_datetime(out["CREATED_AT"], errors="coerce")
     out["CHANGED_AT"]     = pd.to_datetime(out["CHANGED_AT"], errors="coerce")
+    try:
+        out["ADO_YEAR"] = pd.to_numeric(out["ADO_YEAR"], errors="coerce").astype("Int64")
+    except Exception:
+        pass
 
     out = out[~out["FEATURE_ID"].isna() & (out["FEATURE_ID"].astype(str).str.len() > 0)].copy()
     return out.reset_index(drop=True)
@@ -257,9 +270,14 @@ def _to_py(v):
     return v
 
 def upsert_ado_features(df: pd.DataFrame) -> int:
-    """Batch MERGE into ADO_FEATURES; returns number of rows passed."""
+    """Batch MERGE into ADO_FEATURES; returns number of rows passed. Ensures ADO_YEAR column exists."""
     if df.empty:
         return 0
+    try:
+        execute("ALTER TABLE ADO_FEATURES ADD COLUMN IF NOT EXISTS ADO_YEAR NUMBER(4)")
+    except Exception:
+        pass
+
     rows: List[Tuple] = []
     for _, r in df.iterrows():
         rows.append((
@@ -272,6 +290,7 @@ def upsert_ado_features(df: pd.DataFrame) -> int:
             _to_py(r.get("ITERATION_PATH")),
             _to_py(r.get("CREATED_AT")),
             _to_py(r.get("CHANGED_AT")),
+            _to_py(r.get("ADO_YEAR")),
         ))
     rows = [t for t in rows if t[0] is not None]
     if not rows:
@@ -282,7 +301,8 @@ def upsert_ado_features(df: pd.DataFrame) -> int:
     USING (
       SELECT %s AS FEATURE_ID, %s AS TITLE, %s AS STATE,
              %s AS TEAM_RAW, %s AS APP_NAME_RAW, %s AS EFFORT_POINTS,
-             %s AS ITERATION_PATH, %s AS CREATED_AT, %s AS CHANGED_AT
+             %s AS ITERATION_PATH, %s AS CREATED_AT, %s AS CHANGED_AT,
+             %s AS ADO_YEAR
     ) s
     ON t.FEATURE_ID = s.FEATURE_ID
     WHEN MATCHED THEN UPDATE SET
@@ -293,64 +313,21 @@ def upsert_ado_features(df: pd.DataFrame) -> int:
       EFFORT_POINTS = s.EFFORT_POINTS,
       ITERATION_PATH = s.ITERATION_PATH,
       CREATED_AT = s.CREATED_AT,
-      CHANGED_AT = s.CHANGED_AT
+      CHANGED_AT = s.CHANGED_AT,
+      ADO_YEAR = s.ADO_YEAR
     WHEN NOT MATCHED THEN INSERT
-      (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+      (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT, ADO_YEAR)
     VALUES
-      (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+      (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT, s.ADO_YEAR)
     """
     execute(sql, rows, many=True)
     return len(rows)
 
-# ---- Extra helpers for ADO Explorer / Reconciliation
-def load_ado_distincts() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    teams = fetch_df("""
-        SELECT DISTINCT TEAM_RAW
-        FROM ADO_FEATURES
-        WHERE TEAM_RAW IS NOT NULL AND TRIM(TEAM_RAW) <> ''
-        ORDER BY TEAM_RAW
-    """)
-    apps  = fetch_df("""
-        SELECT DISTINCT APP_NAME_RAW
-        FROM ADO_FEATURES
-        WHERE APP_NAME_RAW IS NOT NULL AND TRIM(APP_NAME_RAW) <> ''
-        ORDER BY APP_NAME_RAW
-    """)
-    iters = fetch_df("""
-        SELECT DISTINCT ITERATION_PATH
-        FROM ADO_FEATURES
-        WHERE ITERATION_PATH IS NOT NULL AND TRIM(ITERATION_PATH) <> ''
-        ORDER BY ITERATION_PATH
-    """)
-    return teams, apps, iters
-
-def ado_features_base_query(where_sql: str = "", params: Optional[tuple] = None) -> pd.DataFrame:
-    sql = f"""
-      SELECT FEATURE_ID, TITLE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CHANGED_AT
-      FROM ADO_FEATURES
-      {where_sql}
-      ORDER BY COALESCE(CHANGED_AT, TO_TIMESTAMP_NTZ('1900-01-01')) DESC, FEATURE_ID
-    """
-    df = fetch_df(sql, params)
-    if "EFFORT_POINTS" in df.columns:
-        df["EFFORT_POINTS"] = pd.to_numeric(df["EFFORT_POINTS"], errors="coerce")
-    return df
-
 # -------------------------
-# UI: Tabs (single row, requested order)
+# UI: Tabs (top-level)
 # -------------------------
-(
-    tab_load,
-    tab_map,
-    tab_explore,
-    tab_recon,
-    tab_admin,
-) = st.tabs([
-    "📥 Load Data",
-    "🧭 Map Values",
-    "🔎 ADO Explorer",
-    "📊 Reconciliation",
-    "🛠️ Admin / Cleanup",
+tab_load, tab_map, tab_explore, tab_recon = st.tabs([
+    "📥 Load Data", "🧭 Map Values", "🔎 ADO Explorer", "📊 Reconciliation"
 ])
 
 # =========================
@@ -365,7 +342,7 @@ with tab_load:
     except Exception:
         st.warning("Could not query ADO_FEATURES row count (check connection/secrets).")
 
-    st.caption("Upload **XLSX/XLSM/XLSB/XLS** or **CSV**. Only raw ADO fields are stored.")
+    st.caption("Upload **XLSX/XLSM/XLSB/XLS** or **CSV**. Only raw ADO fields are stored (including Year if present).")
     upl = st.file_uploader("Upload ADO export", type=["xlsx", "xlsm", "xlsb", "xls", "csv"], key="upl_ado")
 
     sheet_name: Optional[str] = None
@@ -433,6 +410,40 @@ with tab_load:
             st.success(f"Upserted **{n}** rows into ADO_FEATURES. New total rows: **{n_rows2}**.")
     else:
         st.caption("Parse a file first to enable upsert.")
+
+# Helper: DISTINCTs for ADO Explorer
+def load_ado_distincts() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    teams = fetch_df("""
+        SELECT DISTINCT TEAM_RAW
+        FROM ADO_FEATURES
+        WHERE TEAM_RAW IS NOT NULL AND TRIM(TEAM_RAW) <> ''
+        ORDER BY TEAM_RAW
+    """)
+    apps  = fetch_df("""
+        SELECT DISTINCT APP_NAME_RAW
+        FROM ADO_FEATURES
+        WHERE APP_NAME_RAW IS NOT NULL AND TRIM(APP_NAME_RAW) <> ''
+        ORDER BY APP_NAME_RAW
+    """)
+    iters = fetch_df("""
+        SELECT DISTINCT ITERATION_PATH
+        FROM ADO_FEATURES
+        WHERE ITERATION_PATH IS NOT NULL AND TRIM(ITERATION_PATH) <> ''
+        ORDER BY ITERATION_PATH
+    """)
+    return teams, apps, iters
+
+def ado_features_base_query(where_sql: str = "", params: Optional[tuple] = None) -> pd.DataFrame:
+    sql = f"""
+      SELECT FEATURE_ID, TITLE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CHANGED_AT
+      FROM ADO_FEATURES
+      {where_sql}
+      ORDER BY COALESCE(CHANGED_AT, TO_TIMESTAMP_NTZ('1900-01-01')) DESC, FEATURE_ID
+    """
+    df = fetch_df(sql, params)
+    if "EFFORT_POINTS" in df.columns:
+        df["EFFORT_POINTS"] = pd.to_numeric(df["EFFORT_POINTS"], errors="coerce")
+    return df
 
 # =========================
 # Tab: Map Values
@@ -624,12 +635,13 @@ with tab_explore:
         params.append(f"%{iter_like.strip()}%")
     where_sql = " WHERE " + " AND ".join(where) if where else ""
 
-    df_raw = ado_features_base_query(where_sql, tuple(params) if params else None)
-
+    # Raw latest features (ADO_FEATURES)
     st.markdown("#### Latest Features from ADO")
+    df_raw = ado_features_base_query(where_sql, tuple(params) if params else None)
     st.dataframe(df_raw, use_container_width=True, height=340)
 
-    st.markdown("#### Effort Points by Iteration")
+    # Legacy raw aggregation by ITERATION_PATH (keep)
+    st.markdown("#### Effort Points by Iteration (raw path)")
     df_iter_sum = fetch_df(f"""
       SELECT ITERATION_PATH,
              SUM(COALESCE(EFFORT_POINTS,0)) AS EFFORT_POINTS_SUM,
@@ -641,7 +653,40 @@ with tab_explore:
     """, tuple(params) if params else None)
     st.dataframe(df_iter_sum, use_container_width=True, height=240)
 
-    st.markdown("#### Effort Points by Team & Iteration (raw)")
+    # Effort by Year + Iteration (Excel Year + parsed Iteration)
+    st.markdown("#### Effort Points by Year & Iteration (Excel-based Year + parsed Iteration)")
+    df_year_iter = fetch_df(f"""
+      WITH base AS (
+        SELECT
+          ADO_YEAR,
+          ITERATION_PATH,
+          EFFORT_POINTS
+        FROM ADO_FEATURES
+        {where_sql}
+      ),
+      labeled AS (
+        SELECT
+          ADO_YEAR,
+          COALESCE(
+            REGEXP_SUBSTR(ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1),
+            REGEXP_SUBSTR(ITERATION_PATH, 'ITERATION[[:space:]]*([0-9]+)', 1, 1, 'i', 1)
+          ) AS ITER_NUM,
+          EFFORT_POINTS
+        FROM base
+      )
+      SELECT
+        ADO_YEAR AS YEAR,
+        CASE WHEN ITER_NUM IS NOT NULL THEN 'I' || ITER_NUM ELSE NULL END AS ITERATION,
+        SUM(COALESCE(EFFORT_POINTS,0)) AS EFFORT_POINTS_SUM,
+        COUNT(*) AS FEATURES
+      FROM labeled
+      GROUP BY ADO_YEAR, ITER_NUM
+      ORDER BY YEAR, TRY_TO_NUMBER(ITER_NUM)
+    """, tuple(params) if params else None)
+    st.dataframe(df_year_iter, use_container_width=True, height=300)
+
+    # Raw by Team & Iteration (keep)
+    st.markdown("#### Effort Points by Team & Iteration (raw path)")
     df_team_iter = fetch_df(f"""
       SELECT TEAM_RAW, ITERATION_PATH,
              SUM(COALESCE(EFFORT_POINTS,0)) AS EFFORT_POINTS_SUM,
@@ -658,7 +703,7 @@ with tab_explore:
 # =========================
 with tab_recon:
     st.subheader("Reconciliation: mappings + effort + calculated costs")
-    st.caption("This joins ADO features with your TCO Teams, App Groups and the cost formulas in VW_TEAM_COSTS_PER_FEATURE.")
+    st.caption("Now grouped by **Team, ADO Year & Iteration**. Costs per PI reflect the values used for those rows in the view.")
 
     # Quick issues panel
     colA, colB, colC = st.columns(3)
@@ -697,49 +742,66 @@ with tab_recon:
     except Exception as e:
         colC.warning(f"Rate check failed: {e}")
 
+    # ===== Filters (add ADO Year) =====
     st.markdown("#### Filters")
-    fc1, fc2, fc3 = st.columns([2,2,2])
-    team_like2 = fc1.text_input("TCO Team contains", "", key="recon_team_contains")
-    app_like2  = fc2.text_input("ADO App contains", "", key="recon_app_contains")
-    iter_like2 = fc3.text_input("Iteration contains", "", key="recon_iter_contains")
+    fc1, fc2, fc3, fc4 = st.columns([2,2,2,2])
 
+    # Year options from data
+    year_opts_df = fetch_df("SELECT DISTINCT ADO_YEAR FROM ADO_FEATURES WHERE ADO_YEAR IS NOT NULL ORDER BY ADO_YEAR")
+    year_options = year_opts_df["ADO_YEAR"].dropna().astype(int).tolist() if not year_opts_df.empty else []
+    year_sel = fc1.multiselect("ADO Year", options=year_options, default=[], key="recon_years")
+
+    team_like2 = fc2.text_input("TCO Team contains", "", key="recon_team_contains")
+    app_like2  = fc3.text_input("ADO App contains", "", key="recon_app_contains")
+    iter_like2 = fc4.text_input("Iteration contains", "", key="recon_iter_contains")
+
+    # Build WHERE using aliases v (view) and f (features)
     where2 = []
     params2: list = []
     if team_like2.strip():
-        where2.append("UPPER(TEAMNAME) LIKE UPPER(%s)")
+        where2.append("UPPER(v.TEAMNAME) LIKE UPPER(%s)")
         params2.append(f"%{team_like2.strip()}%")
     if app_like2.strip():
-        where2.append("UPPER(APP_NAME_RAW) LIKE UPPER(%s)")
+        where2.append("UPPER(v.APP_NAME_RAW) LIKE UPPER(%s)")
         params2.append(f"%{app_like2.strip()}%")
     if iter_like2.strip():
-        where2.append("UPPER(ITERATION_PATH) LIKE UPPER(%s)")
+        where2.append("UPPER(v.ITERATION_PATH) LIKE UPPER(%s)")
         params2.append(f"%{iter_like2.strip()}%")
+    if year_sel:
+        where2.append("f.ADO_YEAR IN (" + ",".join(["%s"] * len(year_sel)) + ")")
+        params2.extend(year_sel)
+
     where_sql2 = " WHERE " + " AND ".join(where2) if where2 else ""
 
+    # Pull detail with ADO_YEAR added (join view to features)
     try:
         base_sql = f"""
           SELECT
-            TEAMNAME, TEAMID, FEATURE_ID, TITLE, APP_NAME_RAW, ITERATION_PATH,
-            EFFORT_POINTS,
-            TEAM_COST_PERPI,
-            DEL_TEAM_COST_PERPI,
-            TEAM_CONTRACTOR_CS_COST_PERPI,
-            TEAM_CONTRACTOR_C_COST_PERPI
-          FROM VW_TEAM_COSTS_PER_FEATURE
+            v.TEAMNAME, v.TEAMID, v.FEATURE_ID, v.TITLE, v.APP_NAME_RAW,
+            f.ADO_YEAR,
+            v.ITERATION_PATH,
+            v.EFFORT_POINTS,
+            v.TEAM_COST_PERPI,
+            v.DEL_TEAM_COST_PERPI,
+            v.TEAM_CONTRACTOR_CS_COST_PERPI,
+            v.TEAM_CONTRACTOR_C_COST_PERPI
+          FROM VW_TEAM_COSTS_PER_FEATURE v
+          LEFT JOIN ADO_FEATURES f
+            ON f.FEATURE_ID = v.FEATURE_ID
           {where_sql2}
-          ORDER BY TEAMNAME, ITERATION_PATH, FEATURE_ID
+          ORDER BY v.TEAMNAME, f.ADO_YEAR, v.ITERATION_PATH, v.FEATURE_ID
         """
         df_calc = fetch_df(base_sql, tuple(params2) if params2 else None)
     except Exception as e:
-        st.error(f"Could not read VW_TEAM_COSTS_PER_FEATURE: {e}")
+        st.error(f"Could not read reconciliation data: {e}")
         df_calc = pd.DataFrame()
 
     if df_calc.empty:
         st.info("No rows found with the current filters.")
     else:
-        # Aggregates
-        st.markdown("#### Effort & Cost by Team & Iteration")
-        ag = df_calc.groupby(["TEAMNAME","ITERATION_PATH"], dropna=False).agg(
+        # ===== Aggregates by Team, Year & Iteration =====
+        st.markdown("#### Effort & Cost by Team, Year & Iteration")
+        ag = df_calc.groupby(["TEAMNAME","ADO_YEAR","ITERATION_PATH"], dropna=False).agg(
             FEATURES=("FEATURE_ID","count"),
             EFFORT_POINTS_SUM=("EFFORT_POINTS","sum"),
             TEAM_COST_PERPI=("TEAM_COST_PERPI","sum"),
@@ -747,17 +809,33 @@ with tab_recon:
             TEAM_CONTRACTOR_CS_COST_PERPI=("TEAM_CONTRACTOR_CS_COST_PERPI","sum"),
             TEAM_CONTRACTOR_C_COST_PERPI=("TEAM_CONTRACTOR_C_COST_PERPI","sum"),
         ).reset_index()
+
+        # Ensure numeric types are floats (avoid Decimal/float mix)
+        for col in [
+            "TEAM_COST_PERPI",
+            "DEL_TEAM_COST_PERPI",
+            "TEAM_CONTRACTOR_CS_COST_PERPI",
+            "TEAM_CONTRACTOR_C_COST_PERPI",
+            "EFFORT_POINTS_SUM",
+        ]:
+            if col in ag.columns:
+                ag[col] = pd.to_numeric(ag[col], errors="coerce").astype(float)
+
         ag["TOTAL_COST_PERPI"] = ag[
             ["TEAM_COST_PERPI","DEL_TEAM_COST_PERPI","TEAM_CONTRACTOR_CS_COST_PERPI","TEAM_CONTRACTOR_C_COST_PERPI"]
         ].sum(axis=1)
-        st.dataframe(ag, use_container_width=True, height=320)
 
+        st.dataframe(ag, use_container_width=True, height=360)
+
+        # ===== Per-Feature Detail (includes ADO_YEAR) =====
         st.markdown("#### Per-Feature Detail (to spot anomalies)")
         st.dataframe(df_calc, use_container_width=True, height=420)
 
+        # ===== Unmapped teams list (unchanged) =====
         st.markdown("#### Unmapped ADO Teams (with counts)")
         st.dataframe(unmapped_team, use_container_width=True, height=220)
 
+        # ===== Diagnostics for missing rates / zero composition =====
         st.markdown("#### Rows with missing rates or zero composition (diagnostics)")
         try:
             diag = fetch_df("""
@@ -778,33 +856,3 @@ with tab_recon:
             st.dataframe(diag, use_container_width=True, height=260)
         except Exception as e:
             st.warning(f"Diagnostics view failed: {e}")
-
-# =========================
-# Tab: Admin / Cleanup
-# =========================
-with tab_admin:
-    st.subheader("Admin & Cleanup")
-    st.caption("Use with care. These actions are irreversible.")
-
-    st.markdown("**ADO_FEATURES row count**")
-    try:
-        info = fetch_df("SELECT COUNT(*) AS N FROM ADO_FEATURES")
-        st.metric("Rows in ADO_FEATURES", int(info.iloc[0]["N"]))
-    except Exception as e:
-        st.warning(f"Count failed: {e}")
-
-    with st.expander("Danger zone: truncate tables"):
-        confirm = st.checkbox("I understand this will permanently delete all rows.")
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("Truncate ADO_FEATURES", disabled=not confirm, key="btn_trunc_features"):
-                execute("TRUNCATE TABLE ADO_FEATURES")
-                st.success("ADO_FEATURES truncated.")
-        with c2:
-            if st.button("Truncate MAP_ADO_TEAM_TO_TCO_TEAM", disabled=not confirm, key="btn_trunc_team_map"):
-                execute("TRUNCATE TABLE MAP_ADO_TEAM_TO_TCO_TEAM")
-                st.success("MAP_ADO_TEAM_TO_TCO_TEAM truncated.")
-        with c3:
-            if st.button("Truncate MAP_ADO_APP_TO_TCO_GROUP", disabled=not confirm, key="btn_trunc_app_map"):
-                execute("TRUNCATE TABLE MAP_ADO_APP_TO_TCO_GROUP")
-                st.success("MAP_ADO_APP_TO_TCO_GROUP truncated.")
