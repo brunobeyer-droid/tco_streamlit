@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional, Tuple, List
+from typing import Any, Iterable, Optional, Tuple, List, Dict
 
 import pandas as pd
 import streamlit as st
@@ -140,16 +140,14 @@ def _add_unique_if_absent(table: str, columns: str, constraint_name: str) -> Non
     try:
         execute(f"ALTER TABLE { _fq(table) } ADD CONSTRAINT {constraint_name} UNIQUE ({columns})")
     except Exception:
-        # If the table currently contains duplicate data, adding the constraint will fail.
-        # We still block duplicates at the app level in the upserts below.
+        # If duplicates exist, Snowflake will reject; we still enforce in app.
         pass
 
 
 def ensure_groups_teamid() -> None:
     """
     Ensure APPLICATION_GROUPS exists and has TEAMID column; add FK.
-    Additionally maintain a denormalized PROGRAMID column for convenience,
-    synced from TEAMS.PROGRAMID. Safe to run multiple times.
+    Maintain denormalized PROGRAMID column synced from TEAMS.PROGRAMID.
     """
     db, sch = _db_and_schema()
 
@@ -176,11 +174,11 @@ def ensure_groups_teamid() -> None:
         except Exception:
             pass
 
-    # Denormalized PROGRAMID convenience column
+    # Denormalized PROGRAMID
     if not _table_has_column(db, sch, "APPLICATION_GROUPS", "PROGRAMID"):
         execute(f"ALTER TABLE {db}.{sch}.APPLICATION_GROUPS ADD COLUMN PROGRAMID STRING")
 
-    # Backfill/sync PROGRAMID from TEAMS
+    # Sync PROGRAMID from TEAMS
     execute(f"""
       UPDATE {db}.{sch}.APPLICATION_GROUPS g
       SET PROGRAMID = t.PROGRAMID
@@ -189,7 +187,7 @@ def ensure_groups_teamid() -> None:
         AND (g.PROGRAMID IS NULL OR g.PROGRAMID <> t.PROGRAMID)
     """)
 
-    # Optional legacy backfill for TEAMID if a many-to-many existed
+    # Optional legacy backfill (if TEAMS_APP_GROUPS existed)
     try:
         _ = fetch_df(f"SELECT 1 FROM {db}.{sch}.TEAMS_APP_GROUPS LIMIT 1")
         rows = fetch_df(f"""
@@ -201,14 +199,13 @@ def ensure_groups_teamid() -> None:
             updates = []
             for _, r in rows.iterrows():
                 if int(r["CNT"]) == 1 and r["THE_TEAM"]:
-                    updates.append((r["THE_TEAM"], r["GROUPID"]))  # (TEAMID, GROUPID)
+                    updates.append((r["THE_TEAM"], r["GROUPID"]))
             if updates:
                 execute(f"""
                   UPDATE {db}.{sch}.APPLICATION_GROUPS
                   SET TEAMID = %s
                   WHERE GROUPID = %s AND TEAMID IS NULL
                 """, updates, many=True)
-                # re-sync PROGRAMID after TEAMID backfill
                 execute(f"""
                   UPDATE {db}.{sch}.APPLICATION_GROUPS g
                   SET PROGRAMID = t.PROGRAMID
@@ -221,8 +218,8 @@ def ensure_groups_teamid() -> None:
 
 
 def ensure_tables() -> None:
-    """Create/patch all tables & constraints; safe to call repeatedly."""
-    # Core
+    """Create/patch core tables & constraints; safe to call repeatedly."""
+    # PROGRAMS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("PROGRAMS") } (
             PROGRAMID    STRING PRIMARY KEY,
@@ -231,6 +228,9 @@ def ensure_tables() -> None:
             PROGRAMFTE   FLOAT
         )
     """)
+    _add_unique_if_absent("PROGRAMS", "PROGRAMNAME", "UQ_PROGRAMS_PROGRAMNAME")
+
+    # TEAMS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("TEAMS") } (
             TEAMID       STRING PRIMARY KEY,
@@ -240,29 +240,36 @@ def ensure_tables() -> None:
             COSTPERFTE   FLOAT
         )
     """)
-    # Ensure extended numeric team columns exist
+    _add_unique_if_absent("TEAMS", "TEAMNAME", "UQ_TEAMS_TEAMNAME")
+
+    # Ensure numeric columns exist
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
-    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS FLOAT")
-    # NEW: Product Owner on Teams (for your Teams page linkage)
+    # NEW NAME: CONTRACTOR_CS_FTE (rename from old if present)
+    db, sch = _db_and_schema()
+    try:
+        if _table_has_column(db, sch, "TEAMS", "CONTRACTOR_CS") and not _table_has_column(db, sch, "TEAMS", "CONTRACTOR_CS_FTE"):
+            execute(f"ALTER TABLE {db}.{sch}.TEAMS RENAME COLUMN CONTRACTOR_CS TO CONTRACTOR_CS_FTE")
+    except Exception:
+        pass
+    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS_FTE FLOAT")
+
+    # NEW: Product Owner on Teams
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS PRODUCTOWNER STRING")
 
+    # VENDORS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("VENDORS") } (
             VENDORID   STRING PRIMARY KEY,
             VENDORNAME STRING
         )
     """)
+    _add_unique_if_absent("VENDORS", "VENDORNAME", "UQ_VENDORS_VENDORNAME")
 
-    # Add DB-level uniqueness to PROGRAMNAME, TEAMNAME, VENDORNAME (idempotent attempts)
-    _add_unique_if_absent("PROGRAMS", "PROGRAMNAME", "UQ_PROGRAMS_PROGRAMNAME")
-    _add_unique_if_absent("TEAMS",    "TEAMNAME",    "UQ_TEAMS_TEAMNAME")
-    _add_unique_if_absent("VENDORS",  "VENDORNAME",  "UQ_VENDORS_VENDORNAME")
-
-    # Groups (1 Team → many Groups) + PROGRAMID sync
+    # GROUPS + PROGRAMID sync
     ensure_groups_teamid()
 
-    # Applications (each belongs to a group; optional vendor; optional additional info)
+    # APPLICATIONS
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("APPLICATIONS") } (
             APPLICATIONID   STRING PRIMARY KEY,
@@ -272,16 +279,14 @@ def ensure_tables() -> None:
             ADD_INFO        STRING
         )
     """)
-    # --- MIGRATION: rename old SITE -> ADD_INFO safely ---
-    db, sch = _db_and_schema()
+    # Migrate old SITE->ADD_INFO if necessary
     try:
         if _table_has_column(db, sch, "APPLICATIONS", "SITE") and not _table_has_column(db, sch, "APPLICATIONS", "ADD_INFO"):
             execute(f"ALTER TABLE {db}.{sch}.APPLICATIONS RENAME COLUMN SITE TO ADD_INFO")
     except Exception:
-        # If RENAME not permitted, ensure ADD_INFO exists (we'll just keep both and ignore SITE)
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD COLUMN IF NOT EXISTS ADD_INFO STRING")
 
-    # Add FK/unique constraints if not present
+    # FK + uniqueness
     try:
         execute(f"""
             ALTER TABLE { _fq('APPLICATIONS') }
@@ -290,25 +295,20 @@ def ensure_tables() -> None:
         """)
     except Exception:
         pass
-
-    # Drop legacy uniqueness (GROUPID,SITE) if present
     try:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } DROP CONSTRAINT UQ_APP_GROUP_SITE")
     except Exception:
         pass
-    # New uniqueness on (GROUPID, ADD_INFO) — informational for Snowflake
     try:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD CONSTRAINT UQ_APP_GROUP_ADD_INFO UNIQUE (GROUPID, ADD_INFO)")
     except Exception:
         pass
-
-    # Metadata uniqueness on ApplicationName (UI also enforces)
     try:
         execute(f"ALTER TABLE { _fq('APPLICATIONS') } ADD CONSTRAINT UQ_APPLICATIONS_NAME UNIQUE (APPLICATIONNAME)")
     except Exception:
         pass
 
-    # Invoices (with extended fields)
+    # INVOICES (+ extended fields)
     execute(f"""
         CREATE TABLE IF NOT EXISTS { _fq("INVOICES") } (
             INVOICEID     STRING PRIMARY KEY,
@@ -342,11 +342,9 @@ def ensure_tables() -> None:
     ]:
         execute(f"ALTER TABLE { _fq('INVOICES') } ADD COLUMN IF NOT EXISTS {col_ddl}")
 
-    # NEW: type column for Recurring vs Ad Hoc + safe backfill
+    # INVOICE_TYPE + uniqueness across annual recurring rows
     execute(f"ALTER TABLE { _fq('INVOICES') } ADD COLUMN IF NOT EXISTS INVOICE_TYPE STRING")
     execute(f"UPDATE { _fq('INVOICES') } SET INVOICE_TYPE = 'Recurring Invoice' WHERE INVOICE_TYPE IS NULL")
-
-    # ---- Uniqueness constraints (informational in Snowflake) ----
     try:
         execute(f"ALTER TABLE { _fq('INVOICES') } DROP CONSTRAINT UQ_INVOICE_ANNUAL")
     except Exception:
@@ -363,247 +361,78 @@ def ensure_tables() -> None:
 def normalize_team_numeric_types() -> None:
     """
     Normalize team numeric columns to NUMBER(18,2) to match Team FTE behavior.
-    Safe to run multiple times.
     """
-    for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS"):
+    for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
         try:
             execute(f"ALTER TABLE { _fq('TEAMS') } ALTER COLUMN {col} SET DATA TYPE NUMBER(18,2)")
         except Exception:
             pass
 
+# =========================
+# TEAM_CALC: rates & calcs
+# =========================
 
-# =========================================================
-# ADO tables / rates / capacity and cost view (idempotent)
-# =========================================================
-def ensure_ado_tables() -> None:
+def ensure_team_calc_table() -> None:
     """
-    Creates ADO_FEATURES and supporting mapping/rate tables,
-    plus a view to compute blended rate per FTE-PI.
-    Safe to call multiple times.
+    TEAM_CALC stores editable rate columns per team (no duplication of counts).
+    Columns created here are NEW per your spec:
+      - XOM_RATE
+      - CONTRACTOR_CS_RATE
+      - CONTRACTOR_C_RATE
     """
-    # ADO raw features
-    execute("""
-    CREATE TABLE IF NOT EXISTS ADO_FEATURES (
-      FEATURE_ID STRING,
-      TITLE STRING,
-      STATE STRING,
-      TEAM_RAW STRING,
-      APP_NAME_RAW STRING,
-      EFFORT_POINTS NUMBER(18,2),
-      ITERATION_PATH STRING,
-      CREATED_AT TIMESTAMP_NTZ,
-      CHANGED_AT TIMESTAMP_NTZ
-    )
-    """)
-    try:
-        execute("ALTER TABLE ADO_FEATURES ADD CONSTRAINT UQ_ADO_FEATURE UNIQUE (FEATURE_ID)")
-    except Exception:
-        pass
-        
-    # Mappings (ADO → TCO)
-    execute("""
-    CREATE TABLE IF NOT EXISTS MAP_ADO_TEAM_TO_TCO_TEAM (
-      ADO_TEAM STRING PRIMARY KEY,
-      TEAMID STRING
-    )
-    """)
-    execute("""
-    CREATE TABLE IF NOT EXISTS MAP_ADO_APP_TO_TCO_GROUP (
-      ADO_APP STRING PRIMARY KEY,
-      APP_GROUP STRING
-    )
-    """)
-
-    # --- NEW: Effort split rules (math stays dynamic & versioned) ---
+    db, sch = _db_and_schema()
     execute(f"""
-    CREATE TABLE IF NOT EXISTS { _fq("EFFORT_SPLIT_RULES") } (
-      RULE_ID STRING,                   -- e.g., "rule-2025-01"
-      RULE_NAME STRING,                 -- friendly name
-      EFFECTIVE_FROM DATE,              -- versioning
-      DENOMINATOR STRING,               -- 'TEAMFTE' | 'SUM_FTE'
-      TEAM_WEIGHT NUMBER(18,6),         -- weight applied to TEAMFTE share
-      DELIVERY_WEIGHT NUMBER(18,6),     -- weight applied to DELIVERY_TEAM_FTE share
-      CONTRACTOR_CS_WEIGHT NUMBER(18,6),
-      CONTRACTOR_C_WEIGHT NUMBER(18,6),
-      NORMALIZE BOOLEAN,                -- if TRUE, weights normalized so sum=1 before using
-      NOTES STRING,
-      IS_ACTIVE BOOLEAN,                -- only one should be TRUE
-      CREATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
-    )
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.TEAM_CALC (
+        TEAMID STRING PRIMARY KEY,
+        XOM_RATE NUMBER(18,2),
+        CONTRACTOR_CS_RATE NUMBER(18,2),
+        CONTRACTOR_C_RATE NUMBER(18,2),
+        UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
+      )
     """)
 
-    # Composition view: pull FTE counts from TEAMS (no editing here)
+def upsert_team_calc_rates(team_id: str,
+                           xom_rate: Optional[float],
+                           contractor_cs_rate: Optional[float],
+                           contractor_c_rate: Optional[float]) -> None:
+    """
+    Insert or update TEAM_CALC rates for a team.
+    """
+    db, sch = _db_and_schema()
     execute(f"""
-    CREATE OR REPLACE VIEW { _fq("V_TEAM_COMPOSITION_FROM_TEAMS") } AS
-    SELECT
-      t.TEAMID,
-      TO_DECIMAL(t.TEAMFTE,           18, 6) AS TEAMFTE,
-      TO_DECIMAL(t.DELIVERY_TEAM_FTE, 18, 6) AS DELIVERY_TEAM_FTE,
-      TO_DECIMAL(t.CONTRACTOR_CS,     18, 6) AS CONTRACTOR_CS,
-      TO_DECIMAL(t.CONTRACTOR_C_FTE,  18, 6) AS CONTRACTOR_C_FTE,
-      (COALESCE(t.TEAMFTE,0)+COALESCE(t.DELIVERY_TEAM_FTE,0)+COALESCE(t.CONTRACTOR_CS,0)+COALESCE(t.CONTRACTOR_C_FTE,0)) AS SUM_FTE
-    FROM { _fq("TEAMS") } t
-    """)
+      MERGE INTO {db}.{sch}.TEAM_CALC t
+      USING (
+        SELECT %s TEAMID, %s XOM_RATE, %s CONTRACTOR_CS_RATE, %s CONTRACTOR_C_RATE
+      ) s
+      ON t.TEAMID = s.TEAMID
+      WHEN MATCHED THEN UPDATE SET
+        XOM_RATE = s.XOM_RATE,
+        CONTRACTOR_CS_RATE = s.CONTRACTOR_CS_RATE,
+        CONTRACTOR_C_RATE = s.CONTRACTOR_C_RATE,
+        UPDATED_AT = CURRENT_TIMESTAMP()
+      WHEN NOT MATCHED THEN INSERT (TEAMID, XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE)
+      VALUES (s.TEAMID, s.XOM_RATE, s.CONTRACTOR_CS_RATE, s.CONTRACTOR_C_RATE)
+    """, (team_id, xom_rate, contractor_cs_rate, contractor_c_rate))
 
-    # Active rule (latest TRUE / or latest by EFFECTIVE_FROM if multiple)
-    execute(f"""
-    CREATE OR REPLACE VIEW { _fq("V_ACTIVE_EFFORT_RULE") } AS
-    SELECT *
-    FROM (
-      SELECT r.*,
-             ROW_NUMBER() OVER (ORDER BY (CASE WHEN r.IS_ACTIVE THEN 0 ELSE 1 END), r.EFFECTIVE_FROM DESC, r.CREATED_AT DESC) AS rn
-      FROM { _fq("EFFORT_SPLIT_RULES") } r
-    ) WHERE rn=1
-    """)
-
-    # Effort split factors per team using the active rule.
-    #    m_* are the fractions applied to ADO.EFFORT_POINTS (per team) before converting to FTE-PI.
-    #   m_role = (FTE_role / DENOM) * WEIGHT_role    (then optionally normalized if NORMALIZE=TRUE)
-
-    execute(f"""
-    CREATE OR REPLACE VIEW { _fq("V_EFFORT_SPLIT_ASOF") } AS
-    WITH base AS (
+def list_team_calc() -> pd.DataFrame:
+    """
+    Current TEAM_CALC rows with team names.
+    """
+    return fetch_df(f"""
       SELECT
-        c.TEAMID,
-        c.TEAMFTE, c.DELIVERY_TEAM_FTE, c.CONTRACTOR_CS, c.CONTRACTOR_C_FTE, c.SUM_FTE,
-        r.DENOMINATOR, r.TEAM_WEIGHT, r.DELIVERY_WEIGHT, r.CONTRACTOR_CS_WEIGHT, r.CONTRACTOR_C_WEIGHT, r.NORMALIZE
-      FROM { _fq("V_TEAM_COMPOSITION_FROM_TEAMS") } c
-      CROSS JOIN { _fq("V_ACTIVE_EFFORT_RULE") } r
-    ),
-    denom AS (
-      SELECT TEAMID,
-             CASE WHEN DENOMINATOR='TEAMFTE' THEN NULLIF(TEAMFTE,0) ELSE NULLIF(SUM_FTE,0) END AS DEN
-      FROM base
-    ),
-    raw AS (
-      SELECT
-        b.TEAMID,
-        (COALESCE(b.TEAMFTE,0)           / d.DEN) * COALESCE(b.TEAM_WEIGHT,1)          AS raw_team,
-        (COALESCE(b.DELIVERY_TEAM_FTE,0) / d.DEN) * COALESCE(b.DELIVERY_WEIGHT,1)      AS raw_delivery,
-        (COALESCE(b.CONTRACTOR_CS,0)     / d.DEN) * COALESCE(b.CONTRACTOR_CS_WEIGHT,1) AS raw_cs,
-        (COALESCE(b.CONTRACTOR_C_FTE,0)  / d.DEN) * COALESCE(b.CONTRACTOR_C_WEIGHT,1)  AS raw_c
-      FROM base b
-      JOIN denom d USING (TEAMID)
-    ),
-    norm AS (
-      SELECT TEAMID,
-             CASE WHEN (SELECT NORMALIZE FROM { _fq("V_ACTIVE_EFFORT_RULE") }) THEN (raw_team+raw_delivery+raw_cs+raw_c) ELSE 1 END AS Z
-      FROM raw
-    )
-    SELECT
-      r.TEAMID,
-      CASE WHEN n.Z=0 THEN 0 ELSE r.raw_team     / n.Z END AS M_TEAM,
-      CASE WHEN n.Z=0 THEN 0 ELSE r.raw_delivery / n.Z END AS M_DELIVERY,
-      CASE WHEN n.Z=0 THEN 0 ELSE r.raw_cs       / n.Z END AS M_CS,
-      CASE WHEN n.Z=0 THEN 0 ELSE r.raw_c        / n.Z END AS M_C
-    FROM raw r
-    JOIN norm n USING (TEAMID)
+        tc.TEAMID, t.TEAMNAME,
+        tc.XOM_RATE, tc.CONTRACTOR_CS_RATE, tc.CONTRACTOR_C_RATE,
+        tc.UPDATED_AT
+      FROM { _fq('TEAM_CALC') } tc
+      LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = tc.TEAMID
+      ORDER BY t.TEAMNAME
     """)
-
-
-    # Rates and capacity
-    execute("""
-    CREATE TABLE IF NOT EXISTS FTE_RATES (
-      EMPLOYEE_TYPE STRING,
-      EFFECTIVE_FROM DATE,
-      RATE_PER_PI NUMBER(18,2)
-    )
-    """)
-    try:
-        execute("ALTER TABLE FTE_RATES ADD CONSTRAINT UQ_FTE_RATE UNIQUE (EMPLOYEE_TYPE, EFFECTIVE_FROM)")
-    except Exception:
-        pass
-
-    execute("""
-    CREATE TABLE IF NOT EXISTS TEAM_CAPACITY (
-      TEAMID STRING,
-      EFFECTIVE_FROM DATE,
-      POINTS_PER_FTE_PER_PI NUMBER(18,4)
-    )
-    """)
-    try:
-        execute("ALTER TABLE TEAM_CAPACITY ADD CONSTRAINT UQ_TEAM_CAP UNIQUE (TEAMID, EFFECTIVE_FROM)")
-    except Exception:
-        pass
-
-    # Team FTE composition (optional but powerful for blended rates)
-    execute("""
-    CREATE TABLE IF NOT EXISTS TEAM_FTE_COMPOSITION (
-      TEAMID STRING,
-      ROLE_NAME STRING,
-      EMPLOYEE_TYPE STRING,
-      FTE_COUNT NUMBER(10,2)
-    )
-    """)
-    try:
-        execute("ALTER TABLE TEAM_FTE_COMPOSITION ADD CONSTRAINT UQ_TEAM_COMP UNIQUE (TEAMID, ROLE_NAME, EMPLOYEE_TYPE)")
-    except Exception:
-        pass
-
-    # View: blended rate and latest capacity as-of (uses your TEAMS)
-    execute("""
-    CREATE OR REPLACE VIEW V_TEAM_BLENDED_RATE_ASOF AS
-    WITH latest_rate AS (
-      SELECT EMPLOYEE_TYPE, RATE_PER_PI,
-             EFFECTIVE_FROM,
-             ROW_NUMBER() OVER (PARTITION BY EMPLOYEE_TYPE ORDER BY EFFECTIVE_FROM DESC) AS rn
-      FROM FTE_RATES
-    ),
-    latest_capacity AS (
-      SELECT TEAMID, POINTS_PER_FTE_PER_PI, EFFECTIVE_FROM,
-             ROW_NUMBER() OVER (PARTITION BY TEAMID ORDER BY EFFECTIVE_FROM DESC) AS rn
-      FROM TEAM_CAPACITY
-    ),
-    comp AS (
-      SELECT TEAMID, EMPLOYEE_TYPE, SUM(FTE_COUNT) AS FTE_COUNT
-      FROM TEAM_FTE_COMPOSITION
-      GROUP BY TEAMID, EMPLOYEE_TYPE
-    ),
-    rate AS (
-      SELECT EMPLOYEE_TYPE, RATE_PER_PI
-      FROM latest_rate WHERE rn=1
-    ),
-    cap AS (
-      SELECT TEAMID, POINTS_PER_FTE_PER_PI
-      FROM latest_capacity WHERE rn=1
-    )
-    SELECT
-      t.TEAMID,
-      COALESCE(SUM(comp.FTE_COUNT * rate.RATE_PER_PI),0) / NULLIF(SUM(comp.FTE_COUNT),0) AS BLENDED_RATE_PER_FTE_PI,
-      cap.POINTS_PER_FTE_PER_PI
-    FROM TEAMS t
-    LEFT JOIN comp ON comp.TEAMID = t.TEAMID
-    LEFT JOIN rate ON rate.EMPLOYEE_TYPE = comp.EMPLOYEE_TYPE
-    LEFT JOIN cap ON cap.TEAMID = t.TEAMID
-    GROUP BY t.TEAMID, cap.POINTS_PER_FTE_PER_PI
-    """)
-
-    # Materialized estimation table for dashboards
-    execute("""
-    CREATE TABLE IF NOT EXISTS ADO_FEATURE_COST_ESTIMATE (
-      FEATURE_ID STRING,
-      TITLE STRING,
-      STATE STRING,
-      TEAMID STRING,
-      APP_GROUP STRING,
-      EFFORT_POINTS NUMBER(18,2),
-      POINTS_PER_FTE_PER_PI NUMBER(18,4),
-      BLENDED_RATE_PER_FTE_PI NUMBER(18,2),
-      EST_FTE_PI NUMBER(18,4),
-      EST_COST_PI NUMBER(18,2),
-      ITERATION_PATH STRING,
-      CREATED_AT TIMESTAMP_NTZ,
-      CHANGED_AT TIMESTAMP_NTZ
-    )
-    """)
-
 
 # =========================================================
-# Upserts
+# Upserts (core)
 # =========================================================
 
 def upsert_program(program_id: str, name: str, owner: Optional[str], fte: Optional[float]) -> None:
-    # App-level uniqueness guard (case-insensitive)
     if name and str(name).strip():
         dup = fetch_df(
             f"SELECT PROGRAMID FROM { _fq('PROGRAMS') } WHERE UPPER(PROGRAMNAME)=UPPER(%s) AND PROGRAMID <> %s LIMIT 1",
@@ -630,8 +459,8 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
                 team_fte: Optional[float],
                 delivery_team_fte: Optional[float] = None,
                 contractor_c_fte: Optional[float] = None,
-                contractor_cs: Optional[float] = None) -> None:
-    # App-level uniqueness guard (case-insensitive)
+                contractor_cs_fte: Optional[float] = None) -> None:
+    # Name uniqueness guard (case-insensitive)
     if name and str(name).strip():
         dup = fetch_df(
             f"SELECT TEAMID FROM { _fq('TEAMS') } WHERE UPPER(TEAMNAME)=UPPER(%s) AND TEAMID <> %s LIMIT 1",
@@ -640,15 +469,16 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
         if not dup.empty:
             raise ValueError(f"Team name '{name.strip()}' already exists.")
 
+    # Ensure columns exist (idempotent)
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
-    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS FLOAT")
+    execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS CONTRACTOR_CS_FTE FLOAT")
 
     sql = f"""
     MERGE INTO { _fq('TEAMS') } t
     USING (
       SELECT %s AS TEAMID, %s AS TEAMNAME, %s AS PROGRAMID,
-             %s AS TEAMFTE, %s AS DELIVERY_TEAM_FTE, %s AS CONTRACTOR_C_FTE, %s AS CONTRACTOR_CS
+             %s AS TEAMFTE, %s AS DELIVERY_TEAM_FTE, %s AS CONTRACTOR_C_FTE, %s AS CONTRACTOR_CS_FTE
     ) s
     ON t.TEAMID = s.TEAMID
     WHEN MATCHED THEN UPDATE SET
@@ -657,17 +487,16 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
       TEAMFTE = s.TEAMFTE,
       DELIVERY_TEAM_FTE = s.DELIVERY_TEAM_FTE,
       CONTRACTOR_C_FTE = s.CONTRACTOR_C_FTE,
-      CONTRACTOR_CS = s.CONTRACTOR_CS
+      CONTRACTOR_CS_FTE = s.CONTRACTOR_CS_FTE
     WHEN NOT MATCHED THEN INSERT
-      (TEAMID, TEAMNAME, PROGRAMID, TEAMFTE, DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS)
+      (TEAMID, TEAMNAME, PROGRAMID, TEAMFTE, DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS_FTE)
     VALUES
-      (s.TEAMID, s.TEAMNAME, s.PROGRAMID, s.TEAMFTE, s.DELIVERY_TEAM_FTE, s.CONTRACTOR_C_FTE, s.CONTRACTOR_CS)
+      (s.TEAMID, s.TEAMNAME, s.PROGRAMID, s.TEAMFTE, s.DELIVERY_TEAM_FTE, s.CONTRACTOR_C_FTE, s.CONTRACTOR_CS_FTE)
     """
-    execute(sql, (team_id, name, program_id, team_fte, delivery_team_fte, contractor_c_fte, contractor_cs))
+    execute(sql, (team_id, name, program_id, team_fte, delivery_team_fte, contractor_c_fte, contractor_cs_fte))
 
 
 def upsert_vendor(vendor_id: str, vendor_name: str) -> None:
-    # App-level uniqueness guard (case-insensitive)
     if vendor_name and str(vendor_name).strip():
         dup = fetch_df(
             f"SELECT VENDORID FROM { _fq('VENDORS') } WHERE UPPER(VENDORNAME)=UPPER(%s) AND VENDORID <> %s LIMIT 1",
@@ -723,18 +552,8 @@ def upsert_application_instance(application_id: str, group_id: str,
                                 application_name: str,
                                 add_info: Optional[str] = None,
                                 vendor_id: Optional[str] = None,
-                                # --- compatibility kw-only: old callers might pass site=...
                                 **kwargs) -> None:
-    """
-    Insert or update an application instance.
-
-    New canonical param:
-      - add_info: Optional[str]
-
-    Backward compatible:
-      - if a caller passes site="...", we will map it to add_info IF add_info is None.
-    """
-    # Map deprecated 'site' kwarg to add_info if needed
+    """Insert or update an application instance (SITE→ADD_INFO migration compatible)."""
     if add_info is None and "site" in kwargs and kwargs["site"] is not None:
         add_info = kwargs["site"]
 
@@ -782,7 +601,7 @@ def upsert_invoice(
     groupid_at_booking: Optional[str] = None,
     rollover_batch_id: Optional[str] = None,
     rolled_over_from_year: Optional[int] = None,
-    invoice_type: Optional[str] = None,              # NEW
+    invoice_type: Optional[str] = None,
 ) -> None:
     eff_type = invoice_type or "Recurring Invoice"
     if eff_type == "Recurring Invoice" and fiscal_year is not None:
@@ -866,9 +685,9 @@ def upsert_invoice_extended(
     invoice_id: str,
     application_id: str,
     team_id: str,
-    renewal_date,               # date or ISO string
+    renewal_date,
     amount: float,
-    status: str,                # "Planned" | "Completed"
+    status: str,
     fiscal_year: Optional[int] = None,
     product_owner: Optional[str] = None,
     amount_next_year: Optional[float] = None,
@@ -887,7 +706,7 @@ def upsert_invoice_extended(
     groupid_at_booking: Optional[str] = None,
     rollover_batch_id: Optional[str] = None,
     rolled_over_from_year: Optional[int] = None,
-    invoice_type: Optional[str] = None,          # NEW
+    invoice_type: Optional[str] = None,
 ) -> None:
     return upsert_invoice(
         invoice_id=invoice_id,
@@ -934,8 +753,7 @@ def delete_application_group(group_id: str) -> None:
     df = fetch_df(f"SELECT COUNT(*) AS N FROM { _fq('APPLICATIONS') } WHERE GROUPID = %s", (group_id,))
     n = int(df.iloc[0]["N"]) if not df.empty else 0
     if n > 0:
-        raise ValueError("Cannot delete this Application Group because it has Application Instances. "
-                         "Delete the instances first.")
+        raise ValueError("Cannot delete this Application Group because it has Application Instances. Delete the instances first.")
     execute(f"DELETE FROM { _fq('APPLICATION_GROUPS') } WHERE GROUPID = %s", (group_id,))
 
 def delete_application(application_id: str) -> None:
@@ -971,7 +789,7 @@ def list_teams() -> pd.DataFrame:
             TO_DECIMAL(TEAMFTE,           18, 2) AS TEAMFTE,
             TO_DECIMAL(DELIVERY_TEAM_FTE, 18, 2) AS DELIVERY_TEAM_FTE,
             TO_DECIMAL(CONTRACTOR_C_FTE,  18, 2) AS CONTRACTOR_C_FTE,
-            TO_DECIMAL(CONTRACTOR_CS,     18, 2) AS CONTRACTOR_CS
+            TO_DECIMAL(CONTRACTOR_CS_FTE, 18, 2) AS CONTRACTOR_CS_FTE
         FROM { _fq('TEAMS') }
         ORDER BY TEAMNAME
     """)
@@ -1052,7 +870,6 @@ def list_group_team_links(team_id: Optional[str] = None) -> pd.DataFrame:
 def list_applications(team_id: Optional[str] = None, group_id: Optional[str] = None) -> pd.DataFrame:
     """
     List application instances. Optionally filter by team (via group’s team) and/or group.
-    Returns ADD_INFO; no legacy SITE column.
     """
     ensure_groups_teamid()
     where_clauses = []
@@ -1185,11 +1002,416 @@ def repair_programs_programfte() -> None:
 
 
 # =========================================================
-# One-time init per session
+# ADO minimal schema + cleanup
+# =========================================================
+
+def ensure_ado_minimal_tables() -> None:
+    """
+    Keep only raw ADO features + mapping tables.
+    """
+    db, sch = _db_and_schema()
+
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.ADO_FEATURES (
+        FEATURE_ID     STRING PRIMARY KEY,
+        TITLE          STRING,
+        STATE          STRING,
+        TEAM_RAW       STRING,
+        APP_NAME_RAW   STRING,
+        EFFORT_POINTS  FLOAT,
+        ITERATION_PATH STRING,
+        CREATED_AT     TIMESTAMP_NTZ,
+        CHANGED_AT     TIMESTAMP_NTZ
+      )
+    """)
+
+    # Mapping tables
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM (
+        ADO_TEAM STRING PRIMARY KEY,
+        TEAMID   STRING
+      )
+    """)
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP (
+        ADO_APP   STRING PRIMARY KEY,
+        APP_GROUP STRING
+      )
+    """)
+
+
+def reset_ado_calc_artifacts(drop_mappings: bool = False) -> None:
+    """
+    Remove calculation artifacts (tables/columns) created earlier.
+    """
+    db, sch = _db_and_schema()
+
+    for tbl in ["ADO_FEATURE_COST_ESTIMATE", "EFFORT_SPLIT_RULES"]:
+        try:
+            execute(f"DROP TABLE IF EXISTS {db}.{sch}.{tbl}")
+        except Exception:
+            pass
+
+    # Try to drop any known calc columns on ADO_FEATURES
+    for col in [
+        "ADO_YEAR", "POINTS_PER_FTE_PER_PI",
+        "EFF_TEAM","EFF_DELIVERY","EFF_CS","EFF_C",
+        "FTEPI_TEAM","FTEPI_DELIVERY","FTEPI_CS","FTEPI_C",
+        "COST_TEAM","COST_DELIVERY","COST_CS","COST_C",
+        "EST_FTE_PI","EST_COST_PI"
+    ]:
+        try:
+            if _table_has_column(db, sch, "ADO_FEATURES", col):
+                execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES DROP COLUMN {col}")
+        except Exception:
+            pass
+
+    if drop_mappings:
+        for tbl in ["MAP_ADO_TEAM_TO_TCO_TEAM", "MAP_ADO_APP_TO_TCO_GROUP"]:
+            try:
+                execute(f"DROP TABLE IF EXISTS {db}.{sch}.{tbl}")
+            except Exception:
+                pass
+
+    ensure_ado_minimal_tables()
+
+
+# ---------- NEW: EFFORT_POINTS precision repair & upserts ----------
+
+def repair_ado_effort_points_precision() -> None:
+    """
+    1) Ensure ADO_FEATURES.EFFORT_POINTS is FLOAT (keeps decimals).
+    2) Clean existing rows where points may be strings or use comma decimals.
+       Anything unparsable becomes NULL.
+    """
+    db, sch = _db_and_schema()
+    # Ensure type is FLOAT
+    try:
+        execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES ALTER COLUMN EFFORT_POINTS SET DATA TYPE FLOAT")
+    except Exception:
+        pass
+
+    # Normalize values: to_varchar -> replace comma -> try_to_decimal -> cast float
+    try:
+        execute(f"""
+            UPDATE {db}.{sch}.ADO_FEATURES
+            SET EFFORT_POINTS = CAST(
+                TRY_TO_DECIMAL(
+                    REPLACE(NULLIF(TRIM(TO_VARCHAR(EFFORT_POINTS)), ''), ',', '.'),
+                    18, 6
+                ) AS FLOAT
+            )
+            WHERE TRUE
+        """)
+    except Exception:
+        pass
+
+
+def upsert_ado_feature(
+    feature_id: str,
+    title: Optional[str] = None,
+    state: Optional[str] = None,
+    team_raw: Optional[str] = None,
+    app_name_raw: Optional[str] = None,
+    effort_points: Optional[float] = None,
+    iteration_path: Optional[str] = None,
+    created_at: Optional[str] = None,
+    changed_at: Optional[str] = None,
+) -> None:
+    """Insert/update a single ADO feature with decimal-preserving effort points."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+
+    sql = f"""
+      MERGE INTO {db}.{sch}.ADO_FEATURES t
+      USING (
+        SELECT %s FEATURE_ID, %s TITLE, %s STATE, %s TEAM_RAW, %s APP_NAME_RAW,
+               %s EFFORT_POINTS, %s ITERATION_PATH, %s CREATED_AT, %s CHANGED_AT
+      ) s
+      ON t.FEATURE_ID = s.FEATURE_ID
+      WHEN MATCHED THEN UPDATE SET
+        TITLE          = s.TITLE,
+        STATE          = s.STATE,
+        TEAM_RAW       = s.TEAM_RAW,
+        APP_NAME_RAW   = s.APP_NAME_RAW,
+        EFFORT_POINTS  = s.EFFORT_POINTS,
+        ITERATION_PATH = s.ITERATION_PATH,
+        CREATED_AT     = s.CREATED_AT,
+        CHANGED_AT     = s.CHANGED_AT
+      WHEN NOT MATCHED THEN INSERT
+        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+      VALUES
+        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+    """
+    execute(sql, (
+        feature_id, title, state, team_raw, app_name_raw,
+        None if effort_points is None else float(str(effort_points).replace(",", ".")),
+        iteration_path, created_at, changed_at
+    ))
+
+
+def bulk_upsert_ado_features(rows: Iterable[Dict[str, Any]]) -> None:
+    """Batch upsert for ADO features; keeps decimal effort points intact."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+
+    params: List[Tuple[Any, ...]] = []
+    for r in rows:
+        ep = r.get("effort_points")
+        ep = None if ep in (None, "") else float(str(ep).replace(",", "."))
+        params.append((
+            r.get("feature_id"),
+            r.get("title"),
+            r.get("state"),
+            r.get("team_raw"),
+            r.get("app_name_raw"),
+            ep,
+            r.get("iteration_path"),
+            r.get("created_at"),
+            r.get("changed_at"),
+        ))
+
+    sql = f"""
+      MERGE INTO {db}.{sch}.ADO_FEATURES t
+      USING (
+        SELECT
+          %s AS FEATURE_ID, %s AS TITLE, %s AS STATE, %s AS TEAM_RAW, %s AS APP_NAME_RAW,
+          %s AS EFFORT_POINTS, %s AS ITERATION_PATH, %s AS CREATED_AT, %s AS CHANGED_AT
+      ) s
+      ON t.FEATURE_ID = s.FEATURE_ID
+      WHEN MATCHED THEN UPDATE SET
+        TITLE          = s.TITLE,
+        STATE          = s.STATE,
+        TEAM_RAW       = s.TEAM_RAW,
+        APP_NAME_RAW   = s.APP_NAME_RAW,
+        EFFORT_POINTS  = s.EFFORT_POINTS,
+        ITERATION_PATH = s.ITERATION_PATH,
+        CREATED_AT     = s.CREATED_AT,
+        CHANGED_AT     = s.CHANGED_AT
+      WHEN NOT MATCHED THEN INSERT
+        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+      VALUES
+        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+    """
+    execute(sql, params, many=True)
+
+
+# ---------- NEW: Mapping helpers ----------
+
+def upsert_map_ado_team_to_tco_team(ado_team: str, team_id: Optional[str]) -> None:
+    """Map an ADO team name to a TCO TEAMID (nullable unmaps)."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    sql = f"""
+      MERGE INTO {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM t
+      USING (SELECT %s ADO_TEAM, %s TEAMID) s
+      ON t.ADO_TEAM = s.ADO_TEAM
+      WHEN MATCHED THEN UPDATE SET TEAMID = s.TEAMID
+      WHEN NOT MATCHED THEN INSERT (ADO_TEAM, TEAMID) VALUES (s.ADO_TEAM, s.TEAMID)
+    """
+    execute(sql, (ado_team, team_id))
+
+def upsert_map_ado_app_to_tco_group(ado_app: str, app_group: Optional[str]) -> None:
+    """Map an ADO application name to a TCO GROUPID (nullable unmaps)."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    sql = f"""
+      MERGE INTO {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP t
+      USING (SELECT %s ADO_APP, %s APP_GROUP) s
+      ON t.ADO_APP = s.ADO_APP
+      WHEN MATCHED THEN UPDATE SET APP_GROUP = s.APP_GROUP
+      WHEN NOT MATCHED THEN INSERT (ADO_APP, APP_GROUP) VALUES (s.ADO_APP, s.APP_GROUP)
+    """
+    execute(sql, (ado_app, app_group))
+
+def list_map_ado_team() -> pd.DataFrame:
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    return fetch_df(f"""
+      SELECT m.ADO_TEAM, m.TEAMID, t.TEAMNAME
+      FROM {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
+      LEFT JOIN {db}.{sch}.TEAMS t ON t.TEAMID = m.TEAMID
+      ORDER BY m.ADO_TEAM
+    """)
+
+def list_map_ado_app() -> pd.DataFrame:
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    return fetch_df(f"""
+      SELECT m.ADO_APP, m.APP_GROUP, g.GROUPNAME
+      FROM {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP m
+      LEFT JOIN {db}.{sch}.APPLICATION_GROUPS g ON g.GROUPID = m.APP_GROUP
+      ORDER BY m.ADO_APP
+    """)
+
+
+# =========================================================
+# Views: list & drop helpers
+# =========================================================
+
+def ensure_team_cost_view() -> None:
+    """
+    Creates a per-feature view that computes the four NEW columns using your math
+    and ALSO exposes the underlying FTE and rate columns so diagnostics pages can reference them.
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
+      WITH j AS (
+        SELECT
+          af.FEATURE_ID,
+          af.TITLE,
+          af.TEAM_RAW,
+          af.APP_NAME_RAW,
+          af.EFFORT_POINTS,
+          af.ITERATION_PATH,
+          m.TEAMID,
+          t.TEAMNAME,
+          -- FTE counts from TEAMS
+          COALESCE(t.DELIVERY_TEAM_FTE, 0)  AS DELIVERY_TEAM_FTE,
+          COALESCE(t.CONTRACTOR_CS_FTE, 0)  AS CONTRACTOR_CS_FTE,
+          COALESCE(t.CONTRACTOR_C_FTE, 0)   AS CONTRACTOR_C_FTE,
+          COALESCE(t.TEAMFTE, 0)            AS TEAMFTE,
+          -- Rates from TEAM_CALC
+          COALESCE(tc.XOM_RATE, 0)           AS XOM_RATE,
+          COALESCE(tc.CONTRACTOR_CS_RATE, 0) AS CONTRACTOR_CS_RATE,
+          COALESCE(tc.CONTRACTOR_C_RATE, 0)  AS CONTRACTOR_C_RATE
+        FROM {db}.{sch}.ADO_FEATURES af
+        LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
+          ON m.ADO_TEAM = af.TEAM_RAW
+        LEFT JOIN {db}.{sch}.TEAMS t
+          ON t.TEAMID = m.TEAMID
+        LEFT JOIN {db}.{sch}.TEAM_CALC tc
+          ON tc.TEAMID = t.TEAMID
+      )
+      SELECT
+        FEATURE_ID,
+        TITLE,
+        TEAM_RAW,
+        TEAMID,
+        TEAMNAME,
+        APP_NAME_RAW,
+        EFFORT_POINTS,
+        ITERATION_PATH,
+
+        -- Expose component FTEs and rates so downstream queries can filter/diagnose
+        DELIVERY_TEAM_FTE,
+        CONTRACTOR_CS_FTE,
+        CONTRACTOR_C_FTE,
+        TEAMFTE,
+        XOM_RATE,
+        CONTRACTOR_CS_RATE,
+        CONTRACTOR_C_RATE,
+
+        -- Denominator and safe helper
+        (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) AS COMP_DENOM,
+        CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN NULL ELSE TEAMFTE END AS TEAMFTE_SAFE,
+
+        -- 1) TEAM_COST_PERPI (does not depend on EFFORT_POINTS)
+        (TEAMFTE * XOM_RATE / 4) AS TEAM_COST_PERPI,
+
+        -- 2) Delivery share * effort * XOM rate
+        CASE
+          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+          ELSE (DELIVERY_TEAM_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+        END * EFFORT_POINTS * XOM_RATE AS DEL_TEAM_COST_PERPI,
+
+        -- 3) Contractor CS share * effort * CS rate
+        CASE
+          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+          ELSE (CONTRACTOR_CS_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+        END * EFFORT_POINTS * CONTRACTOR_CS_RATE AS TEAM_CONTRACTOR_CS_COST_PERPI,
+
+        -- 4) Contractor C share * effort * C rate
+        CASE
+          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+          ELSE (CONTRACTOR_C_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+        END * EFFORT_POINTS * CONTRACTOR_C_RATE AS TEAM_CONTRACTOR_C_COST_PERPI
+
+      FROM j
+    """)
+
+
+
+def list_views(pattern: Optional[str] = None) -> pd.DataFrame:
+    """List views in the current database/schema."""
+    db, sch = _db_and_schema()
+    if pattern:
+        return fetch_df(f"""
+            SELECT TABLE_CATALOG AS DATABASE_NAME,
+                   TABLE_SCHEMA  AS SCHEMA_NAME,
+                   TABLE_NAME    AS VIEW_NAME
+            FROM {db}.INFORMATION_SCHEMA.VIEWS
+            WHERE TABLE_SCHEMA = %s
+              AND TABLE_NAME LIKE %s
+            ORDER BY TABLE_NAME
+        """, (sch, pattern))
+    else:
+        return fetch_df(f"""
+            SELECT TABLE_CATALOG AS DATABASE_NAME,
+                   TABLE_SCHEMA  AS SCHEMA_NAME,
+                   TABLE_NAME    AS VIEW_NAME
+            FROM {db}.INFORMATION_SCHEMA.VIEWS
+            WHERE TABLE_SCHEMA = %s
+            ORDER BY TABLE_NAME
+        """, (sch,))
+
+
+def drop_view(view_name: str) -> None:
+    """Drop a single view by name (in current DB/schema)."""
+    db, sch = _db_and_schema()
+    execute(f'DROP VIEW IF EXISTS {db}.{sch}."{view_name}"')
+
+
+def drop_views_by_prefix(prefix: str = "V_") -> List[str]:
+    """Drop all views whose name begins with the given prefix."""
+    like = prefix.replace("_", "\\_") + "%"
+    df = list_views(pattern=like)
+    dropped: List[str] = []
+    for _, r in df.iterrows():
+        vname = str(r["VIEW_NAME"])
+        try:
+            drop_view(vname)
+            dropped.append(vname)
+        except Exception:
+            pass
+    return dropped
+
+
+# =========================================================
+# Column admin helpers
+# =========================================================
+
+def drop_column(table: str, column: str) -> None:
+    """Drop a column from a table (idempotent safe call)."""
+    db, sch = _db_and_schema()
+    try:
+        execute(f'ALTER TABLE {db}.{sch}.{table} DROP COLUMN "{column}"')
+    except Exception:
+        pass
+
+def rename_column(table: str, old: str, new: str) -> None:
+    """Rename a column on a table."""
+    db, sch = _db_and_schema()
+    execute(f'ALTER TABLE {db}.{sch}.{table} RENAME COLUMN "{old}" TO "{new}"')
+
+
+# =========================================================
+# One-time init per session (ORDER MATTERS)
 # =========================================================
 
 if not st.session_state.get("_tco_db_init_done"):
     ensure_tables()
-    ensure_ado_tables()   # <-- ADO tables/view bootstrap added
     normalize_team_numeric_types()
+    ensure_team_calc_table()
+
+    # Ensure ADO raw + mapping tables exist BEFORE the cost view
+    ensure_ado_minimal_tables()
+
+    # Clean/normalize EFFORT_POINTS once per session (idempotent and fast)
+    repair_ado_effort_points_precision()
+
+    # Now the view can safely reference decimals
+    ensure_team_cost_view()
+
     st.session_state["_tco_db_init_done"] = True

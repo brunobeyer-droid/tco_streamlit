@@ -845,7 +845,7 @@ def list_groups_for_team(team_id: str) -> pd.DataFrame:
         FROM { _fq('APPLICATION_GROUPS') } g
         LEFT JOIN { _fq('TEAMS') }    t ON t.TEAMID    = g.TEAMID
         LEFT JOIN { _fq('PROGRAMS') } p ON p.PROGRAMID = COALESCE(g.PROGRAMID, t.PROGRAMID)
-        LEFT JOIN { _fq('VENDORS') }  v ON v.VENDORID  = g.DEFAULT_VENDORID
+        LEFT JOIN { _fq('VENDORS') }  v ON v.VENDORID = g.DEFAULT_VENDORID
         WHERE g.TEAMID = %s
         ORDER BY g.GROUPNAME
     """, (team_id,))
@@ -999,6 +999,36 @@ def repair_programs_programfte() -> None:
             updates,
             many=True,
         )
+
+def repair_team_fte_values() -> None:
+    """
+    Coerce TEAMS FTE columns that might be stored as VARCHAR (e.g., '5,0') into numeric.
+    - Replaces comma decimals with dots
+    - Trims blanks to NULL
+    - Uses TRY_TO_DECIMAL to avoid errors
+    - Then enforces NUMBER(18,2) on the columns
+    """
+    db, sch = _db_and_schema()
+    for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
+        try:
+            execute(f"""
+                UPDATE {db}.{sch}.TEAMS
+                SET {col} = CAST(
+                    TRY_TO_DECIMAL(
+                        REPLACE(NULLIF(TRIM(TO_VARCHAR({col})), ''), ',', '.'),
+                        18, 2
+                    ) AS NUMBER(18,2)
+                )
+            """)
+        except Exception:
+            pass
+
+    # Enforce numeric data types after cleaning
+    for col in ("TEAMFTE", "DELIVERY_TEAM_FTE", "CONTRACTOR_C_FTE", "CONTRACTOR_CS_FTE"):
+        try:
+            execute(f"ALTER TABLE {db}.{sch}.TEAMS ALTER COLUMN {col} SET DATA TYPE NUMBER(18,2)")
+        except Exception:
+            pass
 
 
 # =========================================================
@@ -1251,8 +1281,9 @@ def list_map_ado_app() -> pd.DataFrame:
 
 def ensure_team_cost_view() -> None:
     """
-    Creates a per-feature view that computes the four NEW columns using your math
-    and ALSO exposes the underlying FTE and rate columns so diagnostics pages can reference them.
+    View with robust casting:
+    - FTEs and rates are coerced to DECIMAL safely, then CAST to FLOAT.
+    - All computed cost columns are CAST to FLOAT to avoid Decimal in pandas.
     """
     db, sch = _db_and_schema()
     execute(f"""
@@ -1263,19 +1294,22 @@ def ensure_team_cost_view() -> None:
           af.TITLE,
           af.TEAM_RAW,
           af.APP_NAME_RAW,
-          af.EFFORT_POINTS,
+          CAST(af.EFFORT_POINTS AS FLOAT) AS EFFORT_POINTS,
           af.ITERATION_PATH,
           m.TEAMID,
           t.TEAMNAME,
-          -- FTE counts from TEAMS
-          COALESCE(t.DELIVERY_TEAM_FTE, 0)  AS DELIVERY_TEAM_FTE,
-          COALESCE(t.CONTRACTOR_CS_FTE, 0)  AS CONTRACTOR_CS_FTE,
-          COALESCE(t.CONTRACTOR_C_FTE, 0)   AS CONTRACTOR_C_FTE,
-          COALESCE(t.TEAMFTE, 0)            AS TEAMFTE,
-          -- Rates from TEAM_CALC
-          COALESCE(tc.XOM_RATE, 0)           AS XOM_RATE,
-          COALESCE(tc.CONTRACTOR_CS_RATE, 0) AS CONTRACTOR_CS_RATE,
-          COALESCE(tc.CONTRACTOR_C_RATE, 0)  AS CONTRACTOR_C_RATE
+
+          -- FTE counts from TEAMS (robust cast to DECIMAL, then FLOAT)
+          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.DELIVERY_TEAM_FTE)), ''), ',', '.'), 18, 2), 0) AS FLOAT) AS DELIVERY_TEAM_FTE,
+          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.CONTRACTOR_CS_FTE)), ''), ',', '.'), 18, 2), 0) AS FLOAT) AS CONTRACTOR_CS_FTE,
+          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.CONTRACTOR_C_FTE)), ''), ',', '.'), 18, 2), 0) AS FLOAT) AS CONTRACTOR_C_FTE,
+          CAST(COALESCE(TRY_TO_DECIMAL(REPLACE(NULLIF(TRIM(TO_VARCHAR(t.TEAMFTE)), ''), ',', '.'), 18, 2), 0) AS FLOAT) AS TEAMFTE,
+
+          -- Rates from TEAM_CALC (cast to FLOAT)
+          CAST(COALESCE(tc.XOM_RATE, 0) AS FLOAT)           AS XOM_RATE,
+          CAST(COALESCE(tc.CONTRACTOR_CS_RATE, 0) AS FLOAT) AS CONTRACTOR_CS_RATE,
+          CAST(COALESCE(tc.CONTRACTOR_C_RATE, 0) AS FLOAT)  AS CONTRACTOR_C_RATE
+
         FROM {db}.{sch}.ADO_FEATURES af
         LEFT JOIN {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
           ON m.ADO_TEAM = af.TEAM_RAW
@@ -1294,7 +1328,6 @@ def ensure_team_cost_view() -> None:
         EFFORT_POINTS,
         ITERATION_PATH,
 
-        -- Expose component FTEs and rates so downstream queries can filter/diagnose
         DELIVERY_TEAM_FTE,
         CONTRACTOR_CS_FTE,
         CONTRACTOR_C_FTE,
@@ -1303,30 +1336,32 @@ def ensure_team_cost_view() -> None:
         CONTRACTOR_CS_RATE,
         CONTRACTOR_C_RATE,
 
-        -- Denominator and safe helper
-        (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) AS COMP_DENOM,
-        CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN NULL ELSE TEAMFTE END AS TEAMFTE_SAFE,
+        -- Denominator (cast to FLOAT to keep consistency)
+        CAST(DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE AS FLOAT) AS COMP_DENOM,
 
-        -- 1) TEAM_COST_PERPI (does not depend on EFFORT_POINTS)
-        (TEAMFTE * XOM_RATE / 4) AS TEAM_COST_PERPI,
+        -- 1) Team-level cost per PI
+        CAST(TEAMFTE * XOM_RATE / 4 AS FLOAT) AS TEAM_COST_PERPI,
 
         -- 2) Delivery share * effort * XOM rate
-        CASE
-          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
-          ELSE (DELIVERY_TEAM_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
-        END * EFFORT_POINTS * XOM_RATE AS DEL_TEAM_COST_PERPI,
+        CAST(
+          CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+               ELSE (DELIVERY_TEAM_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+          END * EFFORT_POINTS * XOM_RATE
+        AS FLOAT) AS DEL_TEAM_COST_PERPI,
 
         -- 3) Contractor CS share * effort * CS rate
-        CASE
-          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
-          ELSE (CONTRACTOR_CS_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
-        END * EFFORT_POINTS * CONTRACTOR_CS_RATE AS TEAM_CONTRACTOR_CS_COST_PERPI,
+        CAST(
+          CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+               ELSE (CONTRACTOR_CS_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+          END * EFFORT_POINTS * CONTRACTOR_CS_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_CS_COST_PERPI,
 
         -- 4) Contractor C share * effort * C rate
-        CASE
-          WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
-          ELSE (CONTRACTOR_C_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
-        END * EFFORT_POINTS * CONTRACTOR_C_RATE AS TEAM_CONTRACTOR_C_COST_PERPI
+        CAST(
+          CASE WHEN (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE) = 0 THEN 0
+               ELSE (CONTRACTOR_C_FTE / (DELIVERY_TEAM_FTE + CONTRACTOR_CS_FTE + CONTRACTOR_C_FTE))
+          END * EFFORT_POINTS * CONTRACTOR_C_RATE
+        AS FLOAT) AS TEAM_CONTRACTOR_C_COST_PERPI
 
       FROM j
     """)
@@ -1402,6 +1437,8 @@ def rename_column(table: str, old: str, new: str) -> None:
 
 if not st.session_state.get("_tco_db_init_done"):
     ensure_tables()
+    # Sanitize any legacy string FTEs like '5,0' -> 5.00 before enforcing numeric
+    repair_team_fte_values()            # <<< ADDED
     normalize_team_numeric_types()
     ensure_team_calc_table()
 
@@ -1411,7 +1448,7 @@ if not st.session_state.get("_tco_db_init_done"):
     # Clean/normalize EFFORT_POINTS once per session (idempotent and fast)
     repair_ado_effort_points_precision()
 
-    # Now the view can safely reference decimals
+    # Now the view can safely reference decimals and sanitized FTEs
     ensure_team_cost_view()
 
     st.session_state["_tco_db_init_done"] = True

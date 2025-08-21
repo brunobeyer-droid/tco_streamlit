@@ -18,7 +18,7 @@ ensure_tables()
 # --- Ensure columns exist (idempotent) ---
 execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
 execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS CONTRACTOR_C_FTE FLOAT")
-execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS CONTRACTOR_CS FLOAT")
+execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS CONTRACTOR_CS_FTE FLOAT")
 execute("ALTER TABLE TEAMS ADD COLUMN IF NOT EXISTS PRODUCTOWNER STRING")
 
 st.title("👥 Teams")
@@ -32,7 +32,7 @@ def _teams_df():
     return fetch_df(
         """
         SELECT TEAMID, TEAMNAME, PROGRAMID, TEAMFTE,
-               DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS,
+               DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS_FTE,
                PRODUCTOWNER
         FROM TEAMS
         ORDER BY TEAMNAME
@@ -65,7 +65,7 @@ with st.expander("➕ Add New Team", expanded=False):
     teamfte = st.number_input("Team FTE", min_value=0.0, step=0.1, key="add_teamfte")
     delivery_team_fte = st.number_input("Delivery Team FTE", min_value=0.0, step=0.1, key="add_delivery_team_fte")
     contractor_c_fte = st.number_input("Contractor C FTE", min_value=0.0, step=0.1, key="add_contractor_c_fte")
-    contractor_cs = st.number_input("Contractor CS", min_value=0.0, step=0.1, key="add_contractor_cs")
+    CONTRACTOR_CS_FTE = st.number_input("Contractor CS", min_value=0.0, step=0.1, key="add_CONTRACTOR_CS_FTE")
 
     if st.button("Create Team", key="add_create_btn"):
         name = (teamname or "").strip()
@@ -87,11 +87,11 @@ with st.expander("➕ Add New Team", expanded=False):
                     execute(
                         """
                         INSERT INTO TEAMS (TEAMID, TEAMNAME, PROGRAMID, TEAMFTE,
-                                           DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS,
+                                           DELIVERY_TEAM_FTE, CONTRACTOR_C_FTE, CONTRACTOR_CS_FTE,
                                            PRODUCTOWNER)
                         VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
                         """,
-                        (teamid, name, programid, teamfte, delivery_team_fte, contractor_c_fte, contractor_cs, po),
+                        (teamid, name, programid, teamfte, delivery_team_fte, contractor_c_fte, CONTRACTOR_CS_FTE, po),
                     )
                     st.success("Team created.")
                     st.cache_data.clear()
@@ -113,7 +113,7 @@ with st.expander("✏️ Edit Existing Team", expanded=True):
         new_fte = st.number_input("Team FTE", value=float(row["TEAMFTE"] or 0), step=0.1, key="edit_teamfte")
         new_delivery = st.number_input("Delivery Team FTE", value=float(row["DELIVERY_TEAM_FTE"] or 0), step=0.1, key="edit_delivery_team_fte")
         new_cc = st.number_input("Contractor C FTE", value=float(row["CONTRACTOR_C_FTE"] or 0), step=0.1, key="edit_contractor_c_fte")
-        new_cs = st.number_input("Contractor CS", value=float(row["CONTRACTOR_CS"] or 0), step=0.1, key="edit_contractor_cs")
+        new_cs = st.number_input("Contractor CS FTE", value=float(row["CONTRACTOR_CS_FTE"] or 0), step=0.1, key="edit_CONTRACTOR_CS_FTE")
 
         if st.button("Update Team", key="edit_update_btn"):
             name = (new_name or "").strip()
@@ -132,7 +132,7 @@ with st.expander("✏️ Edit Existing Team", expanded=True):
                         execute(
                             """
                             UPDATE TEAMS
-                            SET TEAMNAME=%s, TEAMFTE=%s, DELIVERY_TEAM_FTE=%s, CONTRACTOR_C_FTE=%s, CONTRACTOR_CS=%s,
+                            SET TEAMNAME=%s, TEAMFTE=%s, DELIVERY_TEAM_FTE=%s, CONTRACTOR_C_FTE=%s, CONTRACTOR_CS_FTE=%s,
                                 PRODUCTOWNER=%s
                             WHERE TEAMID=%s
                             """,

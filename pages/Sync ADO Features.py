@@ -7,12 +7,29 @@ import streamlit as st
 
 from snowflake_db import execute, fetch_df, ensure_ado_minimal_tables
 
+# Optional helpers (safe if not present in snowflake_db.py)
+try:
+    from snowflake_db import (
+        ensure_team_calc_table,
+        ensure_team_cost_view,
+        repair_ado_effort_points_precision,
+    )
+except Exception:
+    ensure_team_calc_table = None
+    ensure_team_cost_view = None
+    repair_ado_effort_points_precision = None
+
 st.set_page_config(page_title="Sync ADO Features", layout="wide")
 st.title("🔄 Sync ADO Features (XLSX‑friendly, persistent upload)")
 
 # Ensure minimal schema is ready
 with st.spinner("Ensuring minimal ADO schema..."):
     ensure_ado_minimal_tables()
+    # Best effort: prepare calc/view for the Reconciliation tab if available
+    if callable(ensure_team_calc_table):
+        ensure_team_calc_table()
+    if callable(ensure_team_cost_view):
+        ensure_team_cost_view()
 
 # -------------------------
 # Session state
@@ -285,10 +302,56 @@ def upsert_ado_features(df: pd.DataFrame) -> int:
     execute(sql, rows, many=True)
     return len(rows)
 
+# ---- Extra helpers for ADO Explorer / Reconciliation
+def load_ado_distincts() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    teams = fetch_df("""
+        SELECT DISTINCT TEAM_RAW
+        FROM ADO_FEATURES
+        WHERE TEAM_RAW IS NOT NULL AND TRIM(TEAM_RAW) <> ''
+        ORDER BY TEAM_RAW
+    """)
+    apps  = fetch_df("""
+        SELECT DISTINCT APP_NAME_RAW
+        FROM ADO_FEATURES
+        WHERE APP_NAME_RAW IS NOT NULL AND TRIM(APP_NAME_RAW) <> ''
+        ORDER BY APP_NAME_RAW
+    """)
+    iters = fetch_df("""
+        SELECT DISTINCT ITERATION_PATH
+        FROM ADO_FEATURES
+        WHERE ITERATION_PATH IS NOT NULL AND TRIM(ITERATION_PATH) <> ''
+        ORDER BY ITERATION_PATH
+    """)
+    return teams, apps, iters
+
+def ado_features_base_query(where_sql: str = "", params: Optional[tuple] = None) -> pd.DataFrame:
+    sql = f"""
+      SELECT FEATURE_ID, TITLE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CHANGED_AT
+      FROM ADO_FEATURES
+      {where_sql}
+      ORDER BY COALESCE(CHANGED_AT, TO_TIMESTAMP_NTZ('1900-01-01')) DESC, FEATURE_ID
+    """
+    df = fetch_df(sql, params)
+    if "EFFORT_POINTS" in df.columns:
+        df["EFFORT_POINTS"] = pd.to_numeric(df["EFFORT_POINTS"], errors="coerce")
+    return df
+
 # -------------------------
-# UI: Tabs
+# UI: Tabs (single row, requested order)
 # -------------------------
-tab_load, tab_map, tab_admin = st.tabs(["📥 Load Data", "🧭 Map Values", "🛠️ Admin / Cleanup"])
+(
+    tab_load,
+    tab_map,
+    tab_explore,
+    tab_recon,
+    tab_admin,
+) = st.tabs([
+    "📥 Load Data",
+    "🧭 Map Values",
+    "🔎 ADO Explorer",
+    "📊 Reconciliation",
+    "🛠️ Admin / Cleanup",
+])
 
 # =========================
 # Tab: Load Data
@@ -458,7 +521,7 @@ with tab_map:
 
     st.markdown("---")
 
-    # ---- App group mapping (Display GROUPNAME, store GROUPID)  **FIXED**
+    # ---- App group mapping (Display GROUPNAME, store GROUPID)
     st.markdown("### ADO → TCO App Group")
     if ado_apps.empty or groups_df.empty:
         st.info("Load features and create Application Groups first.")
@@ -493,7 +556,6 @@ with tab_map:
             key="am_editor",
         )
 
-        # ✅ Button lives ONLY inside tab_map
         if st.button("💾 Save App Group Mappings", key="btn_save_app_group_mappings"):
             rows = []
             for _, r in edited2.iterrows():
@@ -517,6 +579,205 @@ with tab_map:
                 """
                 execute(merge_sql, rows, many=True)
             st.success("App Group mappings saved.")
+
+# =========================
+# Tab: 🔎 ADO Explorer
+# =========================
+with tab_explore:
+    st.subheader("What’s coming from ADO (raw import)")
+
+    cfix, _ = st.columns([1, 5])
+    with cfix:
+        if callable(repair_ado_effort_points_precision):
+            if st.button("🧹 Repair Effort Points Precision", key="btn_repair_effort_explorer"):
+                try:
+                    repair_ado_effort_points_precision()
+                    st.success("Effort points precision repaired.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Repair failed: {e}")
+        else:
+            st.caption("Repair Effort Points action unavailable (helper not found).")
+
+    df_teams, df_apps, df_iters = load_ado_distincts()
+    c1, c2, c3 = st.columns(3)
+    c1.metric("Distinct ADO Teams", len(df_teams))
+    c2.metric("Distinct ADO Apps", len(df_apps))
+    c3.metric("Distinct Iterations", len(df_iters))
+
+    st.markdown("#### Filter")
+    f1, f2, f3 = st.columns([2,2,2])
+    team_like = f1.text_input("Team contains", "", key="exp_team_contains")
+    app_like  = f2.text_input("App contains", "", key="exp_app_contains")
+    iter_like = f3.text_input("Iteration contains", "", key="exp_iter_contains")
+
+    where = []
+    params: list = []
+    if team_like.strip():
+        where.append("UPPER(TEAM_RAW) LIKE UPPER(%s)")
+        params.append(f"%{team_like.strip()}%")
+    if app_like.strip():
+        where.append("UPPER(APP_NAME_RAW) LIKE UPPER(%s)")
+        params.append(f"%{app_like.strip()}%")
+    if iter_like.strip():
+        where.append("UPPER(ITERATION_PATH) LIKE UPPER(%s)")
+        params.append(f"%{iter_like.strip()}%")
+    where_sql = " WHERE " + " AND ".join(where) if where else ""
+
+    df_raw = ado_features_base_query(where_sql, tuple(params) if params else None)
+
+    st.markdown("#### Latest Features from ADO")
+    st.dataframe(df_raw, use_container_width=True, height=340)
+
+    st.markdown("#### Effort Points by Iteration")
+    df_iter_sum = fetch_df(f"""
+      SELECT ITERATION_PATH,
+             SUM(COALESCE(EFFORT_POINTS,0)) AS EFFORT_POINTS_SUM,
+             COUNT(*) AS FEATURES
+      FROM ADO_FEATURES
+      {where_sql}
+      GROUP BY ITERATION_PATH
+      ORDER BY ITERATION_PATH
+    """, tuple(params) if params else None)
+    st.dataframe(df_iter_sum, use_container_width=True, height=240)
+
+    st.markdown("#### Effort Points by Team & Iteration (raw)")
+    df_team_iter = fetch_df(f"""
+      SELECT TEAM_RAW, ITERATION_PATH,
+             SUM(COALESCE(EFFORT_POINTS,0)) AS EFFORT_POINTS_SUM,
+             COUNT(*) AS FEATURES
+      FROM ADO_FEATURES
+      {where_sql}
+      GROUP BY TEAM_RAW, ITERATION_PATH
+      ORDER BY TEAM_RAW, ITERATION_PATH
+    """, tuple(params) if params else None)
+    st.dataframe(df_team_iter, use_container_width=True, height=300)
+
+# =========================
+# Tab: 📊 Reconciliation
+# =========================
+with tab_recon:
+    st.subheader("Reconciliation: mappings + effort + calculated costs")
+    st.caption("This joins ADO features with your TCO Teams, App Groups and the cost formulas in VW_TEAM_COSTS_PER_FEATURE.")
+
+    # Quick issues panel
+    colA, colB, colC = st.columns(3)
+    try:
+        unmapped_team = fetch_df("""
+          SELECT TEAM_RAW, COUNT(*) AS N
+          FROM ADO_FEATURES af
+          LEFT JOIN MAP_ADO_TEAM_TO_TCO_TEAM m ON m.ADO_TEAM = af.TEAM_RAW
+          WHERE m.TEAMID IS NULL
+          GROUP BY TEAM_RAW
+          ORDER BY N DESC
+        """)
+        colA.metric("Features missing TEAM mapping", int(unmapped_team["N"].sum()) if not unmapped_team.empty else 0)
+    except Exception as e:
+        colA.warning(f"Unmapped calc failed: {e}")
+        unmapped_team = pd.DataFrame()
+
+    try:
+        zero_denom = fetch_df("""
+          SELECT COUNT(*) AS N
+          FROM VW_TEAM_COSTS_PER_FEATURE
+          WHERE (TEAMID IS NOT NULL) AND
+                (COALESCE(DELIVERY_TEAM_FTE,0) + COALESCE(CONTRACTOR_CS_FTE,0) + COALESCE(CONTRACTOR_C_FTE,0)) = 0
+        """)
+        colB.metric("Rows with zero composition denominator", int(zero_denom.iloc[0]["N"]) if not zero_denom.empty else 0)
+    except Exception as e:
+        colB.warning(f"Zero-denom check failed: {e}")
+
+    try:
+        no_rate = fetch_df("""
+          SELECT COUNT(*) AS N FROM VW_TEAM_COSTS_PER_FEATURE
+          WHERE (TEAMID IS NOT NULL) AND
+                (COALESCE(XOM_RATE,0)=0 OR COALESCE(CONTRACTOR_CS_RATE,0)=0 OR COALESCE(CONTRACTOR_C_RATE,0)=0)
+        """)
+        colC.metric("Rows with a missing rate", int(no_rate.iloc[0]["N"]) if not no_rate.empty else 0)
+    except Exception as e:
+        colC.warning(f"Rate check failed: {e}")
+
+    st.markdown("#### Filters")
+    fc1, fc2, fc3 = st.columns([2,2,2])
+    team_like2 = fc1.text_input("TCO Team contains", "", key="recon_team_contains")
+    app_like2  = fc2.text_input("ADO App contains", "", key="recon_app_contains")
+    iter_like2 = fc3.text_input("Iteration contains", "", key="recon_iter_contains")
+
+    where2 = []
+    params2: list = []
+    if team_like2.strip():
+        where2.append("UPPER(TEAMNAME) LIKE UPPER(%s)")
+        params2.append(f"%{team_like2.strip()}%")
+    if app_like2.strip():
+        where2.append("UPPER(APP_NAME_RAW) LIKE UPPER(%s)")
+        params2.append(f"%{app_like2.strip()}%")
+    if iter_like2.strip():
+        where2.append("UPPER(ITERATION_PATH) LIKE UPPER(%s)")
+        params2.append(f"%{iter_like2.strip()}%")
+    where_sql2 = " WHERE " + " AND ".join(where2) if where2 else ""
+
+    try:
+        base_sql = f"""
+          SELECT
+            TEAMNAME, TEAMID, FEATURE_ID, TITLE, APP_NAME_RAW, ITERATION_PATH,
+            EFFORT_POINTS,
+            TEAM_COST_PERPI,
+            DEL_TEAM_COST_PERPI,
+            TEAM_CONTRACTOR_CS_COST_PERPI,
+            TEAM_CONTRACTOR_C_COST_PERPI
+          FROM VW_TEAM_COSTS_PER_FEATURE
+          {where_sql2}
+          ORDER BY TEAMNAME, ITERATION_PATH, FEATURE_ID
+        """
+        df_calc = fetch_df(base_sql, tuple(params2) if params2 else None)
+    except Exception as e:
+        st.error(f"Could not read VW_TEAM_COSTS_PER_FEATURE: {e}")
+        df_calc = pd.DataFrame()
+
+    if df_calc.empty:
+        st.info("No rows found with the current filters.")
+    else:
+        # Aggregates
+        st.markdown("#### Effort & Cost by Team & Iteration")
+        ag = df_calc.groupby(["TEAMNAME","ITERATION_PATH"], dropna=False).agg(
+            FEATURES=("FEATURE_ID","count"),
+            EFFORT_POINTS_SUM=("EFFORT_POINTS","sum"),
+            TEAM_COST_PERPI=("TEAM_COST_PERPI","sum"),
+            DEL_TEAM_COST_PERPI=("DEL_TEAM_COST_PERPI","sum"),
+            TEAM_CONTRACTOR_CS_COST_PERPI=("TEAM_CONTRACTOR_CS_COST_PERPI","sum"),
+            TEAM_CONTRACTOR_C_COST_PERPI=("TEAM_CONTRACTOR_C_COST_PERPI","sum"),
+        ).reset_index()
+        ag["TOTAL_COST_PERPI"] = ag[
+            ["TEAM_COST_PERPI","DEL_TEAM_COST_PERPI","TEAM_CONTRACTOR_CS_COST_PERPI","TEAM_CONTRACTOR_C_COST_PERPI"]
+        ].sum(axis=1)
+        st.dataframe(ag, use_container_width=True, height=320)
+
+        st.markdown("#### Per-Feature Detail (to spot anomalies)")
+        st.dataframe(df_calc, use_container_width=True, height=420)
+
+        st.markdown("#### Unmapped ADO Teams (with counts)")
+        st.dataframe(unmapped_team, use_container_width=True, height=220)
+
+        st.markdown("#### Rows with missing rates or zero composition (diagnostics)")
+        try:
+            diag = fetch_df("""
+              SELECT
+                TEAMNAME, FEATURE_ID, APP_NAME_RAW, ITERATION_PATH, EFFORT_POINTS,
+                DELIVERY_TEAM_FTE, CONTRACTOR_CS_FTE, CONTRACTOR_C_FTE,
+                XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE
+              FROM VW_TEAM_COSTS_PER_FEATURE
+              WHERE (TEAMID IS NOT NULL) AND
+                    (
+                     (COALESCE(DELIVERY_TEAM_FTE,0) + COALESCE(CONTRACTOR_CS_FTE,0) + COALESCE(CONTRACTOR_C_FTE,0)) = 0
+                     OR COALESCE(XOM_RATE,0)=0
+                     OR COALESCE(CONTRACTOR_CS_RATE,0)=0
+                     OR COALESCE(CONTRACTOR_C_RATE,0)=0
+                    )
+              ORDER BY TEAMNAME, FEATURE_ID
+            """)
+            st.dataframe(diag, use_container_width=True, height=260)
+        except Exception as e:
+            st.warning(f"Diagnostics view failed: {e}")
 
 # =========================
 # Tab: Admin / Cleanup
