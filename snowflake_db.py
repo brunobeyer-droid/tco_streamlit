@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from typing import Any, Iterable, Optional, Tuple, List
+from typing import Any, Iterable, Optional, Tuple, List, Dict
 
 import pandas as pd
 import streamlit as st
@@ -429,7 +429,7 @@ def list_team_calc() -> pd.DataFrame:
     """)
 
 # =========================================================
-# Upserts
+# Upserts (core)
 # =========================================================
 
 def upsert_program(program_id: str, name: str, owner: Optional[str], fte: Optional[float]) -> None:
@@ -460,7 +460,7 @@ def upsert_team(team_id: str, name: str, program_id: Optional[str],
                 delivery_team_fte: Optional[float] = None,
                 contractor_c_fte: Optional[float] = None,
                 contractor_cs_fte: Optional[float] = None) -> None:
-    # App-level uniqueness guard (case-insensitive)
+    # Name uniqueness guard (case-insensitive)
     if name and str(name).strip():
         dup = fetch_df(
             f"SELECT TEAMID FROM { _fq('TEAMS') } WHERE UPPER(TEAMNAME)=UPPER(%s) AND TEAMID <> %s LIMIT 1",
@@ -1002,7 +1002,7 @@ def repair_programs_programfte() -> None:
 
 
 # =========================================================
-# ADO minimal schema + cleanup (kept from earlier reset)
+# ADO minimal schema + cleanup
 # =========================================================
 
 def ensure_ado_minimal_tables() -> None:
@@ -1074,6 +1074,175 @@ def reset_ado_calc_artifacts(drop_mappings: bool = False) -> None:
                 pass
 
     ensure_ado_minimal_tables()
+
+
+# ---------- NEW: EFFORT_POINTS precision repair & upserts ----------
+
+def repair_ado_effort_points_precision() -> None:
+    """
+    1) Ensure ADO_FEATURES.EFFORT_POINTS is FLOAT (keeps decimals).
+    2) Clean existing rows where points may be strings or use comma decimals.
+       Anything unparsable becomes NULL.
+    """
+    db, sch = _db_and_schema()
+    # Ensure type is FLOAT
+    try:
+        execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES ALTER COLUMN EFFORT_POINTS SET DATA TYPE FLOAT")
+    except Exception:
+        pass
+
+    # Normalize values: to_varchar -> replace comma -> try_to_decimal -> cast float
+    try:
+        execute(f"""
+            UPDATE {db}.{sch}.ADO_FEATURES
+            SET EFFORT_POINTS = CAST(
+                TRY_TO_DECIMAL(
+                    REPLACE(NULLIF(TRIM(TO_VARCHAR(EFFORT_POINTS)), ''), ',', '.'),
+                    18, 6
+                ) AS FLOAT
+            )
+            WHERE TRUE
+        """)
+    except Exception:
+        pass
+
+
+def upsert_ado_feature(
+    feature_id: str,
+    title: Optional[str] = None,
+    state: Optional[str] = None,
+    team_raw: Optional[str] = None,
+    app_name_raw: Optional[str] = None,
+    effort_points: Optional[float] = None,
+    iteration_path: Optional[str] = None,
+    created_at: Optional[str] = None,
+    changed_at: Optional[str] = None,
+) -> None:
+    """Insert/update a single ADO feature with decimal-preserving effort points."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+
+    sql = f"""
+      MERGE INTO {db}.{sch}.ADO_FEATURES t
+      USING (
+        SELECT %s FEATURE_ID, %s TITLE, %s STATE, %s TEAM_RAW, %s APP_NAME_RAW,
+               %s EFFORT_POINTS, %s ITERATION_PATH, %s CREATED_AT, %s CHANGED_AT
+      ) s
+      ON t.FEATURE_ID = s.FEATURE_ID
+      WHEN MATCHED THEN UPDATE SET
+        TITLE          = s.TITLE,
+        STATE          = s.STATE,
+        TEAM_RAW       = s.TEAM_RAW,
+        APP_NAME_RAW   = s.APP_NAME_RAW,
+        EFFORT_POINTS  = s.EFFORT_POINTS,
+        ITERATION_PATH = s.ITERATION_PATH,
+        CREATED_AT     = s.CREATED_AT,
+        CHANGED_AT     = s.CHANGED_AT
+      WHEN NOT MATCHED THEN INSERT
+        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+      VALUES
+        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+    """
+    execute(sql, (
+        feature_id, title, state, team_raw, app_name_raw,
+        None if effort_points is None else float(str(effort_points).replace(",", ".")),
+        iteration_path, created_at, changed_at
+    ))
+
+
+def bulk_upsert_ado_features(rows: Iterable[Dict[str, Any]]) -> None:
+    """Batch upsert for ADO features; keeps decimal effort points intact."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+
+    params: List[Tuple[Any, ...]] = []
+    for r in rows:
+        ep = r.get("effort_points")
+        ep = None if ep in (None, "") else float(str(ep).replace(",", "."))
+        params.append((
+            r.get("feature_id"),
+            r.get("title"),
+            r.get("state"),
+            r.get("team_raw"),
+            r.get("app_name_raw"),
+            ep,
+            r.get("iteration_path"),
+            r.get("created_at"),
+            r.get("changed_at"),
+        ))
+
+    sql = f"""
+      MERGE INTO {db}.{sch}.ADO_FEATURES t
+      USING (
+        SELECT
+          %s AS FEATURE_ID, %s AS TITLE, %s AS STATE, %s AS TEAM_RAW, %s AS APP_NAME_RAW,
+          %s AS EFFORT_POINTS, %s AS ITERATION_PATH, %s AS CREATED_AT, %s AS CHANGED_AT
+      ) s
+      ON t.FEATURE_ID = s.FEATURE_ID
+      WHEN MATCHED THEN UPDATE SET
+        TITLE          = s.TITLE,
+        STATE          = s.STATE,
+        TEAM_RAW       = s.TEAM_RAW,
+        APP_NAME_RAW   = s.APP_NAME_RAW,
+        EFFORT_POINTS  = s.EFFORT_POINTS,
+        ITERATION_PATH = s.ITERATION_PATH,
+        CREATED_AT     = s.CREATED_AT,
+        CHANGED_AT     = s.CHANGED_AT
+      WHEN NOT MATCHED THEN INSERT
+        (FEATURE_ID, TITLE, STATE, TEAM_RAW, APP_NAME_RAW, EFFORT_POINTS, ITERATION_PATH, CREATED_AT, CHANGED_AT)
+      VALUES
+        (s.FEATURE_ID, s.TITLE, s.STATE, s.TEAM_RAW, s.APP_NAME_RAW, s.EFFORT_POINTS, s.ITERATION_PATH, s.CREATED_AT, s.CHANGED_AT)
+    """
+    execute(sql, params, many=True)
+
+
+# ---------- NEW: Mapping helpers ----------
+
+def upsert_map_ado_team_to_tco_team(ado_team: str, team_id: Optional[str]) -> None:
+    """Map an ADO team name to a TCO TEAMID (nullable unmaps)."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    sql = f"""
+      MERGE INTO {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM t
+      USING (SELECT %s ADO_TEAM, %s TEAMID) s
+      ON t.ADO_TEAM = s.ADO_TEAM
+      WHEN MATCHED THEN UPDATE SET TEAMID = s.TEAMID
+      WHEN NOT MATCHED THEN INSERT (ADO_TEAM, TEAMID) VALUES (s.ADO_TEAM, s.TEAMID)
+    """
+    execute(sql, (ado_team, team_id))
+
+def upsert_map_ado_app_to_tco_group(ado_app: str, app_group: Optional[str]) -> None:
+    """Map an ADO application name to a TCO GROUPID (nullable unmaps)."""
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    sql = f"""
+      MERGE INTO {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP t
+      USING (SELECT %s ADO_APP, %s APP_GROUP) s
+      ON t.ADO_APP = s.ADO_APP
+      WHEN MATCHED THEN UPDATE SET APP_GROUP = s.APP_GROUP
+      WHEN NOT MATCHED THEN INSERT (ADO_APP, APP_GROUP) VALUES (s.ADO_APP, s.APP_GROUP)
+    """
+    execute(sql, (ado_app, app_group))
+
+def list_map_ado_team() -> pd.DataFrame:
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    return fetch_df(f"""
+      SELECT m.ADO_TEAM, m.TEAMID, t.TEAMNAME
+      FROM {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM m
+      LEFT JOIN {db}.{sch}.TEAMS t ON t.TEAMID = m.TEAMID
+      ORDER BY m.ADO_TEAM
+    """)
+
+def list_map_ado_app() -> pd.DataFrame:
+    db, sch = _db_and_schema()
+    ensure_ado_minimal_tables()
+    return fetch_df(f"""
+      SELECT m.ADO_APP, m.APP_GROUP, g.GROUPNAME
+      FROM {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP m
+      LEFT JOIN {db}.{sch}.APPLICATION_GROUPS g ON g.GROUPID = m.APP_GROUP
+      ORDER BY m.ADO_APP
+    """)
 
 
 # =========================================================
@@ -1210,7 +1379,7 @@ def drop_views_by_prefix(prefix: str = "V_") -> List[str]:
 
 
 # =========================================================
-# Column admin helpers (NEW)
+# Column admin helpers
 # =========================================================
 
 def drop_column(table: str, column: str) -> None:
@@ -1219,9 +1388,7 @@ def drop_column(table: str, column: str) -> None:
     try:
         execute(f'ALTER TABLE {db}.{sch}.{table} DROP COLUMN "{column}"')
     except Exception:
-        # Ignore if not exists / no-op
         pass
-
 
 def rename_column(table: str, old: str, new: str) -> None:
     """Rename a column on a table."""
@@ -1230,13 +1397,21 @@ def rename_column(table: str, old: str, new: str) -> None:
 
 
 # =========================================================
-# One-time init per session
+# One-time init per session (ORDER MATTERS)
 # =========================================================
 
 if not st.session_state.get("_tco_db_init_done"):
     ensure_tables()
     normalize_team_numeric_types()
     ensure_team_calc_table()
-    ensure_team_cost_view()
-    st.session_state["_tco_db_init_done"] = True
 
+    # Ensure ADO raw + mapping tables exist BEFORE the cost view
+    ensure_ado_minimal_tables()
+
+    # Clean/normalize EFFORT_POINTS once per session (idempotent and fast)
+    repair_ado_effort_points_precision()
+
+    # Now the view can safely reference decimals
+    ensure_team_cost_view()
+
+    st.session_state["_tco_db_init_done"] = True
