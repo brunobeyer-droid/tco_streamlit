@@ -1,9 +1,8 @@
 # pages/Sync ADO Features.py
 import io
 import uuid
-import time
 from datetime import date
-from typing import Optional, List, Dict, Tuple
+from typing import Optional, List, Dict, Tuple, Any
 
 import pandas as pd
 import streamlit as st
@@ -72,16 +71,6 @@ EXPECTED = {
     "ChangedDate": ["Changed Date", "System.ChangedDate", "ChangedDate"],
     "Year": ["Year", "ADO Year", "ADO_YEAR"],
 }
-
-# -------------------------
-# Utilities (helpers)
-# -------------------------
-def _table_count(table: str) -> int:
-    try:
-        df = fetch_df(f"SELECT COUNT(*) AS N FROM {table}")
-        return int(df.iloc[0]["N"]) if not df.empty else 0
-    except Exception:
-        return 0
 
 # -------------------------
 # Utilities (file parsing)
@@ -191,7 +180,7 @@ def _read_file_any(upl, sheet_name: Optional[str], diag: Dict) -> pd.DataFrame:
     return df
 
 # -------------------------
-# ADO parsing (core)
+# ADO parsing (unchanged core)
 # -------------------------
 def _auto_rename_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
@@ -479,11 +468,11 @@ with tab_map:
     groups_df = fetch_df("SELECT GROUPID, GROUPNAME FROM APPLICATION_GROUPS ORDER BY GROUPNAME")
 
     st.markdown("### ADO → TCO Team")
-    if ado_teams is None or ado_teams.empty or teams_df is None or teams_df.empty:
+    if ado_teams.empty or teams_df.empty:
         st.info("Load features and create Teams first.")
     else:
         base_tm = ado_teams.rename(columns={"TEAM_RAW": "ADO_TEAM"}).copy()
-        if team_maps is not None and not team_maps.empty:
+        if not team_maps.empty:
             base_tm = base_tm.merge(team_maps, how="left", on="ADO_TEAM")
         else:
             base_tm["TEAMID"] = None
@@ -532,11 +521,11 @@ with tab_map:
     st.markdown("---")
 
     st.markdown("### ADO → TCO App Group")
-    if ado_apps is None or ado_apps.empty or groups_df is None or groups_df.empty:
+    if ado_apps.empty or groups_df.empty:
         st.info("Load features and create Application Groups first.")
     else:
         base_am = ado_apps.rename(columns={"APP_NAME_RAW": "ADO_APP"}).copy()
-        if app_maps is not None and not app_maps.empty:
+        if not app_maps.empty:
             base_am = base_am.merge(app_maps, how="left", on="ADO_APP")
         else:
             base_am["APP_GROUP"] = None
@@ -790,7 +779,7 @@ with tab_recon:
         st.error(f"Could not read VW_TEAM_COSTS_PER_FEATURE: {e}")
         df_calc = pd.DataFrame()
 
-    if df_calc is None or df_calc.empty:
+    if df_calc.empty:
         st.info("No rows found with the current filters.")
         st.stop()
 
@@ -844,7 +833,7 @@ with tab_bulk:
         diag = {}
         try:
             df_src = _read_file_any(upl_one, sheet, diag)
-            # De-duplicate column labels cleanly for display logic
+            # De-duplicate column labels cleanly for display logic (PyArrow disallows dup names)
             seen = {}
             newcols = []
             for c in df_src.columns:
@@ -880,6 +869,7 @@ with tab_bulk:
             lc = {c.lower(): c for c in cols}
             if name.lower() in lc:
                 return lc[name.lower()]
+            # contains heuristic
             matches = [c for c in cols if name.lower() in c.lower()]
             return matches[0] if matches else None
 
@@ -895,10 +885,10 @@ with tab_bulk:
                 # App Groups
                 "GROUPNAME": _default_pick("APP GROUP NAME") or _default_pick("GROUPNAME") or _default_pick("GROUP"),
 
-                # Applications
+                # Applications (only APPNAME; group comes from GROUPNAME mapping)
                 "APPNAME": _default_pick("APPNAME") or _default_pick("APPLICATION"),
 
-                # Teams
+                # Teams (only TEAMNAME; program comes from PROGRAMNAME mapping)
                 "TEAMNAME": _default_pick("TEAMNAME") or _default_pick("TEAM"),
 
                 # Invoices (required)
@@ -972,7 +962,7 @@ with tab_bulk:
                 ("NOTES", "NOTES"),
             ]:
                 cm[opt_key] = st.selectbox(label, options=["(none)"] + cols,
-                                           index=(cols.index(cm.get(opt_key)) + 1) if cm.get(opt_key) in cols else 0,
+                                           index=(cols.index(cm[opt_key]) + 1) if cm.get(opt_key) in cols else 0,
                                            key=f"map_opt_{opt_key}")
 
         st.markdown("---")
@@ -987,7 +977,7 @@ with tab_bulk:
         def _safe_num(series: pd.Series) -> pd.Series:
             return pd.to_numeric(series.astype(str).str.replace(",", ".", regex=False), errors="coerce")
 
-        # Programs preview
+        # Programs preview (unique names)
         dfP = pd.DataFrame()
         if _col("PROGRAMNAME"):
             dfP = (
@@ -998,7 +988,7 @@ with tab_bulk:
                 .reset_index(drop=True)
             )
 
-        # Vendors preview
+        # Vendors preview (unique names)
         dfV = pd.DataFrame()
         if _col("VENDORNAME"):
             dfV = (
@@ -1009,22 +999,24 @@ with tab_bulk:
                 .reset_index(drop=True)
             )
 
-        # Groups preview
+        # Groups preview (unique names + vendor shown for preview only)
         dfG = pd.DataFrame()
         if _col("GROUPNAME"):
             tmp = df_src[[_col("GROUPNAME")]].rename(columns={_col("GROUPNAME"): "GROUPNAME"})
             tmp["GROUPNAME"] = tmp["GROUPNAME"].astype(str).str.strip()
             tmp = tmp[tmp["GROUPNAME"] != ""]
             tmp = tmp.drop_duplicates(subset=["GROUPNAME"]).reset_index(drop=True)
+            # show TEAMNAME/PROGRAMNAME for context if available (not used as mapping here)
             if _col("TEAMNAME"):
                 tmp["TEAMNAME"] = df_src[_col("TEAMNAME")]
             if _col("PROGRAMNAME"):
                 tmp["PROGRAMNAME"] = df_src[_col("PROGRAMNAME")]
+            # vendor column for preview convenience
             if _col("VENDORNAME"):
                 tmp["DEFAULT_VENDORNAME"] = df_src[_col("VENDORNAME")]
             dfG = tmp[["GROUPNAME"] + [c for c in ["TEAMNAME","PROGRAMNAME","DEFAULT_VENDORNAME"] if c in tmp.columns]].drop_duplicates("GROUPNAME").reset_index(drop=True)
 
-        # Applications preview
+        # Applications preview (APPNAME with its group name for context)
         dfA = pd.DataFrame()
         if _col("APPNAME"):
             tmp = df_src[[_col("APPNAME")]].rename(columns={_col("APPNAME"): "APPNAME"})
@@ -1034,69 +1026,26 @@ with tab_bulk:
                 tmp["GROUPNAME"] = df_src[_col("GROUPNAME")].astype(str).str.strip()
             dfA = tmp.drop_duplicates(subset=["APPNAME","GROUPNAME"] if "GROUPNAME" in tmp.columns else ["APPNAME"]).reset_index(drop=True)
 
-        # Teams preview
+        # Teams preview (TEAMNAME with its program for context)
         dfT = pd.DataFrame()
         if _col("TEAMNAME"):
             tmp = df_src[[_col("TEAMNAME")]].rename(columns={_col("TEAMNAME"): "TEAMNAME"})
             tmp["TEAMNAME"] = tmp["TEAMNAME"].astype(str).str.strip()
             tmp = tmp[tmp["TEAMNAME"] != ""]
             if _col("PROGRAMNAME"):
-                tmp["PROGRAMNAME"] = df_src[_col("PROGRAMNAME")].astype(str).stripped() if hasattr(pd.Series, "stripped") else df_src[_col("PROGRAMNAME")].astype(str).str.strip()
+                tmp["PROGRAMNAME"] = df_src[_col("PROGRAMNAME")].astype(str).str.strip()
             dfT = tmp.drop_duplicates(subset=["TEAMNAME"]).reset_index(drop=True)
 
-        # -------------------------
-        # Invoices preview (row-level requireds + validity)
-        # -------------------------
-        REQUIRED_KEYS = [
-            "VENDORNAME",       # lookup to vendor
-            "TEAMNAME",         # strict required — cannot be blank
-            "APPNAME",          # optional to resolve appid; still used for context
-            "GROUPNAME",        # optional to resolve groupid; still used for context
-            "FISCAL_YEAR",      # int(4)
-            "RENEWAL_MONTH",    # 1..12 (we still compute RENEWALDATE for convenience preview)
-            "AMOUNT",
-            "AMOUNT_NEXT_YEAR",
-        ]
-
-        def _has_required_mapping() -> dict:
-            """Which required keys have a mapped source column at all (column-level)?"""
-            return {k: bool(_col(k)) for k in REQUIRED_KEYS}
-
-        def _row_is_missing(series_val) -> bool:
-            """Blank strings, NaN, None are considered missing."""
-            if series_val is None:
-                return True
-            s = str(series_val).strip()
-            if s == "" or s.lower() == "nan":
-                return True
-            return False
-
+        # Invoices preview (required fields + derived RENEWALDATE)
         dfI = pd.DataFrame()
-        invoice_diag = {"column_mapping": _has_required_mapping(), "row_counts": {}}
-        missing_invoice_reqs = [k for k, ok in invoice_diag["column_mapping"].items() if not ok]
-
+        missing_invoice_reqs = [k for k in ["AMOUNT_NEXT_YEAR","AMOUNT","FISCAL_YEAR","RENEWAL_MONTH","VENDORNAME"] if not _col(k)]
         if not missing_invoice_reqs:
-            # Build base frame with typed columns
             out = pd.DataFrame()
             out["AMOUNT_NEXT_YEAR"] = _safe_num(df_src[_col("AMOUNT_NEXT_YEAR")])
             out["AMOUNT"] = _safe_num(df_src[_col("AMOUNT")])
             out["FISCAL_YEAR"] = pd.to_numeric(df_src[_col("FISCAL_YEAR")], errors="coerce").astype("Int64")
             out["RENEWAL_MONTH"] = pd.to_numeric(df_src[_col("RENEWAL_MONTH")], errors="coerce").astype("Int64")
 
-            # Attach context identifiers by NAME
-            out["VENDORNAME"] = df_src[_col("VENDORNAME")].astype(str)
-            out["TEAMNAME"] = df_src[_col("TEAMNAME")].astype(str)
-            out["APPNAME"] = df_src[_col("APPNAME")].astype(str) if _col("APPNAME") else ""
-            out["GROUPNAME"] = df_src[_col("GROUPNAME")].astype(str) if _col("GROUPNAME") else ""
-
-            # Optionals
-            for opt in ["CONTRACT_ACTIVE","SERIAL_NUMBER","WORK_ORDER","COMPANY_CODE","COST_CENTER","PRODUCT_OWNER","NOTES"]:
-                if _col(opt):
-                    out[opt] = df_src[_col(opt)]
-                else:
-                    out[opt] = None
-
-            # Derived RENEWALDATE for preview convenience (not required by Snowflake)
             def _mk_date(row):
                 fy = row.get("FISCAL_YEAR")
                 m  = row.get("RENEWAL_MONTH")
@@ -1107,46 +1056,27 @@ with tab_bulk:
                     return date(yy, mm, 1)
                 except Exception:
                     return None
+
             out["RENEWALDATE"] = out.apply(_mk_date, axis=1)
 
-            # ---- build row-level validity & reasons ----
-            def _row_reasons(r) -> List[str]:
-                rs = []
-                # Required checks
-                if _row_is_missing(r["TEAMNAME"]): rs.append("missing TEAMNAME")
-                if _row_is_missing(r["VENDORNAME"]): rs.append("missing VENDORNAME")
-                if pd.isna(r["FISCAL_YEAR"]): rs.append("missing FISCAL_YEAR")
-                if pd.isna(r["RENEWAL_MONTH"]): rs.append("missing RENEWAL_MONTH")
-                if pd.isna(r["AMOUNT"]): rs.append("missing AMOUNT")
-                if pd.isna(r["AMOUNT_NEXT_YEAR"]): rs.append("missing AMOUNT_NEXT_YEAR")
-                # Sanity for month
-                try:
-                    m = int(r["RENEWAL_MONTH"]) if pd.notna(r["RENEWAL_MONTH"]) else None
-                    if m is not None and (m < 1 or m > 12):
-                        rs.append("RENEWAL_MONTH out of range")
-                except Exception:
-                    rs.append("RENEWAL_MONTH invalid")
-                return rs
+            # Attach context identifiers by NAME (we'll resolve to IDs later)
+            if _col("PROGRAMNAME"): out["PROGRAMNAME"] = df_src[_col("PROGRAMNAME")].astype(str).str.strip()
+            if _col("TEAMNAME"): out["TEAMNAME"] = df_src[_col("TEAMNAME")].astype(str).str.strip()
+            if _col("GROUPNAME"): out["GROUPNAME"] = df_src[_col("GROUPNAME")].astype(str).str.strip()
+            if _col("APPNAME"): out["APPNAME"] = df_src[_col("APPNAME")].astype(str).str.strip()
+            out["VENDORNAME"] = df_src[_col("VENDORNAME")].astype(str).str.strip()
 
-            out["_REASONS"] = out.apply(_row_reasons, axis=1)
-            out["_IS_VALID"] = out["_REASONS"].apply(lambda lst: len(lst) == 0)
+            # Optionals
+            for k in ["CONTRACT_ACTIVE","SERIAL_NUMBER","WORK_ORDER","COMPANY_CODE","COST_CENTER","PRODUCT_OWNER","NOTES"]:
+                if _col(k):
+                    out[k] = df_src[_col(k)]
 
-            # Split views
-            valid_rows = out[out["_IS_VALID"]].copy()
-            invalid_rows = out[~out["_IS_VALID"]].copy()
-            invoice_diag["row_counts"]["valid"] = int(len(valid_rows))
-            invoice_diag["row_counts"]["invalid"] = int(len(invalid_rows))
-            invoice_diag["row_counts"]["total"] = int(len(out))
-
-            # Keep for upsert phase
             dfI = out
 
-        # Store previews
-        st.session_state["previews"] = {
-            "Programs": dfP, "Vendors": dfV, "Groups": dfG, "Apps": dfA, "Teams": dfT, "Invoices": dfI
-        }
+        # store previews
+        st.session_state["previews"] = {"Programs": dfP, "Vendors": dfV, "Groups": dfG, "Apps": dfA, "Teams": dfT, "Invoices": dfI}
 
-        # ----- Show previews + preflight -----
+        # show previews
         st.markdown("#### Previews")
         p1, p2 = st.columns(2)
         with p1:
@@ -1161,102 +1091,48 @@ with tab_bulk:
             st.dataframe(dfA.head(400), use_container_width=True, height=240)
             st.markdown("**Teams (unique)**")
             st.dataframe(dfT.head(400), use_container_width=True, height=220)
+            st.markdown("**Invoices**")
+            st.dataframe(dfI.head(400), use_container_width=True, height=260)
 
-        # Invoices preview panes
-        st.markdown("**Invoices — Row‑level Preflight**")
-        # Make sure previews exist in scope even if mappings are missing
-        df_valid_preview = pd.DataFrame()
-        df_invalid_preview = pd.DataFrame()
-
-        if missing_invoice_reqs:
-            st.error(
-                "Missing column mappings for required field(s): "
-                + ", ".join(missing_invoice_reqs)
-                + ". Map these columns to proceed."
-            )
-        else:
-            # Show valid & invalid side by side
-            c_valid, c_invalid = st.columns(2)
-            with c_valid:
-                st.caption("✅ Will be imported (valid rows)")
-                df_valid_preview = dfI[dfI["_IS_VALID"]].copy()
-                show_cols_valid = ["VENDORNAME","TEAMNAME","GROUPNAME","APPNAME","FISCAL_YEAR","RENEWAL_MONTH","RENEWALDATE","AMOUNT","AMOUNT_NEXT_YEAR"]
-                show_cols_valid = [c for c in show_cols_valid if c in df_valid_preview.columns]
-                st.dataframe(df_valid_preview[show_cols_valid].head(400), use_container_width=True, height=260)
-            with c_invalid:
-                st.caption("❌ Will be skipped (invalid rows) — with reasons")
-                df_invalid_preview = dfI[~dfI["_IS_VALID"]].copy()
-                if not df_invalid_preview.empty:
-                    df_invalid_preview["_REASONS_STR"] = df_invalid_preview["_REASONS"].apply(lambda xs: "; ".join(xs))
-                show_cols_invalid = ["VENDORNAME","TEAMNAME","GROUPNAME","APPNAME","FISCAL_YEAR","RENEWAL_MONTH","AMOUNT","AMOUNT_NEXT_YEAR","_REASONS_STR"]
-                show_cols_invalid = [c for c in show_cols_invalid if c in df_invalid_preview.columns]
-                st.dataframe(df_invalid_preview[show_cols_invalid].head(400), use_container_width=True, height=260)
-
-        # Summary based on row validity (not just column mapping)
-        with st.expander("Preflight Summary", expanded=True):
-            if missing_invoice_reqs:
-                st.warning("Map all required invoice columns to enable import.")
-            else:
-                total_rows = invoice_diag["row_counts"]["total"]
-                valid_rows_n = invoice_diag["row_counts"]["valid"]
-                invalid_rows_n = invoice_diag["row_counts"]["invalid"]
-                st.write(
-                    f"- Total invoice rows detected: **{total_rows}**  \n"
-                    f"- Valid rows (will import): **{valid_rows_n}**  \n"
-                    f"- Invalid rows (skipped): **{invalid_rows_n}**"
-                )
-                if invalid_rows_n > 0:
-                    # Aggregate reasons for quick guidance
-                    agg: Dict[str, int] = {}
-                    for reasons in dfI.loc[~dfI["_IS_VALID"], "_REASONS"].tolist():
-                        for r in reasons:
-                            agg[r] = agg.get(r, 0) + 1
-                    if agg:
-                        st.write("**Top issues:**")
-                        for r, n in sorted(agg.items(), key=lambda x: -x[1]):
-                            st.write(f"- {r}: **{n}**")
+        st.markdown("---")
 
         # -------------------------
-        # Import ALL in safe order, with UUIDs, progress bar + clock
+        # Upsert ALL in safe order, with UUIDs and name→ID resolution
         # -------------------------
-        prog = st.progress(0, text="Ready.")
-        status = st.empty()
+        def _uuid() -> str:
+            return str(uuid.uuid4())
 
-        def _tick(pct: int, msg: str, t0: float):
-            elapsed = time.time() - t0
-            prog.progress(pct, text=f"{msg}  ⏱ {elapsed:,.1f}s")
-            status.caption(f"⏱ Elapsed: **{elapsed:,.1f} s**")
+        def _name_map(df: pd.DataFrame, key_col: str, id_col: str, name_col: str) -> Dict[str, str]:
+            if df.empty: return {}
+            m: Dict[str, str] = {}
+            for _, r in df.iterrows():
+                nm = str(r.get(name_col) or "").strip()
+                idv = r.get(id_col)
+                if nm and idv:
+                    m[nm.upper()] = idv
+            return m
 
-        # Button that performs the whole import (uses only VALID invoice rows)
-        if st.button("📥 Import ALL", type="primary", use_container_width=True, disabled=(df_valid_preview.empty or bool(missing_invoice_reqs))):
-            t0 = time.time()
-            import_batch_id = str(uuid.uuid4())
-
+        if st.button("⬆️ Upsert ALL (Vendors → Programs → Teams → Groups → Apps → Invoices)", type="primary", key="upsert_all_one_sheet"):
             try:
-                # Pre counts
+                # ---------- pre-counts ----------
+                def _count(tbl: str) -> int:
+                    df = fetch_df(f"SELECT COUNT(*) AS N FROM {tbl}")
+                    return int(df.iloc[0]["N"]) if not df.empty else 0
+
                 pre = {
-                    "vendors": _table_count("VENDORS"),
-                    "programs": _table_count("PROGRAMS"),
-                    "teams": _table_count("TEAMS"),
-                    "groups": _table_count("APPLICATION_GROUPS"),
-                    "apps": _table_count("APPLICATIONS"),
-                    "invoices": _table_count("INVOICES"),
+                    "vendors": _count("VENDORS"),
+                    "programs": _count("PROGRAMS"),
+                    "teams": _count("TEAMS"),
+                    "groups": _count("APPLICATION_GROUPS"),
+                    "apps": _count("APPLICATIONS"),
+                    "invoices": _count("INVOICES"),
                 }
 
-                # Safely fetch previews again
-                dfP = st.session_state["previews"].get("Programs") or pd.DataFrame()
-                dfV = st.session_state["previews"].get("Vendors") or pd.DataFrame()
-                dfG = st.session_state["previews"].get("Groups") or pd.DataFrame()
-                dfA = st.session_state["previews"].get("Apps") or pd.DataFrame()
-                dfT = st.session_state["previews"].get("Teams") or pd.DataFrame()
-                dfI = st.session_state["previews"].get("Invoices") or pd.DataFrame()
-
                 # ---------- Vendors ----------
-                _tick(5, "Importing Vendors…", t0)
                 inserted_v, updated_v = 0, 0
-                existing_vendors = list_vendors()
-                vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in existing_vendors.iterrows()} if existing_vendors is not None and not existing_vendors.empty else {}
                 if not dfV.empty:
+                    existing_vendors = list_vendors()
+                    vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in existing_vendors.iterrows()} if not existing_vendors.empty else {}
                     for _, r in dfV.iterrows():
                         vname = str(r["VENDORNAME"]).strip()
                         if not vname:
@@ -1267,13 +1143,14 @@ with tab_bulk:
                         vmap[vname.upper()] = vid
                         inserted_v += 0 if existed else 1
                         updated_v  += 1 if existed else 0
+                else:
+                    vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in list_vendors().iterrows()} if not list_vendors().empty else {}
 
                 # ---------- Programs ----------
-                _tick(12, "Importing Programs…", t0)
                 inserted_p, updated_p = 0, 0
-                existing_programs = list_programs()
-                pmap = {str(r.PROGRAMNAME).strip().upper(): r.PROGRAMID for _, r in existing_programs.iterrows()} if existing_programs is not None and not existing_programs.empty else {}
                 if not dfP.empty:
+                    existing_programs = list_programs()
+                    pmap = {str(r.PROGRAMNAME).strip().upper(): r.PROGRAMID for _, r in existing_programs.iterrows()} if not existing_programs.empty else {}
                     for _, r in dfP.iterrows():
                         pname = str(r["PROGRAMNAME"]).strip()
                         if not pname:
@@ -1284,13 +1161,14 @@ with tab_bulk:
                         pmap[pname.upper()] = pid
                         inserted_p += 0 if existed else 1
                         updated_p  += 1 if existed else 0
+                else:
+                    pmap = {str(r.PROGRAMNAME).strip().upper(): r.PROGRAMID for _, r in list_programs().iterrows()} if not list_programs().empty else {}
 
                 # ---------- Teams (uses PROGRAMNAME) ----------
-                _tick(22, "Importing Teams…", t0)
                 inserted_t, updated_t = 0, 0
-                existing_teams = list_teams()
-                tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in existing_teams.iterrows()} if existing_teams is not None and not existing_teams.empty else {}
                 if not dfT.empty:
+                    existing_teams = list_teams()
+                    tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in existing_teams.iterrows()} if not existing_teams.empty else {}
                     for _, r in dfT.iterrows():
                         tname = str(r["TEAMNAME"]).strip()
                         if not tname:
@@ -1310,21 +1188,17 @@ with tab_bulk:
                         tmap[tname.upper()] = tid
                         inserted_t += 0 if existed else 1
                         updated_t  += 1 if existed else 0
+                else:
+                    tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in list_teams().iterrows()} if not list_teams().empty else {}
 
-                # ---------- Groups (uses TEAMNAME/DEFAULT_VENDORNAME) ----------
-                _tick(35, "Importing Application Groups…", t0)
+                # ---------- Groups (uses TEAMNAME for context, default vendor) ----------
                 inserted_g, updated_g = 0, 0
-                existing_groups = list_application_groups()
-                gmap = {str(r.GROUPNAME).strip().upper(): r.GROUPID for _, r in existing_groups.iterrows()} if existing_groups is not None and not existing_groups.empty else {}
-                # refresh maps (could have been updated above)
-                existing_teams2 = list_teams()
-                if existing_teams2 is not None and not existing_teams2.empty:
-                    tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in existing_teams2.iterrows()} or tmap
-                existing_vendors2 = list_vendors()
-                if existing_vendors2 is not None and not existing_vendors2.empty:
-                    vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in existing_vendors2.iterrows()} or vmap
-
                 if not dfG.empty:
+                    tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in list_teams().iterrows()} or tmap
+                    existing_groups = list_application_groups()
+                    gmap = {str(r.GROUPNAME).strip().upper(): r.GROUPID for _, r in existing_groups.iterrows()} if not existing_groups.empty else {}
+                    vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in list_vendors().iterrows()} or vmap
+
                     for _, r in dfG.iterrows():
                         gname = str(r["GROUPNAME"]).strip()
                         if not gname:
@@ -1342,19 +1216,18 @@ with tab_bulk:
                         gmap[gname.upper()] = gid
                         inserted_g += 0 if existed else 1
                         updated_g  += 1 if existed else 0
+                else:
+                    gmap = {str(r.GROUPNAME).strip().upper(): r.GROUPID for _, r in list_application_groups().iterrows()} if not list_application_groups().empty else {}
 
                 # ---------- Applications (APPNAME + GROUPNAME link) ----------
-                _tick(48, "Importing Application Instances…", t0)
                 inserted_a, updated_a = 0, 0
-                existing_apps = list_applications()
-                amap = {str(r.APPLICATIONNAME).strip().upper(): r.APPLICATIONID for _, r in existing_apps.iterrows()} if existing_apps is not None and not existing_apps.empty else {}
-
-                # refresh groups to ensure latest gmap
-                cur_groups = list_application_groups()
-                if cur_groups is not None and not cur_groups.empty:
+                if not dfA.empty:
+                    cur_groups = list_application_groups()
                     gmap = {str(r.GROUPNAME).strip().upper(): r.GROUPID for _, r in cur_groups.iterrows()} or gmap
 
-                if not dfA.empty:
+                    existing_apps = list_applications()
+                    amap = {str(r.APPLICATIONNAME).strip().upper(): r.APPLICATIONID for _, r in existing_apps.iterrows()} if not existing_apps.empty else {}
+
                     for _, r in dfA.iterrows():
                         aname = str(r["APPNAME"]).strip()
                         if not aname:
@@ -1375,44 +1248,61 @@ with tab_bulk:
                         amap[aname.upper()] = aid
                         inserted_a += 0 if existed else 1
                         updated_a  += 1 if existed else 0
+                else:
+                    amap = {}
+                    cur_apps = list_applications()
+                    if not cur_apps.empty:
+                        for _, r in cur_apps.iterrows():
+                            nm = str(r.get("APPLICATIONNAME") or "").strip()
+                            aid = r.get("APPLICATIONID")
+                            if nm and aid:
+                                amap[nm.upper()] = aid
 
-                # ---------- Invoices (strict validation already done) ----------
-                _tick(62, "Importing Invoices…", t0)
+                # ---------- Invoices (name-based resolution) ----------
                 created_i = 0
-                # refresh maps
-                cur_programs = list_programs();     pmap = {str(r.PROGRAMNAME).strip().upper(): r.PROGRAMID for _, r in cur_programs.iterrows()} if cur_programs is not None and not cur_programs.empty else {}
-                cur_teams    = list_teams();        tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in cur_teams.iterrows()} if cur_teams is not None and not cur_teams.empty else {}
-                cur_groups2  = list_application_groups(); gmap = {str(r.GROUPNAME).strip().upper(): r.GROUPID for _, r in cur_groups2.iterrows()} if cur_groups2 is not None and not cur_groups2.empty else {}
-                cur_vendors  = list_vendors();      vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in cur_vendors.iterrows()} if cur_vendors is not None and not cur_vendors.empty else {}
-                cur_apps2    = list_applications()
-                amap = {}
-                if cur_apps2 is not None and not cur_apps2.empty:
-                    for _, r0 in cur_apps2.iterrows():
-                        nm = str(r0.get("APPLICATIONNAME") or "").strip()
-                        aid = r0.get("APPLICATIONID")
-                        if nm and aid:
-                            amap[nm.upper()] = aid
+                skipped_i = [0]  # Use a list for mutability
+                skipped_reasons: Dict[str, int] = {}
 
-                req_cols_present = all(c in dfI.columns for c in ["TEAMNAME","VENDORNAME","FISCAL_YEAR","RENEWAL_MONTH","AMOUNT","AMOUNT_NEXT_YEAR"])
-                if not dfI.empty and req_cols_present:
-                    for _, r in df_valid_preview.iterrows():
-                        tname = str(r.get("TEAMNAME") or "").strip()
+                def _skip(reason: str):
+                    skipped_i[0] += 1
+                    skipped_reasons[reason] = skipped_reasons.get(reason, 0) + 1
+
+                if not dfI.empty:
+                    # Refresh maps
+                    pmap = {str(r.PROGRAMNAME).strip().upper(): r.PROGRAMID for _, r in list_programs().iterrows()} or pmap
+                    tmap = {str(r.TEAMNAME).strip().upper(): r.TEAMID for _, r in list_teams().iterrows()} or tmap
+                    gmap = {str(r.GROUPNAME).strip().upper(): r.GROUPID for _, r in list_application_groups().iterrows()} or gmap
+                    vmap = {str(r.VENDORNAME).strip().upper(): r.VENDORID for _, r in list_vendors().iterrows()} or vmap
+
+                    amap = {}
+                    cur_apps2 = list_applications()
+                    if not cur_apps2.empty:
+                        for _, r0 in cur_apps2.iterrows():
+                            nm = str(r0.get("APPLICATIONNAME") or "").strip()
+                            aid = r0.get("APPLICATIONID")
+                            if nm and aid:
+                                amap[nm.upper()] = aid
+
+                    for _, r in dfI.iterrows():
                         vname = str(r.get("VENDORNAME") or "").strip()
-                        fy    = r.get("FISCAL_YEAR")
-                        rmonth= r.get("RENEWAL_MONTH")
-                        amt   = r.get("AMOUNT")
-                        amt_n = r.get("AMOUNT_NEXT_YEAR")
-                        if not tname or not vname or pd.isna(fy) or pd.isna(rmonth) or pd.isna(amt) or pd.isna(amt_n):
-                            continue
+                        fy = r.get("FISCAL_YEAR")
+                        rmonth = r.get("RENEWAL_MONTH")
+                        amt = r.get("AMOUNT")
+                        amt_next = r.get("AMOUNT_NEXT_YEAR")
+
+                        if not vname:            _skip("missing vendor");      continue
+                        if pd.isna(fy):          _skip("missing fiscal year"); continue
+                        if pd.isna(rmonth):      _skip("missing renewal month"); continue
+                        if pd.isna(amt):         _skip("missing amount");      continue
+                        if pd.isna(amt_next):    _skip("missing amount_next_year"); continue
 
                         vendorid_at_booking = vmap.get(vname.upper())
                         if not vendorid_at_booking:
-                            continue  # vendor must exist
+                            _skip("vendor not found"); continue
 
-                        teamid = tmap.get(tname.upper())
-                        if not teamid:
-                            continue  # team must exist
-
+                        teamid = None
+                        if "TEAMNAME" in r and str(r["TEAMNAME"]).strip():
+                            teamid = tmap.get(str(r["TEAMNAME"]).strip().upper())
                         groupid = None
                         if "GROUPNAME" in r and str(r["GROUPNAME"]).strip():
                             groupid = gmap.get(str(r["GROUPNAME"]).strip().upper())
@@ -1423,64 +1313,65 @@ with tab_bulk:
                         try:
                             d_renew = date(int(fy), int(rmonth), 1)
                         except Exception:
-                            continue
+                            _skip("invalid renewal date"); continue
 
                         inv_id = str(uuid.uuid4())
-                        # NOTE: contract_due left as None (avoids DATE→NUMBER mismatch)
                         upsert_invoice(
                             invoice_id=inv_id,
                             application_id=str(appid or ""),
                             team_id=str(teamid or ""),
-                            renewal_date=d_renew,                         # DATE
+                            renewal_date=d_renew,
                             amount=float(amt) if not pd.isna(amt) else None,
                             status="Planned",
-                            fiscal_year=int(fy) if not pd.isna(fy) else None,  # NUMBER(4,0)
+                            fiscal_year=int(fy) if not pd.isna(fy) else None,
                             product_owner=(str(r.get("PRODUCT_OWNER")) if pd.notna(r.get("PRODUCT_OWNER")) else None),
-                            amount_next_year=float(amt_n) if not pd.isna(amt_n) else None,
+                            amount_next_year=float(amt_next) if not pd.isna(amt_next) else None,
                             contract_active=bool(r.get("CONTRACT_ACTIVE")) if pd.notna(r.get("CONTRACT_ACTIVE")) else True,
                             company_code=(str(r.get("COMPANY_CODE")) if pd.notna(r.get("COMPANY_CODE")) else None),
                             cost_center=(str(r.get("COST_CENTER")) if pd.notna(r.get("COST_CENTER")) else None),
                             serial_number=(str(r.get("SERIAL_NUMBER")) if pd.notna(r.get("SERIAL_NUMBER")) else None),
                             work_order=(str(r.get("WORK_ORDER")) if pd.notna(r.get("WORK_ORDER")) else None),
                             agreement_number=None,
-                            contract_due=None,                              # NUMBER(4,0) — keep None unless you truly have a 4‑digit year
+                            contract_due=None,
                             service_type=None,
                             notes=(str(r.get("NOTES")) if pd.notna(r.get("NOTES")) else None),
                             group_id=str(groupid or ""),
                             programid_at_booking=None,
                             vendorid_at_booking=str(vendorid_at_booking or ""),
                             groupid_at_booking=str(groupid or ""),
-                            rollover_batch_id=import_batch_id,              # tag batch
+                            rollover_batch_id=None,
                             rolled_over_from_year=None,
                             invoice_type="Recurring Invoice",
                         )
                         created_i += 1
 
                 # ---------- post-counts & summary ----------
-                _tick(96, "Finalizing…", t0)
                 post = {
-                    "vendors": _table_count("VENDORS"),
-                    "programs": _table_count("PROGRAMS"),
-                    "teams": _table_count("TEAMS"),
-                    "groups": _table_count("APPLICATION_GROUPS"),
-                    "apps": _table_count("APPLICATIONS"),
-                    "invoices": _table_count("INVOICES"),
+                    "vendors": _count("VENDORS"),
+                    "programs": _count("PROGRAMS"),
+                    "teams": _count("TEAMS"),
+                    "groups": _count("APPLICATION_GROUPS"),
+                    "apps": _count("APPLICATIONS"),
+                    "invoices": _count("INVOICES"),
                 }
 
-                _tick(100, "Done.", t0)
                 st.success(
-                    "Import complete ✅\n\n"
-                    f"- Vendors: **{post['vendors'] - pre['vendors']} new** (total: {post['vendors']})\n"
-                    f"- Programs: **{post['programs'] - pre['programs']} new** (total: {post['programs']})\n"
-                    f"- Teams: **{post['teams'] - pre['teams']} new** (total: {post['teams']})\n"
-                    f"- App Groups: **{post['groups'] - pre['groups']} new** (total: {post['groups']})\n"
-                    f"- Applications: **{post['apps'] - pre['apps']} new** (total: {post['apps']})\n"
-                    f"- Invoices: **{post['invoices'] - pre['invoices']} new** (total: {post['invoices']})\n\n"
-                    f"**Batch ID:** `{import_batch_id}`"
+                    "Upsert complete ✅\n\n"
+                    f"- Vendors: **{inserted_v} inserted**, **{updated_v} updated** (total: {post['vendors']} | was {pre['vendors']})\n"
+                    f"- Programs: **{inserted_p} inserted**, **{updated_p} updated** (total: {post['programs']} | was {pre['programs']})\n"
+                    f"- Teams: **{inserted_t} inserted**, **{updated_t} updated** (total: {post['teams']} | was {pre['teams']})\n"
+                    f"- App Groups: **{inserted_g} inserted**, **{updated_g} updated** (total: {post['groups']} | was {pre['groups']})\n"
+                    f"- Applications: **{inserted_a} inserted**, **{updated_a} updated** (total: {post['apps']} | was {pre['apps']})\n"
+                    f"- Invoices: **{created_i} inserted**, **{skipped_i[0]} skipped** (total: {post['invoices']} | was {pre['invoices']})"
                 )
 
+                if skipped_i:
+                    with st.expander("Why invoices were skipped", expanded=False):
+                        for reason, n in sorted(skipped_reasons.items(), key=lambda x: -x[1]):
+                            st.write(f"- {reason}: **{n}**")
+
             except Exception as e:
-                st.error(f"Import failed: {e}")
+                st.error(f"Upsert failed: {e}")
 
     else:
         st.info("Upload your workbook above to proceed.")

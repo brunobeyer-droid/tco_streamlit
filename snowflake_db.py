@@ -535,18 +535,20 @@ def upsert_application_group(group_id: str, group_name: str, team_id: str,
 
 
 def upsert_application_instance(application_id: str, group_id: str,
-                                application_name: str,
-                                add_info: Optional[str] = None,
-                                vendor_id: Optional[str] = None,
-                                **kwargs) -> None:
-    """Insert or update an application instance (SITE→ADD_INFO migration compatible)."""
-    if add_info is None and "site" in kwargs and kwargs["site"] is not None:
-        add_info = kwargs["site"]
-
-    sql = f"""
-    MERGE INTO { _fq('APPLICATIONS') } t
+                                application_name: str, add_info: str | None,
+                                vendor_id: str | None):
+    # If vendor_id not supplied, inherit from group's default vendor
+    sql = """
+    MERGE INTO APPLICATIONS t
     USING (
-      SELECT %s AS APPLICATIONID, %s AS GROUPID, %s AS APPLICATIONNAME, %s AS ADD_INFO, %s AS VENDORID
+      SELECT
+        %s::STRING AS APPLICATIONID,
+        %s::STRING AS GROUPID,
+        %s::STRING AS APPLICATIONNAME,
+        %s::STRING AS ADD_INFO,
+        COALESCE(%s::STRING,
+                 (SELECT DEFAULT_VENDORID FROM APPLICATION_GROUPS WHERE GROUPID = %s)
+        ) AS VENDORID
     ) s
     ON t.APPLICATIONID = s.APPLICATIONID
     WHEN MATCHED THEN UPDATE SET
@@ -559,112 +561,198 @@ def upsert_application_instance(application_id: str, group_id: str,
     VALUES
       (s.APPLICATIONID, s.GROUPID, s.APPLICATIONNAME, s.ADD_INFO, s.VENDORID)
     """
-    execute(sql, (application_id, group_id, application_name, add_info, vendor_id))
+    execute(sql, (application_id, group_id, application_name, add_info, vendor_id, group_id))
 
+from typing import Optional
+from datetime import date
 
+# snowflake_db.upsert_invoice (sketch)
 def upsert_invoice(
-    invoice_id: str,
-    application_id: str,
-    team_id: str,
-    renewal_date,   # date or ISO string
-    amount: float,
-    status: str,    # Planned/Completed
-    fiscal_year: Optional[int] = None,
-    product_owner: Optional[str] = None,
-    amount_next_year: Optional[float] = None,
-    contract_active: Optional[bool] = True,
-    company_code: Optional[str] = None,
-    cost_center: Optional[str] = None,
-    serial_number: Optional[str] = None,
-    work_order: Optional[str] = None,
-    agreement_number: Optional[str] = None,
-    contract_due: Optional[int] = None,
-    service_type: Optional[str] = None,
-    notes: Optional[str] = None,
-    group_id: Optional[str] = None,
-    programid_at_booking: Optional[str] = None,
-    vendorid_at_booking: Optional[str] = None,
-    groupid_at_booking: Optional[str] = None,
-    rollover_batch_id: Optional[str] = None,
-    rolled_over_from_year: Optional[int] = None,
-    invoice_type: Optional[str] = None,
-) -> None:
-    eff_type = invoice_type or "Recurring Invoice"
-    if eff_type == "Recurring Invoice" and fiscal_year is not None:
-        dup_q = f"""
-            SELECT COUNT(*) AS CNT
-            FROM { _fq('INVOICES') }
-            WHERE APPLICATIONID = %s
-              AND TEAMID = %s
-              AND FISCAL_YEAR = %s
-              AND COALESCE(INVOICE_TYPE,'Recurring Invoice') = 'Recurring Invoice'
-              AND INVOICEID <> %s
-        """
-        dup_df = fetch_df(dup_q, (application_id, team_id, int(fiscal_year), invoice_id))
-        if not dup_df.empty and int(dup_df.iloc[0]["CNT"]) > 0:
-            raise ValueError("A Recurring Invoice already exists for this Application, Team, and Fiscal Year.")
+    invoice_id,
+    application_id,
+    team_id,
+    renewal_date,
+    amount,
+    status,
+    fiscal_year,
+    product_owner,
+    amount_next_year,
+    contract_active,
+    company_code,
+    cost_center,
+    serial_number,
+    work_order,
+    agreement_number,
+    contract_due,            # NUMBER(4,0), e.g., 2025
+    service_type,
+    notes,
+    group_id,
+    programid_at_booking,
+    vendorid_at_booking,
+    groupid_at_booking,
+    rollover_batch_id,
+    rolled_over_from_year,
+    invoice_type,
+):
+    sql = """
+MERGE INTO INVOICES t
+USING (
+  SELECT
+    %s AS INVOICEID,
+    %s AS APPLICATIONID,
+    %s AS TEAMID,
+    %s AS RENEWALDATE,
+    %s AS AMOUNT,
+    %s AS STATUS,
+    %s AS FISCAL_YEAR,
+    %s AS PRODUCT_OWNER,
+    %s AS AMOUNT_NEXT_YEAR,
+    %s AS CONTRACT_ACTIVE,
+    %s AS COMPANY_CODE,
+    %s AS COST_CENTER,
+    %s AS SERIAL_NUMBER,
+    %s AS WORK_ORDER,
+    %s AS AGREEMENT_NUMBER,
+    %s AS CONTRACT_DUE,
+    %s AS SERVICE_TYPE,
+    %s AS NOTES,
+    %s AS GROUPID,
+    %s AS PROGRAMID_AT_BOOKING,
+    %s AS VENDORID_AT_BOOKING,
+    %s AS GROUPID_AT_BOOKING,
+    %s AS ROLLOVER_BATCH_ID,
+    %s AS ROLLED_OVER_FROM_YEAR,
+    %s AS INVOICE_TYPE
+) s
+ON t.INVOICEID = s.INVOICEID
+WHEN MATCHED THEN UPDATE SET
+  APPLICATIONID          = s.APPLICATIONID,
+  TEAMID                 = s.TEAMID,
+  RENEWALDATE            = s.RENEWALDATE,
+  AMOUNT                 = s.AMOUNT,
+  STATUS                 = s.STATUS,
+  FISCAL_YEAR            = s.FISCAL_YEAR,
+  PRODUCT_OWNER          = s.PRODUCT_OWNER,
+  AMOUNT_NEXT_YEAR       = s.AMOUNT_NEXT_YEAR,
+  CONTRACT_ACTIVE        = s.CONTRACT_ACTIVE,
+  COMPANY_CODE           = s.COMPANY_CODE,
+  COST_CENTER            = s.COST_CENTER,
+  SERIAL_NUMBER          = s.SERIAL_NUMBER,
+  WORK_ORDER             = s.WORK_ORDER,
+  AGREEMENT_NUMBER       = s.AGREEMENT_NUMBER,
+  CONTRACT_DUE           = s.CONTRACT_DUE,
+  SERVICE_TYPE           = s.SERVICE_TYPE,
+  NOTES                  = s.NOTES,
+  GROUPID                = s.GROUPID,
+  PROGRAMID_AT_BOOKING   = s.PROGRAMID_AT_BOOKING,
+  VENDORID_AT_BOOKING    = s.VENDORID_AT_BOOKING,
+  GROUPID_AT_BOOKING     = s.GROUPID_AT_BOOKING,
+  ROLLOVER_BATCH_ID      = s.ROLLOVER_BATCH_ID,
+  ROLLED_OVER_FROM_YEAR  = s.ROLLED_OVER_FROM_YEAR,
+  INVOICE_TYPE           = s.INVOICE_TYPE
+WHEN NOT MATCHED THEN INSERT (
+  INVOICEID, APPLICATIONID, TEAMID, RENEWALDATE, AMOUNT, STATUS, FISCAL_YEAR, PRODUCT_OWNER,
+  AMOUNT_NEXT_YEAR, CONTRACT_ACTIVE, COMPANY_CODE, COST_CENTER, SERIAL_NUMBER, WORK_ORDER,
+  AGREEMENT_NUMBER, CONTRACT_DUE, SERVICE_TYPE, NOTES, GROUPID, PROGRAMID_AT_BOOKING,
+  VENDORID_AT_BOOKING, GROUPID_AT_BOOKING, ROLLOVER_BATCH_ID, ROLLED_OVER_FROM_YEAR, INVOICE_TYPE
+)
+VALUES (
+  s.INVOICEID, s.APPLICATIONID, s.TEAMID, s.RENEWALDATE, s.AMOUNT, s.STATUS, s.FISCAL_YEAR, s.PRODUCT_OWNER,
+  s.AMOUNT_NEXT_YEAR, s.CONTRACT_ACTIVE, s.COMPANY_CODE, s.COST_CENTER, s.SERIAL_NUMBER, s.WORK_ORDER,
+  s.AGREEMENT_NUMBER, s.CONTRACT_DUE, s.SERVICE_TYPE, s.NOTES, s.GROUPID, s.PROGRAMID_AT_BOOKING,
+  s.VENDORID_AT_BOOKING, s.GROUPID_AT_BOOKING, s.ROLLOVER_BATCH_ID, s.ROLLED_OVER_FROM_YEAR, s.INVOICE_TYPE
+)
+"""
+    params = (
+        invoice_id,
+        application_id,
+        team_id,
+        renewal_date,           # pass None if you don't want to set a DATE
+        amount,
+        status,
+        fiscal_year,
+        product_owner,
+        amount_next_year,
+        contract_active,
+        company_code,
+        cost_center,
+        serial_number,
+        work_order,
+        agreement_number,
+        contract_due,           # must be an int like 2025 (NUMBER(4,0))
+        service_type,
+        notes,
+        group_id,
+        programid_at_booking,
+        vendorid_at_booking,
+        groupid_at_booking,
+        rollover_batch_id,
+        rolled_over_from_year,
+        invoice_type,
+    )
+    execute(sql, params)
 
-    sql = f"""
-    MERGE INTO { _fq('INVOICES') } t
+    sql = """
+    MERGE INTO INVOICES t
     USING (
-        SELECT %s AS INVOICEID, %s AS APPLICATIONID, %s AS TEAMID,
-               %s AS RENEWALDATE, %s AS AMOUNT, %s AS STATUS, %s AS FISCAL_YEAR,
-               %s AS PRODUCT_OWNER, %s AS AMOUNT_NEXT_YEAR, %s AS CONTRACT_ACTIVE,
-               %s AS COMPANY_CODE, %s AS COST_CENTER, %s AS SERIAL_NUMBER, %s AS WORK_ORDER,
-               %s AS AGREEMENT_NUMBER, %s AS CONTRACT_DUE, %s AS SERVICE_TYPE, %s AS NOTES,
-               %s AS GROUPID, %s AS PROGRAMID_AT_BOOKING, %s AS VENDORID_AT_BOOKING, %s AS GROUPID_AT_BOOKING,
-               %s AS ROLLOVER_BATCH_ID, %s AS ROLLED_OVER_FROM_YEAR,
-               %s AS INVOICE_TYPE
+      SELECT
+        %(invoice_id)s          AS INVOICEID,
+        %(application_id)s      AS APPLICATIONID,
+        %(team_id)s             AS TEAMID,
+        %(contract_due)s        AS CONTRACT_DUE,
+        %(amount)s              AS AMOUNT,
+        %(status)s              AS STATUS,
+        %(fiscal_year)s         AS FISCAL_YEAR,
+        %(product_owner)s       AS PRODUCT_OWNER,
+        %(amount_next_year)s    AS AMOUNT_NEXT_YEAR,
+        %(contract_active)s     AS CONTRACT_ACTIVE,
+        %(company_code)s        AS COMPANY_CODE,
+        %(cost_center)s         AS COST_CENTER,
+        %(serial_number)s       AS SERIAL_NUMBER,
+        %(work_order)s          AS WORK_ORDER,
+        %(agreement_number)s    AS AGREEMENT_NUMBER,
+        %(renewal_date)s        AS RENEWALDATE,
+        %(service_type)s        AS SERVICE_TYPE,
+        %(notes)s               AS NOTES,
+        %(group_id)s            AS GROUPID,
+        %(programid_at_booking)s AS PROGRAMID_AT_BOOKING,
+        %(vendorid_at_booking)s  AS VENDORID_AT_BOOKING,
+        %(groupid_at_booking)s   AS GROUPID_AT_BOOKING,
+        %(rollover_batch_id)s    AS ROLLOVER_BATCH_ID,
+        %(rolled_over_from_year)s AS ROLLED_OVER_FROM_YEAR,
+        %(invoice_type)s        AS INVOICE_TYPE
     ) s
     ON t.INVOICEID = s.INVOICEID
     WHEN MATCHED THEN UPDATE SET
-        APPLICATIONID = s.APPLICATIONID,
-        TEAMID        = s.TEAMID,
-        RENEWALDATE   = s.RENEWALDATE,
-        AMOUNT        = s.AMOUNT,
-        STATUS        = s.STATUS,
-        FISCAL_YEAR   = s.FISCAL_YEAR,
-        PRODUCT_OWNER = s.PRODUCT_OWNER,
-        AMOUNT_NEXT_YEAR = s.AMOUNT_NEXT_YEAR,
-        CONTRACT_ACTIVE  = s.CONTRACT_ACTIVE,
-        COMPANY_CODE     = s.COMPANY_CODE,
-        COST_CENTER      = s.COST_CENTER,
-        SERIAL_NUMBER    = s.SERIAL_NUMBER,
-        WORK_ORDER       = s.WORK_ORDER,
-        AGREEMENT_NUMBER = s.AGREEMENT_NUMBER,
-        CONTRACT_DUE     = s.CONTRACT_DUE,
-        SERVICE_TYPE     = s.SERVICE_TYPE,
-        NOTES            = s.NOTES,
-        GROUPID          = s.GROUPID,
-        PROGRAMID_AT_BOOKING = s.PROGRAMID_AT_BOOKING,
-        VENDORID_AT_BOOKING  = s.VENDORID_AT_BOOKING,
-        GROUPID_AT_BOOKING   = s.GROUPID_AT_BOOKING,
-        ROLLOVER_BATCH_ID    = s.ROLLOVER_BATCH_ID,
-        ROLLED_OVER_FROM_YEAR = s.ROLLED_OVER_FROM_YEAR,
-        INVOICE_TYPE        = COALESCE(s.INVOICE_TYPE, t.INVOICE_TYPE)
-    WHEN NOT MATCHED THEN INSERT
-        (INVOICEID, APPLICATIONID, TEAMID, RENEWALDATE, AMOUNT, STATUS, FISCAL_YEAR,
-         PRODUCT_OWNER, AMOUNT_NEXT_YEAR, CONTRACT_ACTIVE, COMPANY_CODE, COST_CENTER,
-         SERIAL_NUMBER, WORK_ORDER, AGREEMENT_NUMBER, CONTRACT_DUE, SERVICE_TYPE, NOTES,
-         GROUPID, PROGRAMID_AT_BOOKING, VENDORID_AT_BOOKING, GROUPID_AT_BOOKING,
-         ROLLOVER_BATCH_ID, ROLLED_OVER_FROM_YEAR, INVOICE_TYPE)
-    VALUES
-        (s.INVOICEID, s.APPLICATIONID, s.TEAMID, s.RENEWALDATE, s.AMOUNT, s.STATUS, s.FISCAL_YEAR,
-         s.PRODUCT_OWNER, s.AMOUNT_NEXT_YEAR, s.CONTRACT_ACTIVE, s.COMPANY_CODE, s.COST_CENTER,
-         s.SERIAL_NUMBER, s.WORK_ORDER, s.AGREEMENT_NUMBER, s.CONTRACT_DUE, s.SERVICE_TYPE, s.NOTES,
-         s.GROUPID, s.PROGRAMID_AT_BOOKING, s.VENDORID_AT_BOOKING, s.GROUPID_AT_BOOKING,
-         s.ROLLOVER_BATCH_ID, s.ROLLED_OVER_FROM_YEAR, s.INVOICE_TYPE)
+      APPLICATIONID = s.APPLICATIONID,
+      TEAMID = s.TEAMID,
+      CONTRACT_DUE = s.CONTRACT_DUE,
+      AMOUNT = s.AMOUNT,
+      STATUS = s.STATUS,
+      FISCAL_YEAR = s.FISCAL_YEAR,
+      PRODUCT_OWNER = s.PRODUCT_OWNER,
+      AMOUNT_NEXT_YEAR = s.AMOUNT_NEXT_YEAR,
+      CONTRACT_ACTIVE = s.CONTRACT_ACTIVE,
+      COMPANY_CODE = s.COMPANY_CODE,
+      COST_CENTER = s.COST_CENTER,
+      SERIAL_NUMBER = s.SERIAL_NUMBER,
+      WORK_ORDER = s.WORK_ORDER,
+      AGREEMENT_NUMBER = s.AGREEMENT_NUMBER,
+      RENEWALDATE = s.RENEWALDATE,
+      SERVICE_TYPE = s.SERVICE_TYPE,
+      NOTES = s.NOTES,
+      GROUPID = s.GROUPID,
+      PROGRAMID_AT_BOOKING = s.PROGRAMID_AT_BOOKING,
+      VENDORID_AT_BOOKING = s.VENDORID_AT_BOOKING,
+      GROUPID_AT_BOOKING = s.GROUPID_AT_BOOKING,
+      ROLLOVER_BATCH_ID = s.ROLLOVER_BATCH_ID,
+      ROLLED_OVER_FROM_YEAR = s.ROLLED_OVER_FROM_YEAR,
+      INVOICE_TYPE = s.INVOICE_TYPE
+    WHEN NOT MATCHED THEN INSERT ( ...same column list... )
+    VALUES ( ...same s.* values... )
     """
-    execute(sql, (
-        invoice_id, application_id, team_id,
-        renewal_date, amount, status, fiscal_year,
-        product_owner, amount_next_year, contract_active,
-        company_code, cost_center, serial_number, work_order,
-        agreement_number, contract_due, service_type, notes,
-        group_id, programid_at_booking, vendorid_at_booking, groupid_at_booking,
-        rollover_batch_id, rolled_over_from_year,
-        eff_type,
-    ))
+    execute(sql, k)  # dict binding prevents positional mix-ups
+
 
 
 # =========================================================
@@ -760,26 +848,21 @@ def list_application_groups(team_id: Optional[str] = None) -> pd.DataFrame:
 
 
 def list_groups_for_team(team_id: str) -> pd.DataFrame:
-    ensure_groups_teamid()
-    return fetch_df(f"""
-        SELECT
-            g.GROUPID,
-            g.GROUPNAME,
-            g.TEAMID,
-            t.TEAMNAME,
-            COALESCE(g.PROGRAMID, t.PROGRAMID) AS PROGRAMID,
-            p.PROGRAMNAME,
-            g.DEFAULT_VENDORID AS VENDORID,
-            v.VENDORNAME,
-            g.OWNER,
-            g.CREATED_AT
-        FROM { _fq('APPLICATION_GROUPS') } g
-        LEFT JOIN { _fq('TEAMS') }    t ON t.TEAMID    = g.TEAMID
-        LEFT JOIN { _fq('PROGRAMS') } p ON p.PROGRAMID = COALESCE(g.PROGRAMID, t.PROGRAMID)
-        LEFT JOIN { _fq('VENDORS') }  v ON v.VENDORID = g.DEFAULT_VENDORID
-        WHERE g.TEAMID = %s
-        ORDER BY g.GROUPNAME
-    """, (team_id,))
+    sql = """
+      SELECT
+        g.GROUPID, g.GROUPNAME, g.TEAMID,
+        t.TEAMNAME, t.PROGRAMID, p.PROGRAMNAME,
+        g.DEFAULT_VENDORID AS VENDORID,
+        v.VENDORNAME
+      FROM APPLICATION_GROUPS g
+      LEFT JOIN TEAMS t ON t.TEAMID = g.TEAMID
+      LEFT JOIN PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
+      LEFT JOIN VENDORS v ON v.VENDORID = g.DEFAULT_VENDORID
+      WHERE g.TEAMID = %s
+      ORDER BY g.GROUPNAME
+    """
+    return fetch_df(sql, (team_id,))
+
 
 def list_group_team_links(team_id: Optional[str] = None) -> pd.DataFrame:
     ensure_groups_teamid()
@@ -798,37 +881,34 @@ def list_group_team_links(team_id: Optional[str] = None) -> pd.DataFrame:
     """, params)
 
 
-def list_applications(team_id: Optional[str] = None, group_id: Optional[str] = None) -> pd.DataFrame:
-    """List application instances. Optionally filter by team (via group’s team) and/or group."""
-    ensure_groups_teamid()
-    where_clauses = []
-    params: List[Any] = []
+def list_applications(team_id: str | None = None) -> pd.DataFrame:
+    where = ""
+    params = []
     if team_id:
-        where_clauses.append("g.TEAMID = %s")
-        params.append(team_id)
-    if group_id:
-        where_clauses.append("a.GROUPID = %s")
-        params.append(group_id)
-    where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
-
-    return fetch_df(f"""
-        SELECT
-            a.APPLICATIONID,
-            a.APPLICATIONNAME,
-            a.ADD_INFO AS ADD_INFO,
-            a.VENDORID,
-            v.VENDORNAME,
-            a.GROUPID,
-            g.GROUPNAME,
-            g.TEAMID,
-            t.TEAMNAME
-        FROM { _fq('APPLICATIONS') } a
-        LEFT JOIN { _fq('APPLICATION_GROUPS') } g ON g.GROUPID = a.GROUPID
-        LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = g.TEAMID
-        LEFT JOIN { _fq('VENDORS') } v ON v.VENDORID = a.VENDORID
-        {where_sql}
-        ORDER BY g.GROUPNAME, a.APPLICATIONNAME, a.ADD_INFO
-    """, tuple(params) if params else None)
+        where = "WHERE t.TEAMID = %s"
+        params = [team_id]
+    sql = f"""
+      SELECT
+        a.APPLICATIONID,
+        a.APPLICATIONNAME,
+        a.ADD_INFO,
+        a.GROUPID,
+        g.GROUPNAME,
+        t.TEAMID,
+        t.TEAMNAME,
+        p.PROGRAMID,
+        p.PROGRAMNAME,
+        COALESCE(a.VENDORID, g.DEFAULT_VENDORID) AS VENDORID,
+        v.VENDORNAME
+      FROM APPLICATIONS a
+      LEFT JOIN APPLICATION_GROUPS g ON g.GROUPID = a.GROUPID
+      LEFT JOIN TEAMS t ON t.TEAMID = g.TEAMID
+      LEFT JOIN PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
+      LEFT JOIN VENDORS v ON v.VENDORID = COALESCE(a.VENDORID, g.DEFAULT_VENDORID)
+      {where}
+      ORDER BY p.PROGRAMNAME, t.TEAMNAME, g.GROUPNAME, a.APPLICATIONNAME
+    """
+    return fetch_df(sql, tuple(params) if params else None)
 
 
 def list_invoices(
