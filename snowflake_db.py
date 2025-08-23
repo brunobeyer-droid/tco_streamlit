@@ -238,6 +238,11 @@ def ensure_tables() -> None:
         )
     """)
     _add_unique_if_absent("TEAMS", "TEAMNAME", "UQ_TEAMS_TEAMNAME")
+    # Ensure TEAMNAME is not null (documentation/intent)
+    try:
+        execute(f"ALTER TABLE { _fq('TEAMS') } ALTER COLUMN TEAMNAME SET NOT NULL")
+    except Exception:
+        pass
 
     # Ensure numeric columns exist/correct
     execute(f"ALTER TABLE { _fq('TEAMS') } ADD COLUMN IF NOT EXISTS DELIVERY_TEAM_FTE FLOAT")
@@ -285,7 +290,7 @@ def ensure_tables() -> None:
     # FKs / uniqueness
     try:
         execute(f"""
-            ALTER TABLE { _fq('APPLICATIONS') }
+            ALTER TABLE { _fq('APPLICATIONS') } 
             ADD CONSTRAINT FK_APP_GROUP FOREIGN KEY (GROUPID)
             REFERENCES { _fq('APPLICATION_GROUPS') }(GROUPID)
         """)
@@ -347,7 +352,7 @@ def ensure_tables() -> None:
         pass
     try:
         execute(f"""
-            ALTER TABLE { _fq('INVOICES') }
+            ALTER TABLE { _fq('INVOICES') } 
             ADD CONSTRAINT UQ_INVOICE_ANNUAL_TYPE UNIQUE (APPLICATIONID, TEAMID, FISCAL_YEAR, INVOICE_TYPE)
         """)
     except Exception:
@@ -379,6 +384,34 @@ def ensure_team_calc_table() -> None:
         UPDATED_AT TIMESTAMP_NTZ DEFAULT CURRENT_TIMESTAMP()
       )
     """)
+    # Make sure we don't carry a stray TEAMNAME column
+    try:
+        execute(f"ALTER TABLE {db}.{sch}.TEAM_CALC DROP COLUMN IF EXISTS TEAMNAME")
+    except Exception:
+        pass
+    # Intent constraints (Snowflake doesn't enforce by default)
+    try:
+        execute(f"ALTER TABLE {db}.{sch}.TEAM_CALC ADD CONSTRAINT FK_TEAMCALC_TEAMS FOREIGN KEY (TEAMID) REFERENCES {db}.{sch}.TEAMS(TEAMID)")
+    except Exception:
+        pass
+
+
+def cleanup_orphan_team_calc() -> int:
+    """Delete TEAM_CALC rows whose TEAMID no longer exists in TEAMS. Returns remaining orphans count."""
+    db, sch = _db_and_schema()
+    execute(f"""
+      DELETE FROM {db}.{sch}.TEAM_CALC
+       WHERE TEAMID IS NULL
+          OR TEAMID NOT IN (SELECT TEAMID FROM {db}.{sch}.TEAMS)
+    """)
+    rem = fetch_df(f"""
+      SELECT COUNT(*) AS CNT
+      FROM {db}.{sch}.TEAM_CALC t
+      LEFT JOIN {db}.{sch}.TEAMS te ON te.TEAMID = t.TEAMID
+      WHERE te.TEAMID IS NULL OR t.TEAMID IS NULL
+    """)
+    return int(rem.iloc[0]["CNT"]) if not rem.empty else 0
+
 
 def upsert_team_calc_rates(team_id: str,
                            xom_rate: Optional[float],
@@ -401,16 +434,13 @@ def upsert_team_calc_rates(team_id: str,
       VALUES (s.TEAMID, s.XOM_RATE, s.CONTRACTOR_CS_RATE, s.CONTRACTOR_C_RATE)
     """, (team_id, xom_rate, contractor_cs_rate, contractor_c_rate))
 
+
 def list_team_calc() -> pd.DataFrame:
-    """Current TEAM_CALC rows with team names."""
+    """Current TEAM_CALC rows with team names (via view to avoid orphans showing as blank names)."""
     return fetch_df(f"""
-      SELECT
-        tc.TEAMID, t.TEAMNAME,
-        tc.XOM_RATE, tc.CONTRACTOR_CS_RATE, tc.CONTRACTOR_C_RATE,
-        tc.UPDATED_AT
-      FROM { _fq('TEAM_CALC') } tc
-      LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = tc.TEAMID
-      ORDER BY t.TEAMNAME
+      SELECT TEAMID, TEAMNAME, XOM_RATE, CONTRACTOR_CS_RATE, CONTRACTOR_C_RATE, UPDATED_AT
+      FROM { _fq('VW_TEAM_RATES') }
+      ORDER BY TEAMNAME NULLS LAST, TEAMID
     """)
 
 
@@ -563,7 +593,6 @@ def upsert_application_instance(application_id: str, group_id: str,
     """
     execute(sql, (application_id, group_id, application_name, add_info, vendor_id, group_id))
 
-from typing import Optional
 from datetime import date
 
 # snowflake_db.upsert_invoice (sketch)
@@ -583,7 +612,7 @@ def upsert_invoice(
     serial_number,
     work_order,
     agreement_number,
-    contract_due,            # NUMBER(4,0), e.g., 2025
+    contract_due,            # NUMBER(4,0), e.g., 2025 (or None)
     service_type,
     notes,
     group_id,
@@ -594,166 +623,106 @@ def upsert_invoice(
     rolled_over_from_year,
     invoice_type,
 ):
-    sql = """
-MERGE INTO INVOICES t
-USING (
-  SELECT
-    %s AS INVOICEID,
-    %s AS APPLICATIONID,
-    %s AS TEAMID,
-    %s AS RENEWALDATE,
-    %s AS AMOUNT,
-    %s AS STATUS,
-    %s AS FISCAL_YEAR,
-    %s AS PRODUCT_OWNER,
-    %s AS AMOUNT_NEXT_YEAR,
-    %s AS CONTRACT_ACTIVE,
-    %s AS COMPANY_CODE,
-    %s AS COST_CENTER,
-    %s AS SERIAL_NUMBER,
-    %s AS WORK_ORDER,
-    %s AS AGREEMENT_NUMBER,
-    %s AS CONTRACT_DUE,
-    %s AS SERVICE_TYPE,
-    %s AS NOTES,
-    %s AS GROUPID,
-    %s AS PROGRAMID_AT_BOOKING,
-    %s AS VENDORID_AT_BOOKING,
-    %s AS GROUPID_AT_BOOKING,
-    %s AS ROLLOVER_BATCH_ID,
-    %s AS ROLLED_OVER_FROM_YEAR,
-    %s AS INVOICE_TYPE
-) s
-ON t.INVOICEID = s.INVOICEID
-WHEN MATCHED THEN UPDATE SET
-  APPLICATIONID          = s.APPLICATIONID,
-  TEAMID                 = s.TEAMID,
-  RENEWALDATE            = s.RENEWALDATE,
-  AMOUNT                 = s.AMOUNT,
-  STATUS                 = s.STATUS,
-  FISCAL_YEAR            = s.FISCAL_YEAR,
-  PRODUCT_OWNER          = s.PRODUCT_OWNER,
-  AMOUNT_NEXT_YEAR       = s.AMOUNT_NEXT_YEAR,
-  CONTRACT_ACTIVE        = s.CONTRACT_ACTIVE,
-  COMPANY_CODE           = s.COMPANY_CODE,
-  COST_CENTER            = s.COST_CENTER,
-  SERIAL_NUMBER          = s.SERIAL_NUMBER,
-  WORK_ORDER             = s.WORK_ORDER,
-  AGREEMENT_NUMBER       = s.AGREEMENT_NUMBER,
-  CONTRACT_DUE           = s.CONTRACT_DUE,
-  SERVICE_TYPE           = s.SERVICE_TYPE,
-  NOTES                  = s.NOTES,
-  GROUPID                = s.GROUPID,
-  PROGRAMID_AT_BOOKING   = s.PROGRAMID_AT_BOOKING,
-  VENDORID_AT_BOOKING    = s.VENDORID_AT_BOOKING,
-  GROUPID_AT_BOOKING     = s.GROUPID_AT_BOOKING,
-  ROLLOVER_BATCH_ID      = s.ROLLOVER_BATCH_ID,
-  ROLLED_OVER_FROM_YEAR  = s.ROLLED_OVER_FROM_YEAR,
-  INVOICE_TYPE           = s.INVOICE_TYPE
-WHEN NOT MATCHED THEN INSERT (
-  INVOICEID, APPLICATIONID, TEAMID, RENEWALDATE, AMOUNT, STATUS, FISCAL_YEAR, PRODUCT_OWNER,
-  AMOUNT_NEXT_YEAR, CONTRACT_ACTIVE, COMPANY_CODE, COST_CENTER, SERIAL_NUMBER, WORK_ORDER,
-  AGREEMENT_NUMBER, CONTRACT_DUE, SERVICE_TYPE, NOTES, GROUPID, PROGRAMID_AT_BOOKING,
-  VENDORID_AT_BOOKING, GROUPID_AT_BOOKING, ROLLOVER_BATCH_ID, ROLLED_OVER_FROM_YEAR, INVOICE_TYPE
-)
-VALUES (
-  s.INVOICEID, s.APPLICATIONID, s.TEAMID, s.RENEWALDATE, s.AMOUNT, s.STATUS, s.FISCAL_YEAR, s.PRODUCT_OWNER,
-  s.AMOUNT_NEXT_YEAR, s.CONTRACT_ACTIVE, s.COMPANY_CODE, s.COST_CENTER, s.SERIAL_NUMBER, s.WORK_ORDER,
-  s.AGREEMENT_NUMBER, s.CONTRACT_DUE, s.SERVICE_TYPE, s.NOTES, s.GROUPID, s.PROGRAMID_AT_BOOKING,
-  s.VENDORID_AT_BOOKING, s.GROUPID_AT_BOOKING, s.ROLLOVER_BATCH_ID, s.ROLLED_OVER_FROM_YEAR, s.INVOICE_TYPE
-)
-"""
-    params = (
-        invoice_id,
-        application_id,
-        team_id,
-        renewal_date,           # pass None if you don't want to set a DATE
-        amount,
-        status,
-        fiscal_year,
-        product_owner,
-        amount_next_year,
-        contract_active,
-        company_code,
-        cost_center,
-        serial_number,
-        work_order,
-        agreement_number,
-        contract_due,           # must be an int like 2025 (NUMBER(4,0))
-        service_type,
-        notes,
-        group_id,
-        programid_at_booking,
-        vendorid_at_booking,
-        groupid_at_booking,
-        rollover_batch_id,
-        rolled_over_from_year,
-        invoice_type,
-    )
-    execute(sql, params)
-
+    # Single-source-of-truth MERGE with named parameters
     sql = """
     MERGE INTO INVOICES t
     USING (
       SELECT
-        %(invoice_id)s          AS INVOICEID,
-        %(application_id)s      AS APPLICATIONID,
-        %(team_id)s             AS TEAMID,
-        %(contract_due)s        AS CONTRACT_DUE,
-        %(amount)s              AS AMOUNT,
-        %(status)s              AS STATUS,
-        %(fiscal_year)s         AS FISCAL_YEAR,
-        %(product_owner)s       AS PRODUCT_OWNER,
-        %(amount_next_year)s    AS AMOUNT_NEXT_YEAR,
-        %(contract_active)s     AS CONTRACT_ACTIVE,
-        %(company_code)s        AS COMPANY_CODE,
-        %(cost_center)s         AS COST_CENTER,
-        %(serial_number)s       AS SERIAL_NUMBER,
-        %(work_order)s          AS WORK_ORDER,
-        %(agreement_number)s    AS AGREEMENT_NUMBER,
-        %(renewal_date)s        AS RENEWALDATE,
-        %(service_type)s        AS SERVICE_TYPE,
-        %(notes)s               AS NOTES,
-        %(group_id)s            AS GROUPID,
-        %(programid_at_booking)s AS PROGRAMID_AT_BOOKING,
-        %(vendorid_at_booking)s  AS VENDORID_AT_BOOKING,
-        %(groupid_at_booking)s   AS GROUPID_AT_BOOKING,
-        %(rollover_batch_id)s    AS ROLLOVER_BATCH_ID,
+        %(invoice_id)s            AS INVOICEID,
+        %(application_id)s        AS APPLICATIONID,
+        %(team_id)s               AS TEAMID,
+        %(renewal_date)s          AS RENEWALDATE,
+        %(amount)s                AS AMOUNT,
+        %(status)s                AS STATUS,
+        %(fiscal_year)s           AS FISCAL_YEAR,
+        %(product_owner)s         AS PRODUCT_OWNER,
+        %(amount_next_year)s      AS AMOUNT_NEXT_YEAR,
+        %(contract_active)s       AS CONTRACT_ACTIVE,
+        %(company_code)s          AS COMPANY_CODE,
+        %(cost_center)s           AS COST_CENTER,
+        %(serial_number)s         AS SERIAL_NUMBER,
+        %(work_order)s            AS WORK_ORDER,
+        %(agreement_number)s      AS AGREEMENT_NUMBER,
+        %(contract_due)s          AS CONTRACT_DUE,
+        %(service_type)s          AS SERVICE_TYPE,
+        %(notes)s                 AS NOTES,
+        %(group_id)s              AS GROUPID,
+        %(programid_at_booking)s  AS PROGRAMID_AT_BOOKING,
+        %(vendorid_at_booking)s   AS VENDORID_AT_BOOKING,
+        %(groupid_at_booking)s    AS GROUPID_AT_BOOKING,
+        %(rollover_batch_id)s     AS ROLLOVER_BATCH_ID,
         %(rolled_over_from_year)s AS ROLLED_OVER_FROM_YEAR,
-        %(invoice_type)s        AS INVOICE_TYPE
+        %(invoice_type)s          AS INVOICE_TYPE
     ) s
     ON t.INVOICEID = s.INVOICEID
     WHEN MATCHED THEN UPDATE SET
-      APPLICATIONID = s.APPLICATIONID,
-      TEAMID = s.TEAMID,
-      CONTRACT_DUE = s.CONTRACT_DUE,
-      AMOUNT = s.AMOUNT,
-      STATUS = s.STATUS,
-      FISCAL_YEAR = s.FISCAL_YEAR,
-      PRODUCT_OWNER = s.PRODUCT_OWNER,
-      AMOUNT_NEXT_YEAR = s.AMOUNT_NEXT_YEAR,
-      CONTRACT_ACTIVE = s.CONTRACT_ACTIVE,
-      COMPANY_CODE = s.COMPANY_CODE,
-      COST_CENTER = s.COST_CENTER,
-      SERIAL_NUMBER = s.SERIAL_NUMBER,
-      WORK_ORDER = s.WORK_ORDER,
-      AGREEMENT_NUMBER = s.AGREEMENT_NUMBER,
-      RENEWALDATE = s.RENEWALDATE,
-      SERVICE_TYPE = s.SERVICE_TYPE,
-      NOTES = s.NOTES,
-      GROUPID = s.GROUPID,
-      PROGRAMID_AT_BOOKING = s.PROGRAMID_AT_BOOKING,
-      VENDORID_AT_BOOKING = s.VENDORID_AT_BOOKING,
-      GROUPID_AT_BOOKING = s.GROUPID_AT_BOOKING,
-      ROLLOVER_BATCH_ID = s.ROLLOVER_BATCH_ID,
-      ROLLED_OVER_FROM_YEAR = s.ROLLED_OVER_FROM_YEAR,
-      INVOICE_TYPE = s.INVOICE_TYPE
-    WHEN NOT MATCHED THEN INSERT ( ...same column list... )
-    VALUES ( ...same s.* values... )
+      APPLICATIONID          = s.APPLICATIONID,
+      TEAMID                 = s.TEAMID,
+      RENEWALDATE            = s.RENEWALDATE,
+      AMOUNT                 = s.AMOUNT,
+      STATUS                 = s.STATUS,
+      FISCAL_YEAR            = s.FISCAL_YEAR,
+      PRODUCT_OWNER          = s.PRODUCT_OWNER,
+      AMOUNT_NEXT_YEAR       = s.AMOUNT_NEXT_YEAR,
+      CONTRACT_ACTIVE        = s.CONTRACT_ACTIVE,
+      COMPANY_CODE           = s.COMPANY_CODE,
+      COST_CENTER            = s.COST_CENTER,
+      SERIAL_NUMBER          = s.SERIAL_NUMBER,
+      WORK_ORDER             = s.WORK_ORDER,
+      AGREEMENT_NUMBER       = s.AGREEMENT_NUMBER,
+      CONTRACT_DUE           = s.CONTRACT_DUE,
+      SERVICE_TYPE           = s.SERVICE_TYPE,
+      NOTES                  = s.NOTES,
+      GROUPID                = s.GROUPID,
+      PROGRAMID_AT_BOOKING   = s.PROGRAMID_AT_BOOKING,
+      VENDORID_AT_BOOKING    = s.VENDORID_AT_BOOKING,
+      GROUPID_AT_BOOKING     = s.GROUPID_AT_BOOKING,
+      ROLLOVER_BATCH_ID      = s.ROLLOVER_BATCH_ID,
+      ROLLED_OVER_FROM_YEAR  = s.ROLLED_OVER_FROM_YEAR,
+      INVOICE_TYPE           = s.INVOICE_TYPE
+    WHEN NOT MATCHED THEN INSERT (
+      INVOICEID, APPLICATIONID, TEAMID, RENEWALDATE, AMOUNT, STATUS, FISCAL_YEAR, PRODUCT_OWNER,
+      AMOUNT_NEXT_YEAR, CONTRACT_ACTIVE, COMPANY_CODE, COST_CENTER, SERIAL_NUMBER, WORK_ORDER,
+      AGREEMENT_NUMBER, CONTRACT_DUE, SERVICE_TYPE, NOTES, GROUPID, PROGRAMID_AT_BOOKING,
+      VENDORID_AT_BOOKING, GROUPID_AT_BOOKING, ROLLOVER_BATCH_ID, ROLLED_OVER_FROM_YEAR, INVOICE_TYPE
+    )
+    VALUES (
+      s.INVOICEID, s.APPLICATIONID, s.TEAMID, s.RENEWALDATE, s.AMOUNT, s.STATUS, s.FISCAL_YEAR, s.PRODUCT_OWNER,
+      s.AMOUNT_NEXT_YEAR, s.CONTRACT_ACTIVE, s.COMPANY_CODE, s.COST_CENTER, s.SERIAL_NUMBER, s.WORK_ORDER,
+      s.AGREEMENT_NUMBER, s.CONTRACT_DUE, s.SERVICE_TYPE, s.NOTES, s.GROUPID, s.PROGRAMID_AT_BOOKING,
+      s.VENDORID_AT_BOOKING, s.GROUPID_AT_BOOKING, s.ROLLOVER_BATCH_ID, s.ROLLED_OVER_FROM_YEAR, s.INVOICE_TYPE
+    )
     """
-    execute(sql, k)  # dict binding prevents positional mix-ups
 
+    params = {
+        "invoice_id": invoice_id,
+        "application_id": application_id,
+        "team_id": team_id,
+        "renewal_date": renewal_date,          # None is OK (DATE)
+        "amount": amount,
+        "status": status,
+        "fiscal_year": fiscal_year,            # NUMBER(4,0) or None
+        "product_owner": product_owner,
+        "amount_next_year": amount_next_year,
+        "contract_active": contract_active,    # BOOLEAN
+        "company_code": company_code,
+        "cost_center": cost_center,
+        "serial_number": serial_number,
+        "work_order": work_order,
+        "agreement_number": agreement_number,
+        "contract_due": contract_due,          # NUMBER(4,0) like 2025 or None
+        "service_type": service_type,
+        "notes": notes,
+        "group_id": group_id,
+        "programid_at_booking": programid_at_booking,
+        "vendorid_at_booking": vendorid_at_booking,
+        "groupid_at_booking": groupid_at_booking,
+        "rollover_batch_id": rollover_batch_id,
+        "rolled_over_from_year": rolled_over_from_year,
+        "invoice_type": invoice_type,
+    }
 
+    execute(sql, params)
 
 # =========================================================
 # Deletes
@@ -1052,23 +1021,35 @@ def ensure_ado_minimal_tables() -> None:
         ITERATION_PATH STRING,
         CREATED_AT     TIMESTAMP_NTZ,
         CHANGED_AT     TIMESTAMP_NTZ,
-        ADO_YEAR       NUMBER(4)           -- from Excel "Year" (nullable)
+        ADO_YEAR       NUMBER(4),
+        INVESTMENT_DIMENSION STRING                -- NEW
       )
     """)
 
-    # Add ADO_YEAR if table pre-existed without it
+    # Ensure columns if table already existed
     try:
         execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES ADD COLUMN IF NOT EXISTS ADO_YEAR NUMBER(4)")
     except Exception:
         pass
+    try:
+        execute(f"ALTER TABLE {db}.{sch}.ADO_FEATURES ADD COLUMN IF NOT EXISTS INVESTMENT_DIMENSION STRING")
+    except Exception:
+        pass
 
-    # Mapping tables
+    # Mapping tables (unchanged) ...
     execute(f"""
       CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_TEAM_TO_TCO_TEAM (
         ADO_TEAM STRING PRIMARY KEY,
         TEAMID   STRING
       )
     """)
+    execute(f"""
+      CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP (
+        ADO_APP   STRING PRIMARY KEY,
+        APP_GROUP STRING
+      )
+    """)
+
     execute(f"""
       CREATE TABLE IF NOT EXISTS {db}.{sch}.MAP_ADO_APP_TO_TCO_GROUP (
         ADO_APP   STRING PRIMARY KEY,
@@ -1274,11 +1255,27 @@ def list_map_ado_app() -> pd.DataFrame:
 
 def ensure_team_cost_view() -> None:
     """
-    Per-feature cost view (equal-split team fixed PI cost):
-      TEAM_COST_PERPI = (TEAMFTE * XOM_RATE / 4) / (# of features in Team×ADO_YEAR×Iteration)
-      Delivery/Contractor parts remain effort-weighted.
+    Ensures:
+      - VW_TEAM_RATES (TEAM_CALC joined to TEAMS, source for list_team_calc)
+      - VW_TEAM_COSTS_PER_FEATURE (equal-split fixed PI team cost + effort-weighted components)
     """
     db, sch = _db_and_schema()
+
+    # --- Rates view (names always present when not orphan) ---
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_RATES AS
+      SELECT
+        tc.TEAMID,
+        te.TEAMNAME,
+        tc.XOM_RATE,
+        tc.CONTRACTOR_CS_RATE,
+        tc.CONTRACTOR_C_RATE,
+        tc.UPDATED_AT
+      FROM {db}.{sch}.TEAM_CALC tc
+      LEFT JOIN {db}.{sch}.TEAMS te ON te.TEAMID = tc.TEAMID
+    """)
+
+    # --- Per-feature cost view (now projecting INVESTMENT_DIMENSION) ---
     execute(f"""
       CREATE OR REPLACE VIEW {db}.{sch}.VW_TEAM_COSTS_PER_FEATURE AS
       WITH f AS (
@@ -1293,7 +1290,8 @@ def ensure_team_cost_view() -> None:
           af.CREATED_AT,
           af.CHANGED_AT,
           COALESCE(af.ADO_YEAR, YEAR(COALESCE(af.CHANGED_AT, af.CREATED_AT))) AS ADO_YEAR,
-          TRY_TO_NUMBER(REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)) AS ITERATION_NUM
+          TRY_TO_NUMBER(REGEXP_SUBSTR(af.ITERATION_PATH, 'I[[:space:]]*([0-9]+)', 1, 1, 'i', 1)) AS ITERATION_NUM,
+          af.INVESTMENT_DIMENSION
         FROM {db}.{sch}.ADO_FEATURES af
       ),
       j AS (
@@ -1348,6 +1346,8 @@ def ensure_team_cost_view() -> None:
         j.CONTRACTOR_CS_RATE,
         j.CONTRACTOR_C_RATE,
 
+        j.INVESTMENT_DIMENSION,
+
         (j.DELIVERY_TEAM_FTE + j.CONTRACTOR_CS_FTE + j.CONTRACTOR_C_FTE) AS COMP_DENOM,
 
         /* Equal-split Team PI cost */
@@ -1381,21 +1381,153 @@ def ensure_team_cost_view() -> None:
        AND tp.ITERATION_NUM = j.ITERATION_NUM
     """)
 
+def ensure_workforce_split_view() -> None:
+    """
+    Classify costs into WORK_FORCE vs NON_WORK_FORCE and expose subcomponents
+    + ADO fields (Feature Title, State, Effort Points, Investment Dimension). SOURCE uses 'ADO' for feature rows.
+    WORK_FORCE := TEAM (eq-split) + DELIVERY + CONTRACTOR_C
+    NON_WORK_FORCE := CONTRACTOR_CS + INVOICE (split into Invoice Concurrent / Invoice Ad Hoc)
+    """
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TCO_WORKFORCE_SPLIT AS
+      /* Feature-derived components (renamed SOURCE to 'ADO') */
+      SELECT
+        'ADO' AS SOURCE,
+        f.ADO_YEAR      AS YEAR,
+        f.ITERATION_NUM AS PI,
+        f.PROGRAMID, f.PROGRAMNAME,
+        f.TEAMID, f.TEAMNAME,
+        f.GROUPID, f.GROUPNAME,
+
+        /* ADO fields */
+        f.TITLE         AS FEATURE_TITLE,
+        f.STATE         AS FEATURE_STATE,
+        f.EFFORT_POINTS AS EFFORT_POINTS,
+        f.INVESTMENT_DIMENSION AS INVESTMENT_DIMENSION,
+
+        /* Category & Subcomponent */
+        CASE
+          WHEN f.EMPLOYEE_TYPE IN ('TEAM','DELIVERY','CONTRACTOR_C') THEN 'WORK_FORCE'
+          ELSE 'NON_WORK_FORCE'
+        END AS COST_CATEGORY,
+        CASE f.EMPLOYEE_TYPE
+          WHEN 'TEAM'           THEN 'TEAM cost (eq split)'
+          WHEN 'DELIVERY'       THEN 'Delivery Team'
+          WHEN 'CONTRACTOR_C'   THEN 'Contractor C'
+          WHEN 'CONTRACTOR_CS'  THEN 'Contractor CS'
+          ELSE f.EMPLOYEE_TYPE
+        END AS SUBCOMPONENT,
+        CAST(f.COST_PERPI AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.VW_FEATURE_COSTS_LONG f
+
+      UNION ALL
+
+      /* Invoices are Non Work Force; set ADO-only fields to NULL to keep column alignment */
+      SELECT
+        'INVOICE' AS SOURCE,
+        s.FISCAL_YEAR AS YEAR,
+        NULL          AS PI,
+        s.PROGRAMID, s.PROGRAMNAME,
+        s.TEAMID, s.TEAMNAME,
+        s.GROUPID, s.GROUPNAME,
+
+        /* ADO fields not applicable for invoices */
+        CAST(NULL AS STRING) AS FEATURE_TITLE,
+        CAST(NULL AS STRING) AS FEATURE_STATE,
+        CAST(0    AS FLOAT)  AS EFFORT_POINTS,
+        CAST(NULL AS STRING) AS INVESTMENT_DIMENSION,
+
+        'NON_WORK_FORCE' AS COST_CATEGORY,
+        CASE
+          WHEN COALESCE(s.INVOICE_TYPE, 'Recurring Invoice') ILIKE 'Recurring%%'
+            THEN 'Invoice Concurrent'
+          ELSE 'Invoice Ad Hoc'
+        END AS SUBCOMPONENT,
+        CAST(s.AMOUNT AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.VW_INVOICE_SPEND s
+    """)
+
+    db, sch = _db_and_schema()
+    execute(f"""
+      CREATE OR REPLACE VIEW {db}.{sch}.VW_TCO_WORKFORCE_SPLIT AS
+      /* Feature-derived components (renamed SOURCE to 'ADO') */
+      SELECT
+        'ADO' AS SOURCE,
+        f.ADO_YEAR      AS YEAR,
+        f.ITERATION_NUM AS PI,
+        f.PROGRAMID, f.PROGRAMNAME,
+        f.TEAMID, f.TEAMNAME,
+        f.GROUPID, f.GROUPNAME,
+        f.TITLE         AS FEATURE_TITLE,
+        f.STATE         AS FEATURE_STATE,
+        f.EFFORT_POINTS AS EFFORT_POINTS,
+        f.INVESTMENT_DIMENSION,               -- NEW
+        CASE
+          WHEN f.EMPLOYEE_TYPE IN ('TEAM','DELIVERY','CONTRACTOR_C') THEN 'WORK_FORCE'
+          ELSE 'NON_WORK_FORCE'
+        END AS COST_CATEGORY,
+        CASE f.EMPLOYEE_TYPE
+          WHEN 'TEAM'           THEN 'TEAM cost (eq split)'
+          WHEN 'DELIVERY'       THEN 'Delivery Team'
+          WHEN 'CONTRACTOR_C'   THEN 'Contractor C'
+          WHEN 'CONTRACTOR_CS'  THEN 'Contractor CS'
+          ELSE f.EMPLOYEE_TYPE
+        END AS SUBCOMPONENT,
+        CAST(f.COST_PERPI AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.VW_FEATURE_COSTS_LONG f
+
+      UNION ALL
+
+      /* Invoices block unchanged except we add a NULL for INVESTMENT_DIMENSION so schema matches */
+      SELECT
+        'INVOICE' AS SOURCE,
+        s.FISCAL_YEAR AS YEAR,
+        NULL          AS PI,
+        s.PROGRAMID, s.PROGRAMNAME,
+        s.TEAMID, s.TEAMNAME,
+        s.GROUPID, s.GROUPNAME,
+        CAST(NULL AS STRING) AS FEATURE_TITLE,
+        CAST(NULL AS STRING) AS FEATURE_STATE,
+        CAST(0    AS FLOAT)  AS EFFORT_POINTS,
+        CAST(NULL AS STRING) AS INVESTMENT_DIMENSION,   -- NEW
+        'NON_WORK_FORCE' AS COST_CATEGORY,
+        CASE
+          WHEN COALESCE(s.INVOICE_TYPE, 'Recurring Invoice') ILIKE 'Recurring%%'
+            THEN 'Invoice Concurrent'
+          ELSE 'Invoice Ad Hoc'
+        END AS SUBCOMPONENT,
+        CAST(s.AMOUNT AS NUMBER(18,2)) AS AMOUNT
+      FROM {db}.{sch}.VW_INVOICE_SPEND s
+    """)
 
 def ensure_feature_costs_long_view() -> None:
     """
-    Tidy (long) feature costs with UNPIVOT (no VARIANT/FLATTEN anywhere).
+    Tidy (long) feature costs with UNPIVOT.
+    Carry through STATE, EFFORT_POINTS, and INVESTMENT_DIMENSION so downstream views can expose them.
     """
     db, sch = _db_and_schema()
     execute(f"""
       CREATE OR REPLACE VIEW {db}.{sch}.VW_FEATURE_COSTS_LONG AS
       WITH base AS (
         SELECT
-          v.FEATURE_ID, v.TITLE, v.APP_NAME_RAW, v.ITERATION_PATH,
-          v.ADO_YEAR, v.ITERATION_NUM,
-          v.TEAMID, v.TEAMNAME,
-          t.PROGRAMID, p.PROGRAMNAME,
-          g.GROUPID, g.GROUPNAME,
+          v.FEATURE_ID,
+          v.TITLE,
+          v.STATE,
+          v.APP_NAME_RAW,
+          v.ITERATION_PATH,
+          v.ADO_YEAR,
+          v.ITERATION_NUM,
+          v.TEAMID,
+          v.TEAMNAME,
+          t.PROGRAMID,
+          p.PROGRAMNAME,
+          g.GROUPID,
+          g.GROUPNAME,
+          /* keep effort points + investment dimension available downstream */
+          CAST(v.EFFORT_POINTS AS FLOAT) AS EFFORT_POINTS,
+          v.INVESTMENT_DIMENSION,
+
           /* force numeric early so UNPIVOT yields NUMBER, not VARIANT */
           CAST(v.TEAM_COST_PERPI               AS NUMBER(18,2)) AS TEAM_COST_PERPI_EQSPLIT,
           CAST(v.DEL_TEAM_COST_PERPI           AS NUMBER(18,2)) AS DEL_TEAM_COST_PERPI,
@@ -1410,6 +1542,7 @@ def ensure_feature_costs_long_view() -> None:
       SELECT
         FEATURE_ID,
         TITLE,
+        STATE,
         APP_NAME_RAW,
         ITERATION_PATH,
         ADO_YEAR,
@@ -1420,6 +1553,8 @@ def ensure_feature_costs_long_view() -> None:
         PROGRAMNAME,
         GROUPID,
         GROUPNAME,
+        EFFORT_POINTS,
+        INVESTMENT_DIMENSION,
         CASE EMPLOYEE_TYPE
           WHEN 'TEAM_COST_PERPI_EQSPLIT'          THEN 'TEAM'
           WHEN 'DEL_TEAM_COST_PERPI'              THEN 'DELIVERY'
@@ -1439,7 +1574,6 @@ def ensure_feature_costs_long_view() -> None:
         )
       )
     """)
-
 
 def ensure_invoice_spend_view() -> None:
     """Annual invoice spend by Program/Team/Group."""
@@ -1468,6 +1602,7 @@ def ensure_costs_and_invoices_view() -> None:
     """
     Unified fact view: per-feature PI costs + annual invoices.
     YEAR = ADO_YEAR (features) or FISCAL_YEAR (invoices).
+    (Note: kept SOURCE='FEATURE' here for backward compatibility elsewhere.)
     """
     db, sch = _db_and_schema()
     execute(f"""
@@ -1500,17 +1635,23 @@ def ensure_costs_and_invoices_view() -> None:
 
 def ensure_all_views_ok() -> None:
     """Drop & rebuild views in the correct order; smoke test the unified view."""
-    # Drop first to avoid stale definitions
-    for v in ("VW_COSTS_AND_INVOICES", "VW_FEATURE_COSTS_LONG", "VW_TEAM_COSTS_PER_FEATURE", "VW_INVOICE_SPEND"):
+    # Drop first to avoid stale definitions (include workforce split too)
+    for v in ("VW_COSTS_AND_INVOICES",
+              "VW_FEATURE_COSTS_LONG",
+              "VW_TEAM_COSTS_PER_FEATURE",
+              "VW_INVOICE_SPEND",
+              "VW_TEAM_RATES",
+              "VW_TCO_WORKFORCE_SPLIT"):
         try:
             drop_view(v)
         except Exception:
             pass
 
-    ensure_team_cost_view()          # base per-feature
-    ensure_feature_costs_long_view() # long (UNPIVOT)
+    ensure_team_cost_view()          # rates + per-feature base
+    ensure_feature_costs_long_view() # long (UNPIVOT) + STATE/EFFORT_POINTS now carried through
     ensure_invoice_spend_view()      # yearly invoices
     ensure_costs_and_invoices_view() # union fact
+    ensure_workforce_split_view()    # workforce/non-workforce with ADO fields
 
     # Smoke test: ensure view exists/compiles
     _ = fetch_df(f"SELECT 1 FROM { _fq('VW_COSTS_AND_INVOICES') } LIMIT 1")

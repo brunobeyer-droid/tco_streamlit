@@ -73,7 +73,12 @@ def cached_list_application_groups():
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_list_applications(team_id: Optional[str] = None, group_id: Optional[str] = None):
-    return list_applications(team_id=team_id, group_id=group_id)
+    # snowflake_db.list_applications não aceita group_id — só team_id
+    df = list_applications(team_id=team_id)
+    if group_id and not df.empty and "GROUPID" in df.columns:
+        df = df[df["GROUPID"] == group_id]
+    return df
+
 
 @st.cache_data(ttl=300, show_spinner=False)
 def cached_list_vendors():

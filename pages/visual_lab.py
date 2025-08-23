@@ -1,0 +1,517 @@
+# pages/visual_lab.py
+from __future__ import annotations
+import json
+import pandas as pd
+import streamlit as st
+
+# -------------------- ECharts renderer (theme-aware) --------------------
+try:
+    from streamlit_echarts import st_echarts
+    _ECHARTS_OK = True
+except Exception:
+    _ECHARTS_OK = False
+
+def get_theme_name() -> str:
+    return st.session_state.get("ui_theme_lab", "Light")
+
+def set_theme_name(name: str) -> None:
+    st.session_state["ui_theme_lab"] = name
+
+def render_echart(options: dict, height: str = "420px"):
+    """Render ECharts honoring page theme."""
+    if not _ECHARTS_OK:
+        st.warning("ECharts renderer not available. Install `streamlit-echarts` to display charts.")
+        return
+    theme_arg = "dark" if get_theme_name() == "Dark" else None
+    st_echarts(options=options, height=height, theme=theme_arg)
+
+# -------------------- Data access --------------------
+try:
+    from snowflake_db import fetch_df
+except ImportError:
+    from snowflake_db import fetch_df  # type: ignore
+
+@st.cache_data(ttl=180, show_spinner=False)
+def fetch_split() -> pd.DataFrame:
+    # Main dataset
+    sql = """
+      SELECT SOURCE, YEAR, PI, PROGRAMNAME, TEAMNAME, GROUPNAME,
+             COST_CATEGORY, SUBCOMPONENT, AMOUNT,
+             FEATURE_TITLE, FEATURE_STATE, EFFORT_POINTS,
+             INVESTMENT_DIMENSION 
+      FROM VW_TCO_WORKFORCE_SPLIT
+    """
+    df = fetch_df(sql)
+    if df.empty:
+        return df
+
+    # Types & cleanup
+    for c in ("YEAR","PI","AMOUNT","EFFORT_POINTS"):
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df["YEAR"] = df["YEAR"].fillna(0).astype(int)
+    df["PI"]   = df["PI"].fillna(0).astype(int)
+
+    for c in ["PROGRAMNAME","TEAMNAME","GROUPNAME","SOURCE",
+              "COST_CATEGORY","SUBCOMPONENT","FEATURE_TITLE","FEATURE_STATE"]:
+        if c in df.columns:
+            df[c] = df[c].astype(str).str.strip()
+
+    # Derived: ADO_PI = "YYYY-I<PI>"
+    df["ADO_PI"] = df.apply(
+        lambda r: f"{int(r['YEAR'])}-I{int(r['PI'])}" if int(r["YEAR"]) > 0 and int(r["PI"]) > 0 else "",
+        axis=1,
+    )
+
+    # ---- Enrich ITERATION_PATH from VW_TEAM_COSTS_PER_FEATURE (JOIN to get names) ----
+    sql_iter = """
+      SELECT
+        COALESCE(v.ADO_YEAR, YEAR(v.CHANGED_AT)) AS YEAR,
+        v.ITERATION_NUM                           AS PI,
+        p.PROGRAMNAME                             AS PROGRAMNAME,
+        v.TEAMNAME                                AS TEAMNAME,
+        g.GROUPNAME                               AS GROUPNAME,
+        MIN(v.ITERATION_PATH)                     AS ITERATION_PATH
+      FROM VW_TEAM_COSTS_PER_FEATURE v
+      LEFT JOIN TEAMS t  ON t.TEAMID = v.TEAMID
+      LEFT JOIN PROGRAMS p ON p.PROGRAMID = t.PROGRAMID
+      LEFT JOIN MAP_ADO_APP_TO_TCO_GROUP mag ON mag.ADO_APP = v.APP_NAME_RAW
+      LEFT JOIN APPLICATION_GROUPS g ON g.GROUPID = mag.APP_GROUP
+      GROUP BY
+        COALESCE(v.ADO_YEAR, YEAR(v.CHANGED_AT)),
+        v.ITERATION_NUM,
+        p.PROGRAMNAME,
+        v.TEAMNAME,
+        g.GROUPNAME
+    """
+    iter_map = fetch_df(sql_iter)
+    if not iter_map.empty:
+        for c in ("YEAR","PI"):
+            iter_map[c] = pd.to_numeric(iter_map[c], errors="coerce").fillna(0).astype(int)
+        for c in ["PROGRAMNAME","TEAMNAME","GROUPNAME","ITERATION_PATH"]:
+            iter_map[c] = iter_map[c].astype(str).str.strip()
+
+        df = df.merge(
+            iter_map,
+            how="left",
+            on=["YEAR","PI","PROGRAMNAME","TEAMNAME","GROUPNAME"],
+            suffixes=("", "_it"),
+        )
+    else:
+        df["ITERATION_PATH"] = ""
+
+    df["AMOUNT"] = pd.to_numeric(df["AMOUNT"], errors="coerce").fillna(0.0)
+    df["EFFORT_POINTS"] = pd.to_numeric(df.get("EFFORT_POINTS", 0.0), errors="coerce").fillna(0.0)
+
+    return df
+
+def _to_kusd(x) -> float:
+    try:
+        return float(x) / 1_000.0
+    except Exception:
+        return 0.0
+
+# -------------------- PieNest builders --------------------
+def build_pienest_options(df: pd.DataFrame, top_groups: int = 8, title: str = "Nested Cost Breakdown (KUSD)") -> dict:
+    required = {"GROUPNAME", "COST_CATEGORY", "SUBCOMPONENT", "AMOUNT"}
+    if df.empty or not required.issubset(set(df.columns)):
+        return {"title": {"text": f"{title} (no data)"}}
+
+    work = df.copy()
+    work["KUSD"] = work["AMOUNT"].apply(_to_kusd)
+
+    g_tot = (
+        work.groupby("GROUPNAME", as_index=False)["KUSD"]
+        .sum()
+        .sort_values("KUSD", ascending=False)
+        .head(max(1, int(top_groups)))
+    )
+    keep_groups = set(g_tot["GROUPNAME"].astype(str))
+    work = work[work["GROUPNAME"].astype(str).isin(keep_groups)].copy()
+
+    inner_data = [{"name": str(r["GROUPNAME"]), "value": float(r["KUSD"])} for _, r in g_tot.iterrows()]
+    mid_g = work.groupby(["GROUPNAME", "COST_CATEGORY"], as_index=False)["KUSD"].sum().sort_values(["GROUPNAME","KUSD"], ascending=[True, False])
+    middle_data = [{"name": f"{row['COST_CATEGORY']} | {row['GROUPNAME']}", "value": float(row["KUSD"])} for _, row in mid_g.iterrows()]
+    out_g = work.groupby(["GROUPNAME", "COST_CATEGORY", "SUBCOMPONENT"], as_index=False)["KUSD"].sum().sort_values(["GROUPNAME","COST_CATEGORY","KUSD"], ascending=[True, True, False])
+    outer_data = [{"name": f"{row['SUBCOMPONENT']} | {row['COST_CATEGORY']} | {row['GROUPNAME']}", "value": float(row["KUSD"])} for _, row in out_g.iterrows()]
+
+    return {
+        "title": {"text": title, "left": "center"},
+        "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} KUSD ({d}%)"},
+        "legend": {"type": "scroll", "bottom": 0, "left": "center"},
+        "series": [
+            {"name": "Group", "type": "pie", "selectedMode": "single", "radius": [0, "28%"],
+             "label": {"position": "inner", "formatter": "{b}", "fontSize": 11}, "labelLine": {"show": False},
+             "data": inner_data},
+            {"name": "Category", "type": "pie", "radius": ["36%", "56%"],
+             "label": {"formatter": "{b}", "minAngle": 3}, "data": middle_data},
+            {"name": "Subcomponent", "type": "pie", "radius": ["64%", "80%"],
+             "label": {"formatter": "{b}", "minAngle": 2, "overflow": "truncate"}, "data": outer_data},
+        ],
+    }
+
+def build_dynamic_pienest(df: pd.DataFrame, l1: str, l2: str, l3: str, top_n: int, title: str):
+    if df.empty:
+        return {"title": {"text": f"{title} (no data)"}}
+
+    work = df.copy()
+    work["KUSD"] = work["AMOUNT"].apply(_to_kusd)
+
+    l1_totals = work.groupby(l1, as_index=False)["KUSD"].sum().sort_values("KUSD", ascending=False)
+    keep = l1_totals.head(max(1, int(top_n)))[l1].astype(str).tolist()
+    work = work[work[l1].astype(str).isin(keep)]
+
+    inner_data = [{"name": str(r[l1]), "value": float(r["KUSD"])} for _, r in l1_totals[l1_totals[l1].isin(keep)].iterrows()]
+    mid_g = work.groupby([l1, l2], as_index=False)["KUSD"].sum()
+    middle_data = [{"name": f"{row[l2]} | {row[l1]}", "value": float(row["KUSD"])} for _, row in mid_g.iterrows()]
+    out_g = work.groupby([l1, l2, l3], as_index=False)["KUSD"].sum()
+    outer_data = [{"name": f"{row[l3]} | {row[l2]} | {row[l1]}", "value": float(row["KUSD"])} for _, row in out_g.iterrows()]
+
+    return {
+        "title": {"text": title, "left": "center"},
+        "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} KUSD ({d}%)"},
+        "legend": {"type": "scroll", "bottom": 0, "left": "center"},
+        "series": [
+            {"name": l1, "type": "pie", "selectedMode": "single", "radius": [0, "28%"],
+             "label": {"position": "inner", "formatter": "{b}", "fontSize": 11}, "labelLine": {"show": False},
+             "data": inner_data},
+            {"name": l2, "type": "pie", "radius": ["36%", "56%"],
+             "label": {"formatter": "{b}", "minAngle": 3}, "data": middle_data},
+            {"name": l3, "type": "pie", "radius": ["64%", "80%"],
+             "label": {"formatter": "{b}", "minAngle": 2, "overflow": "truncate"}, "data": outer_data},
+        ],
+    }
+
+# -------------------- Pie (Pad Angle) builder --------------------
+def build_pie_padangle_options(
+    df: pd.DataFrame,
+    category_col: str,
+    title: str,
+    top_n: int,
+    pad_angle: int,
+    min_angle: int,
+    combine_small: bool = False,
+    min_pct_for_other: float = 2.0,  # percent
+) -> dict:
+    """
+    Single-level pie using padAngle example. Aggregates AMOUNT to KUSD by chosen category.
+    If combine_small=True, categories beyond Top-N and/or with share < min_pct_for_other
+    are merged into an 'Other' slice.
+    """
+    if df.empty or category_col not in df.columns:
+        return {"title": {"text": f"{title} (no data)"}}
+
+    work = df.copy()
+    work["KUSD"] = work["AMOUNT"].apply(_to_kusd)
+
+    agg = (
+        work.groupby(category_col, as_index=False)["KUSD"]
+        .sum()
+        .sort_values("KUSD", ascending=False)
+    )
+
+    total = float(agg["KUSD"].sum()) or 1.0  # avoid div/0
+
+    if combine_small:
+        # Mark rows as 'other' if rank > top_n OR pct < threshold
+        agg["__rank__"] = range(1, len(agg) + 1)
+        agg["__pct__"] = (agg["KUSD"] / total) * 100.0
+        keep_mask = (agg["__rank__"] <= int(top_n)) & (agg["__pct__"] >= float(min_pct_for_other))
+        keep_rows = agg[keep_mask].copy()
+        other_rows = agg[~keep_mask].copy()
+        other_val = float(other_rows["KUSD"].sum()) if not other_rows.empty else 0.0
+
+        series_data = [{"name": str(r[category_col]), "value": float(r["KUSD"])} for _, r in keep_rows.iterrows()]
+        if other_val > 0:
+            series_data.append({"name": "Other", "value": round(other_val, 2)})
+    else:
+        # Simple Top-N
+        agg = agg.head(max(1, int(top_n)))
+        series_data = [{"name": str(r[category_col]), "value": float(r["KUSD"])} for _, r in agg.iterrows()]
+
+    options = {
+        "title": {"text": title, "left": "center"},
+        "tooltip": {"trigger": "item", "formatter": "{b}<br/>{c} KUSD ({d}%)"},
+        "legend": {"type": "scroll", "bottom": 0, "left": "center"},
+        "series": [
+            {
+                "name": category_col,
+                "type": "pie",
+                "radius": ["35%", "70%"],
+                "padAngle": int(pad_angle),
+                "minAngle": int(min_angle),
+                "avoidLabelOverlap": True,
+                "itemStyle": {"borderRadius": 6},
+                "label": {"show": True, "formatter": "{b}\n{d}%"},
+                "labelLine": {"show": True},
+                "data": series_data,
+            }
+        ],
+    }
+    return options
+
+# -------------------- Stacked Bar builder (with % labels) --------------------
+def build_stacked_bar_options(
+    df: pd.DataFrame,
+    x_field: str,
+    stack_field: str,
+    normalize_pct: bool,
+    top_n: int,
+    sort_desc: bool,
+    title: str,
+    show_pct_labels: bool = False,   # NEW
+) -> dict:
+    if df.empty or any(col not in df.columns for col in [x_field, stack_field, "AMOUNT"]):
+        return {"title": {"text": f"{title} (no data)"}}
+
+    work = df.copy()
+
+    def _catify(v):
+        if pd.isna(v):
+            return ""
+        if isinstance(v, (int, float)) and float(v).is_integer():
+            return str(int(v))
+        return str(v).strip()
+
+    work[x_field] = work[x_field].apply(_catify)
+    work[stack_field] = work[stack_field].apply(_catify)
+    work["KUSD"] = work["AMOUNT"].apply(_to_kusd)
+
+    pivot = (
+        work.groupby([x_field, stack_field], as_index=False)["KUSD"].sum()
+        .pivot(index=x_field, columns=stack_field, values="KUSD")
+        .fillna(0.0)
+    )
+
+    pivot["__TOTAL__"] = pivot.sum(axis=1)
+    pivot = pivot.sort_values("__TOTAL__", ascending=not sort_desc).head(max(1, int(top_n)))
+
+    y_name = "KUSD"
+    if normalize_pct:
+        row_sums = pivot["__TOTAL__"].replace(0.0, 1.0)
+        for c in [c for c in pivot.columns if c != "__TOTAL__"]:
+            pivot[c] = (pivot[c] / row_sums) * 100.0
+        y_name = "%"
+
+    x_vals = pivot.index.tolist()
+    stack_categories = [c for c in pivot.columns if c != "__TOTAL__"]
+
+    # Determine label config
+    label_cfg = None
+    if normalize_pct and show_pct_labels:
+        # show percentage labels inside bars
+        label_cfg = {
+            "show": True,
+            "position": "inside",
+            "formatter": "{c}%",  # value is already in %
+            "fontSize": 10,
+        }
+
+    series = []
+    for cat in stack_categories:
+        serie = {
+            "name": str(cat),
+            "type": "bar",
+            "stack": "total",
+            "emphasis": {"focus": "series"},
+            "data": [round(float(v), 1) for v in pivot[cat].tolist()],
+        }
+        if label_cfg:
+            serie["label"] = label_cfg
+            # Improve readability when labels overlap
+            serie["labelLayout"] = {"hideOverlap": True}
+        series.append(serie)
+
+    x_axis = {"type": "category", "data": x_vals, "axisLabel": {"rotate": 25}}
+    tooltip = {"trigger": "axis", "axisPointer": {"type": "shadow"}}
+    if normalize_pct:
+        tooltip["valueFormatter"] = "{value}%"
+    legend = {"type": "scroll", "top": 24}
+
+    y_axis = {"type": "value", "name": y_name}
+    if normalize_pct:
+        y_axis["max"] = 100  # keep scale at 0..100 when normalized
+
+    return {
+        "title": {"text": title},
+        "tooltip": tooltip,
+        "legend": legend,
+        "grid": {"left": "2%", "right": "2%", "top": 70, "bottom": 10, "containLabel": True},
+        "xAxis": x_axis,
+        "yAxis": y_axis,
+        "series": series,
+    }
+
+# ----------------------------- UI HEADER -----------------------------
+st.set_page_config(page_title="Visual Lab (ECharts)", layout="wide", initial_sidebar_state="collapsed")
+
+col1, col2, col3 = st.columns([2.6, 1, 1.4], gap="large")
+with col1:
+    st.title("Visual Lab (ECharts)")
+with col2:
+    st.markdown("<div style='height:6px;'></div>", unsafe_allow_html=True)
+    theme_choice = st.segmented_control(
+        "Theme",
+        options=["Light", "Dark"],
+        selection_mode="single",
+        default=get_theme_name(),
+        help="Applies to all ECharts in this page",
+        key="seg_theme_lab",
+    )
+    set_theme_name(theme_choice)
+
+df = fetch_split()
+if df.empty:
+    st.info("No data found in VW_TCO_WORKFORCE_SPLIT.")
+    st.stop()
+
+def _present_if_exists(cols: list[str]) -> list[str]:
+    return [c for c in cols if c in df.columns]
+
+# Candidate fields based on actual dataframe
+common_cats = _present_if_exists([
+    "PROGRAMNAME","TEAMNAME","GROUPNAME",
+    "COST_CATEGORY","SUBCOMPONENT","SOURCE",
+    "FEATURE_STATE","INVESTMENT_DIMENSION","YEAR","PI","ADO_PI","ITERATION_PATH"
+])
+
+# ----------------------------- TABS -----------------------------
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
+    "Top Spend Bar",
+    "Pie (Pad Angle)",
+    "Share Pie",
+    "PieNest",
+    "Stack Bar"
+])
+
+# Import base charts used by Top Spend, Share Pie
+from viz.charts import opt_bar_top_spend_by, opt_pie_share_by
+
+# ----- Top Spend Bar -----
+with tab1:
+    st.subheader("Top Spend Bar")
+    cols = st.columns(2)
+    with cols[0]:
+        group_options = _present_if_exists([
+            "PROGRAMNAME","TEAMNAME","GROUPNAME","SUBCOMPONENT",
+            "FEATURE_STATE","SOURCE","ADO_PI","YEAR","PI","ITERATION_PATH"
+        ])
+        group_col = st.selectbox("Group by", group_options, index=0, key="lab_bar_group")
+        top_n = st.slider("Top N", 3, 30, 10, key="lab_bar_topn")
+    with cols[1]:
+        title = st.text_input("Title", "Top Spend (KUSD)", key="lab_bar_title")
+        sort_desc = st.checkbox("Sort descending", value=True, key="lab_bar_sortdesc")
+
+    opt = opt_bar_top_spend_by(df, group_col=group_col, title=title, top_n=top_n, sort_desc=sort_desc)
+    render_echart(opt, height="420px")
+    with st.expander("Show ECharts option (JSON)"):
+        st.code(json.dumps(opt, indent=2))
+
+# ----- Pie (Pad Angle) -----
+with tab2:
+    st.subheader("Pie (Pad Angle)")
+    c1, c2, c3 = st.columns([1.2, 1, 1])
+    with c1:
+        pie_group_options = _present_if_exists([
+            "PROGRAMNAME","TEAMNAME","GROUPNAME",
+            "SOURCE","COST_CATEGORY","SUBCOMPONENT","FEATURE_STATE",
+            "YEAR","PI","ADO_PI","ITERATION_PATH"
+        ])
+        pie_group = st.selectbox("Categories (slice by)", pie_group_options, index=0, key="pie_pad_group")
+        top_n_pie = st.slider("Top N slices", 3, 30, 12, key="pie_pad_topn")
+        combine_small = st.checkbox("Combine small slices into ‘Other’", value=True, key="pie_pad_other")
+    with c2:
+        pad_angle = st.slider("Pad angle (deg)", 0, 12, 6, key="pie_pad_pad")
+        min_angle = st.slider("Min slice angle (deg)", 0, 10, 2, key="pie_pad_min")
+        min_pct = st.slider("Min % to avoid ‘Other’", 0.0, 10.0, 2.0, 0.1, key="pie_pad_minpct")
+    with c3:
+        title_pie = st.text_input("Title", "Spend Share (KUSD) — Pie (Pad Angle)", key="pie_pad_title")
+
+    opt_pie = build_pie_padangle_options(
+        df=df,
+        category_col=pie_group,
+        title=title_pie,
+        top_n=top_n_pie,
+        pad_angle=pad_angle,
+        min_angle=min_angle,
+        combine_small=combine_small,
+        min_pct_for_other=min_pct,
+    )
+    render_echart(opt_pie, height="460px")
+    with st.expander("Show ECharts option (JSON)"):
+        st.code(json.dumps(opt_pie, indent=2))
+
+# ----- Share Pie (simple) -----
+with tab3:
+    st.subheader("Share Pie")
+    cols = st.columns(2)
+    with cols[0]:
+        group_options = _present_if_exists(["SOURCE","COST_CATEGORY","SUBCOMPONENT","FEATURE_STATE"])
+        group_col = st.selectbox("Share by", group_options, index=0, key="lab_pie_group")
+    with cols[1]:
+        title = st.text_input("Title", "Share (KUSD)", key="lab_pie_title")
+
+    opt = opt_pie_share_by(df, group_col=group_col, title=title)
+    render_echart(opt, height="420px")
+    with st.expander("Show ECharts option (JSON)"):
+        st.code(json.dumps(opt, indent=2))
+
+# ----- PieNest (with custom levels) -----
+with tab4:
+    st.subheader("PieNest — Custom Breakdown")
+
+    candidate_fields = _present_if_exists([
+        "PROGRAMNAME","TEAMNAME","GROUPNAME",
+        "COST_CATEGORY","SUBCOMPONENT","SOURCE",
+        "FEATURE_STATE","YEAR","PI","ADO_PI","ITERATION_PATH"
+    ])
+
+    cols = st.columns(2)
+    with cols[0]:
+        def _safe_index(lst, val, fallback=0):
+            try: return lst.index(val)
+            except Exception: return fallback
+        level1 = st.selectbox("Inner ring (level 1)", candidate_fields, index=_safe_index(candidate_fields, "GROUPNAME"))
+        level2 = st.selectbox("Middle ring (level 2)", candidate_fields, index=_safe_index(candidate_fields, "COST_CATEGORY"))
+        level3 = st.selectbox("Outer ring (level 3)", candidate_fields, index=_safe_index(candidate_fields, "SUBCOMPONENT"))
+        top_n2 = st.slider("Top N values for inner ring", 3, 20, 8, key="lab_pienest_topn")
+    with cols[1]:
+        title2 = st.text_input("Chart title", "Nested Cost Breakdown (KUSD)", key="lab_pienest_title")
+
+    opt2 = build_dynamic_pienest(df, level1, level2, level3, top_n2, title2)
+    render_echart(opt2, height="520px")
+    with st.expander("Show ECharts option (JSON)"):
+        st.code(json.dumps(opt2, indent=2))
+
+# ----- Stack Bar (configurable, now with % labels) -----
+with tab5:
+    st.subheader("Stack Bar — Configurable")
+
+    x_candidates = _present_if_exists(["PROGRAMNAME","TEAMNAME","GROUPNAME","YEAR","PI","ADO_PI","ITERATION_PATH"])
+    stack_candidates = _present_if_exists(["COST_CATEGORY","SUBCOMPONENT","SOURCE","FEATURE_STATE"])
+
+    c1, c2, c3 = st.columns([1.2, 1.2, 1])
+    with c1:
+        x_field = st.selectbox("X-axis groups", x_candidates, index=0, key="stk_x")
+        top_n3 = st.slider("Top N x-groups", 3, 30, 12, key="stk_topn")
+        sort_desc = st.checkbox("Sort by total (desc)", value=True, key="stk_sort")
+    with c2:
+        stack_field = st.selectbox("Stack field", stack_candidates, index=0, key="stk_stack")
+        normalize_pct = st.checkbox("Normalize to % (row-wise)", value=False, key="stk_norm")
+        show_pct_labels = st.checkbox("Show % labels in bars", value=True, key="stk_showlabels")
+    with c3:
+        title3 = st.text_input("Title", "Stacked Breakdown (KUSD)", key="stk_title")
+
+    opt3 = build_stacked_bar_options(
+        df=df,
+        x_field=x_field,
+        stack_field=stack_field,
+        normalize_pct=normalize_pct,
+        top_n=top_n3,
+        sort_desc=sort_desc,
+        title=title3 if not normalize_pct else title3.replace("(KUSD)", "(%)"),
+        show_pct_labels=show_pct_labels,  # NEW
+    )
+    render_echart(opt3, height="460px")
+    with st.expander("Show ECharts option (JSON)"):
+        st.code(json.dumps(opt3, indent=2))
