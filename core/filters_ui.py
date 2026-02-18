@@ -23,6 +23,17 @@ def _norm_sig(items: List[str]) -> Tuple[str, ...]:
     return tuple(sorted({str(x).strip() for x in (items or []) if str(x).strip()}))
 
 
+def _drop_unassigned_if_mixed(values: List[str]) -> List[str]:
+    vals = [str(v).strip() for v in (values or []) if str(v).strip()]
+    if not vals:
+        return []
+    placeholders = {"(UNASSIGNED)", "UNASSIGNED", "(UNMAPPED APPLICATION)", "(UNMAPPED APP GROUP)"}
+    has_real = any(str(v).strip().upper() not in placeholders for v in vals)
+    if not has_real:
+        return vals
+    return [v for v in vals if str(v).strip().upper() not in placeholders]
+
+
 def _df_filter_options(base_df: pd.DataFrame, *, selected_year: int) -> Dict[str, List[str]]:
     if base_df is None or base_df.empty:
         return {"programs": [], "teams": [], "groups": []}
@@ -37,7 +48,11 @@ def _df_filter_options(base_df: pd.DataFrame, *, selected_year: int) -> Dict[str
         vals = [v for v in vals if v]
         return sorted(set(vals))
 
-    return {"programs": uniq("PROGRAMNAME"), "teams": uniq("TEAMNAME"), "groups": uniq("GROUPNAME")}
+    return {
+        "programs": _drop_unassigned_if_mixed(uniq("PROGRAMNAME")),
+        "teams": _drop_unassigned_if_mixed(uniq("TEAMNAME")),
+        "groups": _drop_unassigned_if_mixed(uniq("GROUPNAME")),
+    }
 
 
 def _infer_driver_dim(*, programs: List[str], teams: List[str], groups: List[str]) -> str:
@@ -150,7 +165,7 @@ def render_filters_expander(
         if sel_programs and "PROGRAMNAME" in teams_df.columns:
             teams_df = teams_df.loc[teams_df["PROGRAMNAME"].fillna("").astype(str).str.strip().isin(set(sel_programs))].copy()
         team_opts = sorted(set(teams_df.get("TEAMNAME", pd.Series(dtype=str)).dropna().astype(str).str.strip().tolist()))
-        team_opts = [t for t in team_opts if t]
+        team_opts = _drop_unassigned_if_mixed([t for t in team_opts if t])
 
         sel_teams = [t for t in _as_clean_list(st.session_state.get(teams_key)) if t in set(team_opts)]
         if st.session_state.get(teams_key) != sel_teams:
@@ -160,7 +175,7 @@ def render_filters_expander(
         if sel_teams and "TEAMNAME" in groups_df.columns:
             groups_df = groups_df.loc[groups_df["TEAMNAME"].fillna("").astype(str).str.strip().isin(set(sel_teams))].copy()
         group_opts = sorted(set(groups_df.get("GROUPNAME", pd.Series(dtype=str)).dropna().astype(str).str.strip().tolist()))
-        group_opts = [g for g in group_opts if g]
+        group_opts = _drop_unassigned_if_mixed([g for g in group_opts if g])
 
         sel_groups = [g for g in _as_clean_list(st.session_state.get(groups_key)) if g in set(group_opts)]
         if st.session_state.get(groups_key) != sel_groups:

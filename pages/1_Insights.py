@@ -1625,6 +1625,18 @@ insights_programs_key = "insights_programs"
 insights_teams_key = "insights_teams"
 insights_groups_key = "insights_groups"
 
+_UNASSIGNED_FILTER_TOKENS = {"UNASSIGNED", "(UNASSIGNED)"}
+
+
+def _drop_unassigned_if_mixed(values: list[str]) -> list[str]:
+    cleaned = [str(v).strip() for v in (values or []) if str(v).strip()]
+    if not cleaned:
+        return []
+    has_real = any(v.upper() not in _UNASSIGNED_FILTER_TOKENS for v in cleaned)
+    if not has_real:
+        return cleaned
+    return [v for v in cleaned if v.upper() not in _UNASSIGNED_FILTER_TOKENS]
+
 with st.expander("Filters", expanded=False):
     raw_year = st.session_state.get(insights_year_key, default_year)
     try:
@@ -1734,7 +1746,7 @@ with st.expander("Filters", expanded=False):
                 out.append(alias)
         return out
 
-    programs_opts = _dedupe_options_by_label(programs_opts, program_label_map)
+    programs_opts = _drop_unassigned_if_mixed(_dedupe_options_by_label(programs_opts, program_label_map))
     default_programs = _remap_selected_by_label(default_programs, programs_opts, program_label_map)
 
     sel_programs = st.multiselect(
@@ -1765,6 +1777,7 @@ with st.expander("Filters", expanded=False):
     scope_teams = {str(v).strip() for v in (getattr(scope, "teams", []) or []) if str(v).strip()}
     if scope_teams:
         teams_opts = sorted(set(teams_opts).union(scope_teams))
+    teams_opts = _drop_unassigned_if_mixed(teams_opts)
     current_teams = [t for t in st.session_state.get(insights_teams_key, []) if t in set(teams_opts)]
     st.session_state[insights_teams_key] = current_teams
     sel_teams = st.multiselect(
@@ -1797,6 +1810,7 @@ with st.expander("Filters", expanded=False):
                     groups_opts = sorted({str(v).strip() for v in g_df["GROUPNAME"].dropna().astype(str).tolist() if str(v).strip()})
             except Exception:
                 groups_opts = []
+    groups_opts = _drop_unassigned_if_mixed(groups_opts)
     current_groups = [g for g in st.session_state.get(insights_groups_key, []) if g in set(groups_opts)]
     st.session_state[insights_groups_key] = current_groups
     sel_groups = st.multiselect(
@@ -2225,7 +2239,7 @@ st.markdown(
     @import url("https://fonts.googleapis.com/css2?family=Material+Symbols+Outlined:opsz,wght,FILL,GRAD@20,400,0,0");
     /* FinOps KPI cards – Insights only */
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-card {
-        height: 170px;
+        height: 164px;
         display: flex;
         background: transparent;
         border: 1px solid rgba(255,255,255,0.12);
@@ -2233,7 +2247,7 @@ st.markdown(
         overflow: hidden;
         position: relative;
         isolation: isolate;
-        box-shadow: 0 8px 18px rgba(2, 6, 23, 0.16), 0 1px 0 rgba(255,255,255,0.03) inset;
+        box-shadow: 0 6px 14px rgba(2, 6, 23, 0.12), 0 1px 0 rgba(255,255,255,0.03) inset;
         transition: transform 180ms ease, box-shadow 180ms ease, border-color 180ms ease;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-bg-layer {
@@ -2242,9 +2256,9 @@ st.markdown(
         pointer-events: none;
         z-index: 0;
         background:
-            radial-gradient(180px 96px at 95% 12%, color-mix(in srgb, var(--finops-kpi-accent) 42%, transparent), transparent 74%),
-            linear-gradient(180deg, color-mix(in srgb, var(--finops-kpi-accent) 16%, transparent), transparent 62%);
-        opacity: 1;
+            radial-gradient(160px 90px at 95% 12%, color-mix(in srgb, var(--finops-kpi-accent) 30%, transparent), transparent 76%),
+            linear-gradient(180deg, color-mix(in srgb, var(--finops-kpi-accent) 10%, transparent), transparent 64%);
+        opacity: 0.9;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-bg-art {
         position: absolute;
@@ -2257,8 +2271,8 @@ st.markdown(
         gap: 4px;
         pointer-events: none;
         z-index: 0;
-        opacity: 0.42;
-        filter: saturate(1.1) blur(0.8px);
+        opacity: 0.3;
+        filter: saturate(1.05) blur(0.4px);
         -webkit-mask-image: linear-gradient(90deg, transparent 0%, rgba(0, 0, 0, 0.08) 28%, rgba(0, 0, 0, 0.55) 54%, #000 100%);
         mask-image: linear-gradient(90deg, transparent 0%, rgba(0, 0, 0, 0.08) 28%, rgba(0, 0, 0, 0.55) 54%, #000 100%);
     }
@@ -2355,8 +2369,8 @@ st.markdown(
         pointer-events: none;
         z-index: 0;
         background-image: repeating-radial-gradient(circle at 12% 10%, rgba(255,255,255,0.06) 0 0.7px, transparent 0.7px 2.8px);
-        opacity: 0.07;
-        filter: blur(0.9px);
+        opacity: 0.04;
+        filter: blur(0.7px);
         mix-blend-mode: screen;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-watermark {
@@ -2365,7 +2379,7 @@ st.markdown(
         top: 8px;
         z-index: 0;
         pointer-events: none;
-        opacity: 0.08;
+        opacity: 0.05;
         filter: blur(0.4px);
         line-height: 1;
     }
@@ -2378,7 +2392,7 @@ st.markdown(
         flex-shrink: 0;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-body {
-        padding: 12px 14px;
+        padding: 11px 13px;
         display: flex;
         flex-direction: column;
         justify-content: space-between;
@@ -2404,7 +2418,7 @@ st.markdown(
         flex-shrink: 0;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-title {
-        font-size: 0.76rem;
+        font-size: 0.78rem;
         color: rgba(255,255,255,0.74);
         white-space: nowrap;
         overflow: hidden;
@@ -2431,7 +2445,7 @@ st.markdown(
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-value {
         font-size: clamp(1.22rem, 1.7vw, 1.82rem);
         font-weight: 700;
-        margin: 2px 0 6px 0;
+        margin: 2px 0 5px 0;
         color: rgba(248, 250, 252, 0.95);
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-value-row {
@@ -2476,27 +2490,38 @@ st.markdown(
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-chip {
         display: inline-block;
-        font-size: 0.65rem;
+        font-size: 0.68rem;
         padding: 2px 6px;
         border-radius: 10px;
         margin-right: 4px;
         background: rgba(255,255,255,0.12);
         color: rgba(248, 250, 252, 0.9);
+        white-space: nowrap;
+        max-width: 100%;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        vertical-align: top;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-lines {
-        font-size: 0.7rem;
+        font-size: 0.72rem;
         color: rgba(255,255,255,0.5);
         line-height: 1.2;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
     }
     @media (hover: hover) and (pointer: fine) {
         [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-card:hover {
-            transform: translateY(-2px);
-            box-shadow: 0 14px 24px rgba(2, 6, 23, 0.24), 0 1px 0 rgba(255,255,255,0.05) inset;
+            transform: translateY(-1px);
+            box-shadow: 0 10px 20px rgba(2, 6, 23, 0.18), 0 1px 0 rgba(255,255,255,0.05) inset;
             border-color: rgba(255,255,255,0.2);
         }
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .finops-kpi-line {
         height: 0.9rem;
+        overflow: hidden;
+        white-space: nowrap;
+        text-overflow: ellipsis;
     }
     [data-testid="stAppViewContainer"]:has(#insights-kpi-strip-anchor) .material-symbols-outlined {
         font-variation-settings: "FILL" 0, "wght" 400, "GRAD" 0, "opsz" 20;
@@ -2505,7 +2530,6 @@ st.markdown(
     """,
     unsafe_allow_html=True,
 )
-st.subheader("KPI strip")
 kpi_help = {
     "Estimated Benefits (Midpoint)": "Estimated benefits midpoint derived from BV score mapping.",
     "Projected Cost (Total)": "Projected (forecast) total for selected scope, with baseline reference.",
