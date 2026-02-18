@@ -1,0 +1,4 @@
+interface:
+  display_name: "NEXT_Cost_Model_Guardrails"
+  short_description: "Offline NEXT cost model guardrail checks."
+  default_prompt: "Run offline guardrails and write automation/reports/cost_model_guardrails.md"

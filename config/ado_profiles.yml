@@ -1,0 +1,27 @@
+MOIT:
+  profile_name: MOIT
+  mode: profile
+  area_mapping:
+    program_level: AreaLevel2
+    team_level: Leaf
+  work_item_types:
+    feature: Feature
+    epic: Epic
+  fields:
+    story_points: Effort
+    business_value: BusinessValue
+    app_name: Custom.ApplicationName
+  swag:
+    points_per_fte: 65.0
+DEEPWATER_SBD:
+  profile_name: DEEPWATER_SBD
+  mode: profile
+  work_item_types:
+    feature: Feature
+    epic: Epic
+  fields:
+    story_points: Effort
+    business_value: BusinessValue
+    app_name: Custom.ApplicationName
+  swag:
+    points_per_fte: 65.0

@@ -1,0 +1,33 @@
+version: 1  # config schema version
+
+# Score thresholds (percentage) for level labels
+thresholds:
+  high: 90
+  med: 70
+
+# Weights (%) for each dimension; must add up to 100
+weights:
+  ownership: 10
+  workforce: 15
+  rates: 10
+  nonworkforce: 15
+  adoinputs: 50  # ADO inputs (SWAG demand/features/mapping) carry the most weight
+
+# Rules and toggles per dimension
+rules:
+  ownership:
+    # Group names to ignore from ownership checks
+    exclude_groupnames: ["(Unassigned)", "Unassigned", ""]
+  workforce:
+    # Minimum workforce cost to consider WF present
+    min_workforce_cost: 0.0
+  rates:
+    # Only require rates when WF exists
+    require_rates_only_if_workforce_present: true
+  nonworkforce:
+    # Minimum NWF cost to consider NWF present
+    min_nonworkforce_cost: 0.0
+  adoinputs:
+    # Accept Derived FTE (SWAG) and/or feature count as valid ADO input
+    accept_derived_fte: true
+    accept_feature_count: true

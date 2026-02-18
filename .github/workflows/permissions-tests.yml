@@ -1,0 +1,32 @@
+name: Permissions Tests
+
+on:
+  push:
+    branches:
+      - "**"
+  pull_request:
+
+jobs:
+  permissions:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install test dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install pandas pytest
+
+      - name: Run permission safety tests
+        run: |
+          python -m pytest -q \
+            tests/test_authorization.py \
+            tests/test_scope_master_pages.py \
+            tests/test_ux_copy_contracts.py \
+            tests/test_page_ux_smoke.py

@@ -1,0 +1,22 @@
+# PI Readiness gate configuration
+readiness_thresholds:
+  ready_min_score: 90
+  at_risk_min_score: 70
+
+required_checks:
+  require_ownership: true
+  require_rates: true
+  require_nonworkforce: true
+  require_ado_mapping: true
+  require_swag_ready_demand: true
+
+gating_rules:
+  block_if_unassigned_cost_present: true
+  block_if_missing_rates_for_workforce: true
+  block_if_missing_ado_mapping_fields: true
+  block_if_missing_program_team_group_mapping: true
+
+ado_rules:
+  required_feature_fields: ["TEAM", "APP_GROUP"]
+  max_percent_features_missing_mapping_for_ready: 2.0
+  max_percent_features_missing_mapping_for_at_risk: 10.0

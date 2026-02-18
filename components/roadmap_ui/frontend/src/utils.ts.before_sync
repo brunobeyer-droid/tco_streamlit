@@ -1,0 +1,78 @@
+export const palette: Record<string, string> = {
+  done: "var(--rm-chip-done)",
+  active: "var(--rm-chip-inprogress)",
+  validation: "var(--rm-chip-validation)",
+  planned: "var(--rm-chip-planned)",
+};
+
+export const accent: Record<string, string> = {
+  done: "var(--rm-chip-border-done)",
+  active: "var(--rm-chip-border-inprogress)",
+  validation: "var(--rm-chip-border-validation)",
+  planned: "var(--rm-chip-border-planned)",
+};
+
+export const textColor: Record<string, string> = {
+  done: "var(--rm-chip-text-done)",
+  active: "var(--rm-chip-text-inprogress)",
+  validation: "var(--rm-chip-text-validation)",
+  planned: "var(--rm-chip-text-planned)",
+};
+
+export function clamp(value: number, min = 0, max = 1) {
+  return Math.max(min, Math.min(max, value));
+}
+
+export function utilizationColor(value: number) {
+  if (!Number.isFinite(value)) return "var(--rm-util-na)";
+  if (value <= 0.9) return "var(--rm-util-low)";
+  if (value <= 1.1) return "var(--rm-util-mid)";
+  return "var(--rm-util-high)";
+}
+
+export function formatNumber(value: number | string, digits = 1) {
+  const num = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(num)) return "0";
+  return num.toLocaleString(undefined, {
+    minimumFractionDigits: digits,
+    maximumFractionDigits: digits,
+  });
+}
+
+export function formatWhole(value: number | string) {
+  const num = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(num)) return "0";
+  return Math.round(num).toLocaleString();
+}
+
+export function formatDateRange(start?: string | null, end?: string | null) {
+  if (!start && !end) return "";
+  if (start && end) return `${start} → ${end}`;
+  return start || end || "";
+}
+
+export function safeString(value: any) {
+  return value == null ? "" : String(value);
+}
+
+export function escapeHtml(value: string) {
+  return value
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/\"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+export function sanitizeExternalUrl(value: any): string {
+  const raw = safeString(value).trim();
+  if (!raw) return "";
+  try {
+    const parsed = new URL(raw, window.location.origin);
+    const proto = parsed.protocol.toLowerCase();
+    if (proto !== "http:" && proto !== "https:") return "";
+    return parsed.href;
+  } catch {
+    return "";
+  }
+}

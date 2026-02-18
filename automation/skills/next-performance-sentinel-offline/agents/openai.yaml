@@ -1,0 +1,4 @@
+interface:
+  display_name: "NEXT Performance Sentinel Offline"
+  short_description: "Offline performance sentinel for NEXT core page pipelines"
+  default_prompt: "Run an offline performance sentinel on core page pipelines using local dumps and generate the markdown report."

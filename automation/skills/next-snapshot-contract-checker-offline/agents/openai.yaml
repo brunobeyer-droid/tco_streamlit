@@ -1,0 +1,4 @@
+interface:
+  display_name: "NEXT_Snapshot_Contract_Checker_Offline"
+  short_description: "Detect schema drift and growth risk between local snapshots."
+  default_prompt: "Compare the newest local snapshot against the previous one and produce a non-invasive contract check report at automation/reports/snapshot_contract_check.md."

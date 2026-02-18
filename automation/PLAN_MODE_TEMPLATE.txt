@@ -1,0 +1,42 @@
+Apply GLOBAL GUARDRAILS (STRICT).
+English-only code and identifiers.
+
+Context:
+This is an offline-generated NEXT application report.
+Treat the report below as authoritative analysis.
+Do NOT re-analyze the entire repository from scratch.
+
+Environment Constraints:
+- Offline only
+- No Azure DevOps calls
+- No external APIs
+- Workspace currently contains only the directories mentioned in the report
+- Liquidfill widget must remain untouched (same row, second column, no clipping)
+- Do NOT modify canonical cost model logic
+- Preserve access control, filters, and portfolio scoping
+
+Goal:
+Create a SAFE, incremental refactor plan based ONLY on the report findings.
+
+Instructions:
+1) Propose phased PR-sized steps.
+2) Prioritize HIGH impact / LOW risk improvements first.
+3) Focus on structural performance improvements:
+   - duplicated helpers
+   - missing caching opportunities
+   - vectorization instead of per-row apply
+   - reuse of aggregated dataframes
+4) Do NOT generate implementation code.
+5) Do NOT redesign UI.
+6) Output a concise, senior-level refactor plan.
+
+Output Format:
+- Phase 1 (Safe Structural Cleanup)
+- Phase 2 (Caching Stabilization)
+- Phase 3 (Heavy Transform Optimization)
+- Expected Performance Impact
+- Risk Notes
+
+=== REPORT START ===
+PASTE REPORT CONTENT HERE
+=== REPORT END ===

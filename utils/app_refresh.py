@@ -1,6 +1,7 @@
 # utils/app_refresh.py
 import streamlit as st
-from snowflake_db import ensure_tables
+from db import ensure_tables
+from core.freshness import post_write_refresh
 
 # Initialize schema once per session
 if "_tco_init" not in st.session_state:
@@ -10,13 +11,7 @@ if "_tco_init" not in st.session_state:
 
 def refresh_all_data():
     """
-    Global refresh: increment a shared revision and clear all @st.cache_data caches.
-    Every cached loader should depend on this revision value (e.g., get_*_df(REV)).
+    Legacy compatibility helper for manual refresh actions.
+    Uses centralized freshness flow instead of direct global cache clears.
     """
-    st.session_state.setdefault("db_rev", 0)
-    st.session_state["db_rev"] += 1
-    try:
-        st.cache_data.clear()
-    except Exception:
-        # Older/newer Streamlit versions: failing to clear should not break the app
-        pass
+    post_write_refresh("legacy_refresh_all_data", ensure_views=False, rerun=False, bump_version=False)

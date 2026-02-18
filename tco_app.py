@@ -5,7 +5,9 @@ import datetime as dt
 
 # Adjust this import if snowflake_db.py is under utils/
 from snowflake_db import ensure_tables, fetch_df
-
+# anywhere early in app startup, once
+from snowflake_db import ensure_all_views_ok
+ensure_all_views_ok()
 # Optional: sidebar helper
 try:
     from utils.sidebar import render_global_actions
