@@ -4075,7 +4075,6 @@ def refresh_tco_team_velocity_snapshot(
           TRY_CONVERT(FLOAT, v.BASELINE_PREV) AS BASELINE_PREV
         FROM {_fq('VW_TCO_TEAM_VELOCITY_BASELINE')} v
         WHERE {' AND '.join(where_parts)}
-        ORDER BY TRY_CONVERT(INT, v.YEAR), TRY_CONVERT(INT, v.PI), v.PROGRAMNAME, v.TEAMNAME
         """,
         tuple(params) if params else None,
     )

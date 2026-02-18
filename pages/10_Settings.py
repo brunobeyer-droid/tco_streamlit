@@ -106,6 +106,7 @@ from db import (
     upsert_apptio_actuals_lines,
     upsert_apptio_to_cost_type_mappings,
     fetch_apptio_actuals_by_program_breakdown,
+    refresh_tco_team_velocity_snapshot,
 )
 from db import fetch_df_active as fetch_df, execute_active as execute
 from db.control_db import (
@@ -3231,6 +3232,11 @@ def render_ado_sync_tab() -> None:
         story_points_field = str((profile_cfg.get("fields") or {}).get("story_points") or "").strip() or "None"
         bv_field = str((profile_cfg.get("fields") or {}).get("business_value") or "").strip() or "Not configured"
         app_field = str((profile_cfg.get("fields") or {}).get("app_name") or "").strip() or "Not configured"
+        raw_driver = str((profile_cfg.get("forecast") or {}).get("derived_fte_driver") or "SWAG").strip().upper()
+        if raw_driver in {"VELOCITY", "SNAPSHOT", "SNAPSHOT_VELOCITY"}:
+            driver_label = "Velocity snapshot (Derived FTE)"
+        else:
+            driver_label = "SWAG (Story Points)"
         swag_ppf = float((profile_cfg.get("swag") or {}).get("points_per_fte") or 65.0)
         base_url = str(profile_cfg.get("odata_base_url") or "").strip()
         org_project = "Unknown"
@@ -3253,6 +3259,7 @@ def render_ado_sync_tab() -> None:
         st.write(f"Config source: {config_source}")
         st.write(f"Sync mode: {sync_mode_value}")
         st.write(f"Profile sync status: {'Requires sync' if active_profile_out_of_sync else 'Up to date'}")
+        st.write(f"Forecast demand driver: {driver_label}")
         coverage = _story_points_coverage_summary(int(st.session_state.get("ado_data_cache_bust", 0)))
         c_sp1, c_sp2 = st.columns([2, 2])
         with c_sp1:
@@ -3301,6 +3308,92 @@ def render_ado_sync_tab() -> None:
             st.caption("PAT source: secrets ✅")
         else:
             st.caption("PAT missing ❌")
+
+        st.markdown("### Snapshot refresh (manual)")
+        st.caption("Use this in offline/dev restores to refresh velocity snapshot without full ADO sync.")
+        snap_cols = st.columns([1.1, 1.0, 1.0])
+        with snap_cols[0]:
+            snap_year = int(
+                st.number_input(
+                    "Reference year",
+                    min_value=2000,
+                    max_value=2100,
+                    value=int(date.today().year),
+                    step=1,
+                    key="ado_snapshot_reference_year",
+                )
+            )
+        with snap_cols[1]:
+            snap_include_prior = st.toggle(
+                "Include prior year",
+                value=True,
+                key="ado_snapshot_include_prior",
+            )
+        with snap_cols[2]:
+            snap_reference_only = st.toggle(
+                "Reference year only",
+                value=False,
+                key="ado_snapshot_reference_only",
+            )
+        if st.button(
+            "Refresh Velocity Snapshot Only",
+            key="ado_refresh_velocity_snapshot_only_btn",
+            use_container_width=False,
+        ):
+            try:
+                refresh_timeout_raw = str(
+                    os.getenv("TCO_VELOCITY_SNAPSHOT_REFRESH_QUERY_TIMEOUT", "120") or "120"
+                ).strip()
+                try:
+                    refresh_timeout = int(refresh_timeout_raw)
+                except Exception:
+                    refresh_timeout = 120
+                if refresh_timeout <= 0:
+                    refresh_timeout = 120
+
+                prev_query_timeout = os.getenv("MSSQL_QUERY_TIMEOUT")
+                os.environ["MSSQL_QUERY_TIMEOUT"] = str(refresh_timeout)
+                try:
+                    ok = bool(
+                        refresh_tco_team_velocity_snapshot(
+                            year=int(snap_year),
+                            include_prior_year=bool(snap_include_prior),
+                            reference_year_only=bool(snap_reference_only),
+                        )
+                    )
+                finally:
+                    if prev_query_timeout is None:
+                        os.environ.pop("MSSQL_QUERY_TIMEOUT", None)
+                    else:
+                        os.environ["MSSQL_QUERY_TIMEOUT"] = prev_query_timeout
+
+                lower_year = int(snap_year) if bool(snap_reference_only) else (int(snap_year) - 1 if bool(snap_include_prior) else int(snap_year))
+                n = None
+                try:
+                    cnt = fetch_df(
+                        """
+                        SELECT COUNT(*) AS N
+                        FROM TCO_TEAM_VELOCITY_SNAPSHOT
+                        WHERE TRY_CONVERT(INT, YEAR) <= %s
+                          AND TRY_CONVERT(INT, YEAR) >= %s
+                        """,
+                        (int(snap_year), int(lower_year)),
+                    )
+                    n = int(cnt.iloc[0]["N"]) if cnt is not None and not cnt.empty else 0
+                except Exception:
+                    n = None
+                if ok:
+                    if n is None:
+                        st.success("Velocity snapshot refreshed. Row count unavailable (post-refresh check timed out).")
+                    else:
+                        st.success(f"Velocity snapshot refreshed. Rows in window: {n:,d}.")
+                else:
+                    if n is None:
+                        st.warning("Velocity snapshot refresh finished with no changes. Row count unavailable.")
+                    else:
+                        st.warning(f"Velocity snapshot refresh finished with no changes. Rows in window: {n:,d}.")
+            except Exception as e:
+                st.error(f"Velocity snapshot refresh failed: {e}")
 
     # Try to read defaults from secrets if you added them
     try:
@@ -6264,12 +6357,99 @@ def render_ado_advanced_tab() -> None:
                         toast_success(f"Offline recompute complete. VW_TCO_FEATURE_DEMAND rows: {n:,d}.")
             else:
                 year = st.selectbox("Year", options=years, index=0, key="ado_po_year")
-                feats = load_explorer_feature_rows(
-                    years=[int(year)],
-                    cache_bust=int(st.session_state.get("ado_data_cache_bust", 0)),
+                run_feature_query = st.toggle(
+                    "Run feature-level explorer query (can be slow on large datasets)",
+                    value=False,
+                    key="ado_po_run_feature_query",
                 )
+                include_ado_enrichment = st.toggle(
+                    "Include ADO enrichment columns (slower)",
+                    value=False,
+                    key="ado_po_include_ado_enrichment",
+                    help=(
+                        "When enabled, joins ADO_FEATURES to populate APP/EPIC/AREA raw fields and "
+                        "story points in the explorer grid."
+                    ),
+                )
+                feature_query_paused = not bool(run_feature_query)
+                if not run_feature_query:
+                    st.info(
+                        "Feature-level query is paused. Enable the toggle above to load detailed Explorer rows "
+                        "for this year."
+                    )
+                    feats = pd.DataFrame()
+                else:
+                    def _is_timeout_error(exc: Exception) -> bool:
+                        msg = str(exc).lower()
+                        return ("hyt00" in msg) or ("timeout" in msg) or ("timed out" in msg)
 
-                if feats is None or feats.empty:
+                    explorer_timeout_raw = str(
+                        os.getenv("TCO_SETTINGS_EXPLORER_QUERY_TIMEOUT", "90") or "90"
+                    ).strip()
+                    try:
+                        explorer_timeout = int(explorer_timeout_raw)
+                    except Exception:
+                        explorer_timeout = 90
+                    if explorer_timeout <= 0:
+                        explorer_timeout = 90
+
+                    prev_query_timeout = os.getenv("MSSQL_QUERY_TIMEOUT")
+                    try:
+                        os.environ["MSSQL_QUERY_TIMEOUT"] = str(explorer_timeout)
+                        try:
+                            feats = load_explorer_feature_rows(
+                                years=[int(year)],
+                                cache_bust=int(st.session_state.get("ado_data_cache_bust", 0)),
+                                include_ado_enrichment=bool(include_ado_enrichment),
+                                include_velocity_column=True,
+                            )
+                        except Exception as e:
+                            if _is_timeout_error(e):
+                                st.warning(
+                                    f"Explorer query timed out at {explorer_timeout}s. "
+                                    "Retrying in fallback mode without velocity column."
+                                )
+                                try:
+                                    feats = load_explorer_feature_rows(
+                                        years=[int(year)],
+                                        cache_bust=int(st.session_state.get("ado_data_cache_bust", 0)),
+                                        include_ado_enrichment=False,
+                                        include_velocity_column=True,
+                                    )
+                                    st.info("Explorer loaded in fallback mode (ADO enrichment disabled for this run).")
+                                except Exception as e2:
+                                    st.warning(f"Explorer query failed for this scope: {e2}")
+                                    feats = pd.DataFrame()
+                            else:
+                                st.warning(f"Explorer query failed for this scope: {e}")
+                                feats = pd.DataFrame()
+                    finally:
+                        if prev_query_timeout is None:
+                            os.environ.pop("MSSQL_QUERY_TIMEOUT", None)
+                        else:
+                            os.environ["MSSQL_QUERY_TIMEOUT"] = prev_query_timeout
+
+                if feats is None or not isinstance(feats, pd.DataFrame):
+                    feats = pd.DataFrame()
+                feats = feats.copy()
+                # Defensive schema guard: older/backfilled environments may return partial frames.
+                for c in [
+                    "FEATURE_ID",
+                    "PROGRAMNAME",
+                    "TEAMNAME",
+                    "PI_LABEL",
+                    "DERIVED_FTE",
+                    "DERIVED_FTE_FEATURE",
+                    "DERIVED_FTE_FEATURE_VELOCITY",
+                    "SWAG_READY",
+                    "SWAG_POINTS",
+                ]:
+                    if c not in feats.columns:
+                        feats[c] = pd.Series([pd.NA] * len(feats), index=feats.index)
+
+                if feature_query_paused:
+                    st.caption("Feature-level explorer is paused.")
+                elif feats is None or feats.empty:
                     st.info("No in-scope features found for this year in Explorer v2.")
                 else:
                     # SWAG input (points) is now surfaced directly from the canonical Explorer v2 view as SWAG_POINTS.
@@ -6333,6 +6513,11 @@ def render_ado_advanced_tab() -> None:
                     filt["STORY_POINTS"] = pd.to_numeric(filt.get("SWAG_POINTS"), errors="coerce")
                 else:
                     filt["STORY_POINTS"] = pd.to_numeric(filt.get("STORY_POINTS"), errors="coerce")
+                    # In fast/fallback paths STORY_POINTS can be missing in source while SWAG_POINTS exists.
+                    if "SWAG_POINTS" in filt.columns:
+                        filt["STORY_POINTS"] = filt["STORY_POINTS"].fillna(
+                            pd.to_numeric(filt.get("SWAG_POINTS"), errors="coerce")
+                        )
                 filt["DERIVED_FTE"] = pd.to_numeric(
                     filt.get("DERIVED_FTE_FEATURE", filt.get("DERIVED_FTE")), errors="coerce"
                 )
@@ -6438,12 +6623,11 @@ def render_ado_advanced_tab() -> None:
                                 ),
                             }
                         )
-                        st.data_editor(
+                        st.dataframe(
                             flat_view,
                             use_container_width=True,
                             height=520,
                             hide_index=True,
-                            disabled=True,
                             column_config=column_config,
                         )
                     else:
@@ -6498,12 +6682,11 @@ def render_ado_advanced_tab() -> None:
                             summary_config["EPIC_ID"] = st.column_config.LinkColumn(
                                 "EPIC_ID", display_text=r".*/([^/]+)$"
                             )
-                            st.data_editor(
+                            st.dataframe(
                                 epic_summary[summary_cols] if summary_cols else epic_summary,
                                 use_container_width=True,
                                 height=320,
                                 hide_index=True,
-                                disabled=True,
                                 column_config=summary_config,
                             )
                         else:
@@ -6558,12 +6741,11 @@ def render_ado_advanced_tab() -> None:
                                 detail_config["FEATURE_ID"] = st.column_config.LinkColumn(
                                     "FEATURE_ID", display_text=r".*/([^/]+)$"
                                 )
-                                st.data_editor(
+                                st.dataframe(
                                     detail[detail_cols] if detail_cols else detail,
                                     use_container_width=True,
                                     height=520,
                                     hide_index=True,
-                                    disabled=True,
                                     column_config=detail_config,
                                 )
                             else:
