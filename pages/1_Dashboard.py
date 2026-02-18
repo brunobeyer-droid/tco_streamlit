@@ -2093,6 +2093,33 @@ def _build_capacity_demand_budget_series(
         "neg_fte_total": 0.0,
         "rate_by_pi_head": [],
     }
+
+    def _fallback_from_cost_lines() -> tuple[list[str], list[float], list[float], list[float], list[float], dict]:
+        staff_labels, staff_cost, staff_fte, staff_dbg = _build_staffing_series(
+            df_baseline_scope if isinstance(df_baseline_scope, pd.DataFrame) else pd.DataFrame()
+        )
+        dem_labels, dem_cost, dem_fte, dem_dbg = _build_demand_series(
+            df_expected_scope if isinstance(df_expected_scope, pd.DataFrame) else pd.DataFrame()
+        )
+        x2, cap_cost2, dem_cost2, cap_fte2, dem_fte2, merge_dbg = _merge_to_axis(
+            staff_labels,
+            staff_cost,
+            staff_fte,
+            dem_labels,
+            dem_cost,
+            dem_fte,
+        )
+        dbg = dict(debug)
+        dbg["status"] = "fallback_cost_lines" if x2 else "no_data"
+        dbg["capacity_source_mode"] = "cost_lines_fallback"
+        dbg["rows"] = int(staff_dbg.get("rows", 0) or 0)
+        dbg["total_capacity_fte"] = float(sum(cap_fte2) if cap_fte2 else 0.0)
+        dbg["total_demand_fte"] = float(sum(dem_fte2) if dem_fte2 else 0.0)
+        dbg["neg_cost_total"] = float(merge_dbg.get("neg_cost_total", 0.0) or 0.0)
+        dbg["neg_fte_total"] = float(merge_dbg.get("neg_fte_total", 0.0) or 0.0)
+        dbg["staff_debug"] = staff_dbg
+        dbg["demand_debug"] = dem_dbg
+        return x2, cap_fte2, dem_fte2, cap_cost2, dem_cost2, dbg
     staffing_df = pd.DataFrame()
     demand_df = pd.DataFrame()
 
@@ -2148,7 +2175,7 @@ def _build_capacity_demand_budget_series(
             raise
     debug["rows"] = int(staffing_df.shape[0]) if isinstance(staffing_df, pd.DataFrame) else 0
     if staffing_df is None or staffing_df.empty:
-        return [], [], [], [], [], debug
+        return _fallback_from_cost_lines()
 
     cap = staffing_df.copy()
     cap["PI_LABEL"] = (cap["YEAR"].astype("Int64").astype(str) + " I" + cap["PI"].astype("Int64").astype(str)).where(
@@ -2156,7 +2183,7 @@ def _build_capacity_demand_budget_series(
     )
     cap = cap.loc[cap["PI_LABEL"].fillna("").astype(str).str.strip().ne("")].copy()
     if cap.empty:
-        return [], [], [], [], [], debug
+        return _fallback_from_cost_lines()
 
     comp_norm = cap.get("COMPONENT", "").fillna("").astype(str).str.upper()
     allowed = comp_norm.isin(["DELIVERY", "CONTRACTOR C", "CONTRACTOR_C", "CONTRACTOR CS", "CONTRACTOR_CS"])
