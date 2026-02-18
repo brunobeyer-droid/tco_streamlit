@@ -42,6 +42,8 @@ from db import (
     fetch_ado_workitem_lookup,
     fetch_ado_workitem_lookup_by_type,
     upsert_ado_workitem_lookup,
+    refresh_tco_team_velocity_snapshot,
+    refresh_tco_projected_demand_snapshot,
 )
 from core.ado_profile import (
     get_active_ado_profile,
@@ -229,6 +231,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--filter", dest="filter_", default=os.getenv("ADO_FILTER"))
     p.add_argument("--max-pages", type=int, default=int(os.getenv("ADO_MAX_PAGES", "10")))
     p.add_argument("--url", default=os.getenv("ADO_URL", ""))
+    p.add_argument(
+        "--refresh-snapshots",
+        type=int,
+        choices=[0, 1],
+        default=int(os.getenv("ADO_SYNC_REFRESH_SNAPSHOTS", "1")),
+        help="Refresh velocity + demand snapshots after ADO_FEATURES upsert (default: 1).",
+    )
+    p.add_argument(
+        "--snapshot-year",
+        type=int,
+        default=int(os.getenv("ADO_SYNC_SNAPSHOT_YEAR", "0") or "0"),
+        help="Snapshot refresh anchor year (0 = infer from profile years_prefix/current year).",
+    )
     args = p.parse_args(argv)
 
     profile = get_active_ado_profile()
@@ -434,6 +449,42 @@ def main(argv: Optional[List[str]] = None) -> int:
     ensure_ado_minimal_tables()
     n = upsert_ado_features(df_norm)
     print(f"Upserted {n} row(s) into ADO_FEATURES.")
+    if int(args.refresh_snapshots or 0) == 1:
+        years_from_profile: List[int] = []
+        try:
+            y_pref = list(((profile or {}).get("filters") or {}).get("years_prefix") or [])
+            years_from_profile = [int(str(y).strip()) for y in y_pref if str(y).strip().isdigit()]
+        except Exception:
+            years_from_profile = []
+        year_hint = int(args.snapshot_year or 0)
+        if year_hint <= 0:
+            year_hint = max(years_from_profile) if years_from_profile else int(time.strftime("%Y"))
+        velocity_ok = False
+        demand_ok = False
+        try:
+            refresh_tco_team_velocity_snapshot(
+                year=year_hint,
+                include_prior_year=True,
+                reference_year_only=False,
+            )
+            velocity_ok = True
+        except Exception as e:
+            print(f"WARNING: velocity snapshot refresh failed: {e}", file=sys.stderr)
+        try:
+            refresh_tco_projected_demand_snapshot(
+                year=year_hint,
+                include_prior_year=True,
+                reference_year_only=False,
+            )
+            demand_ok = True
+        except Exception as e:
+            print(f"WARNING: projected demand snapshot refresh failed: {e}", file=sys.stderr)
+        print(
+            "Forecast snapshot refresh status: "
+            f"velocity={'ok' if velocity_ok else 'failed'}, "
+            f"demand={'ok' if demand_ok else 'failed'} "
+            f"(year window ending {year_hint})."
+        )
     return 0
 
 

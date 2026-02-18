@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
+import os
+import time
 from typing import Any, Dict, List, Optional, Tuple
 
 import pandas as pd
@@ -306,6 +309,45 @@ def _set_cost_query_warning(scope_key: str, message: Optional[str]) -> None:
         pass
 
 
+def _cost_query_circuit_until(scope_key: str) -> float:
+    try:
+        bucket = st.session_state.get("_cost_query_circuit_until", {})
+        if isinstance(bucket, dict):
+            val = bucket.get(scope_key)
+            return float(val) if val is not None else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+def _set_cost_query_circuit(scope_key: str, seconds: int) -> None:
+    try:
+        sec = max(0, int(seconds))
+    except Exception:
+        sec = 0
+    try:
+        bucket = st.session_state.setdefault("_cost_query_circuit_until", {})
+        if not isinstance(bucket, dict):
+            bucket = {}
+            st.session_state["_cost_query_circuit_until"] = bucket
+        if sec <= 0:
+            bucket.pop(scope_key, None)
+            return
+        bucket[scope_key] = float(time.time() + sec)
+    except Exception:
+        pass
+
+
+def _cost_query_circuit_seconds() -> int:
+    # Keep the protection, but default to a shorter window to reduce UX freeze in dev
+    # when a single transient timeout happens under narrow scopes.
+    raw = str(os.getenv("TCO_COST_QUERY_CIRCUIT_SECONDS", "60") or "").strip()
+    try:
+        return max(0, int(raw))
+    except Exception:
+        return 60
+
+
 def get_cost_query_warning(
     *,
     fiscal_year: Optional[int] = None,
@@ -537,51 +579,160 @@ def fetch_cost_for_movers(
 @cache_data_portfolio(ttl=300, show_spinner=False)
 def fetch_filter_options(data_version: Optional[int] = None) -> pd.DataFrame:
     _ = data_version
-    # Performance guardrail:
-    # Filter options are used to populate UI selectors and do not require cost-grain rows.
-    # Use feature-demand grain (much smaller) instead of workforce split to avoid blocking
-    # app startup under local SQL pressure.
-    sql = f"""
-      SELECT DISTINCT
-        TRY_CONVERT(INT, d.YEAR) AS YEAR,
-        TRY_CONVERT(INT, d.PI) AS PI,
-        d.PROGRAMNAME,
-        d.TEAMNAME,
-        COALESCE(d.GROUPNAME, '(Unmapped Application)') AS GROUPNAME,
-        CAST(NULL AS NVARCHAR(100)) AS SOURCE,
-        CAST(NULL AS NVARCHAR(200)) AS FEATURE_INVESTMENT_DIMENSION
-      FROM { _fq('VW_TCO_FEATURE_DEMAND') } d
-      WHERE COALESCE(d.IN_SCOPE_FOR_ROADMAP, 0) = 1
-    """
+    cols = [
+        "YEAR",
+        "PI",
+        "PROGRAMNAME",
+        "TEAMNAME",
+        "GROUPNAME",
+        "SOURCE",
+        "FEATURE_INVESTMENT_DIMENSION",
+    ]
+
+    def _augment_with_projected_snapshot_scope(df_in: pd.DataFrame, *, year_floor_val: int) -> pd.DataFrame:
+        """
+        Include scope rows from projected-demand snapshot so teams/programs that only
+        exist in ADO demand (but not headcount history) still show up in page filters.
+        """
+        sql_snap_scope = f"""
+          SELECT DISTINCT
+            TRY_CONVERT(INT, YEAR) AS YEAR,
+            TRY_CONVERT(INT, PI) AS PI,
+            PROGRAMNAME,
+            TEAMNAME,
+            GROUPNAME,
+            CAST(NULL AS NVARCHAR(255)) AS SOURCE,
+            CAST(NULL AS NVARCHAR(255)) AS FEATURE_INVESTMENT_DIMENSION
+          FROM { _fq('TCO_PROJECTED_DEMAND_SNAPSHOT') }
+          WHERE TRY_CONVERT(INT, YEAR) >= %s
+        """
+        try:
+            snap_df = fetch_df(sql_snap_scope, (int(year_floor_val),))
+        except Exception:
+            snap_df = None
+        if snap_df is None or snap_df.empty:
+            return df_in
+
+        base_df = df_in if isinstance(df_in, pd.DataFrame) else pd.DataFrame(columns=cols)
+        merged = pd.concat([base_df, snap_df], ignore_index=True)
+        for c in ("PROGRAMNAME", "TEAMNAME", "GROUPNAME"):
+            if c in merged.columns:
+                merged[c] = merged[c].fillna("").astype(str).str.strip()
+                merged.loc[merged[c].eq(""), c] = None
+        merged["YEAR"] = pd.to_numeric(merged.get("YEAR"), errors="coerce").astype("Int64")
+        merged["PI"] = pd.to_numeric(merged.get("PI"), errors="coerce").astype("Int64")
+        keep_cols = [c for c in cols if c in merged.columns]
+        merged = merged.drop_duplicates(subset=[c for c in ("YEAR", "PI", "PROGRAMNAME", "TEAMNAME", "GROUPNAME") if c in merged.columns])
+        return merged[keep_cols]
+    lookback_raw = str(os.getenv("TCO_FILTER_OPTIONS_YEAR_LOOKBACK", "5") or "").strip()
     try:
-        out = fetch_df(sql, None)
-        out_df = out if isinstance(out, pd.DataFrame) else pd.DataFrame()
-        if out_df.empty:
-            # Lightweight structural fallback (no cost math): keep selectors usable.
-            p = fetch_df(f"SELECT PROGRAMNAME FROM { _fq('PROGRAMS') }", None)
-            t = fetch_df(f"SELECT TEAMNAME FROM { _fq('TEAMS') }", None)
-            g = fetch_df(f"SELECT GROUPNAME FROM { _fq('APPLICATION_GROUPS') }", None)
-            pvals = [str(x).strip() for x in p.get("PROGRAMNAME", pd.Series(dtype=str)).dropna().tolist()] if isinstance(p, pd.DataFrame) else []
-            tvals = [str(x).strip() for x in t.get("TEAMNAME", pd.Series(dtype=str)).dropna().tolist()] if isinstance(t, pd.DataFrame) else []
-            gvals = [str(x).strip() for x in g.get("GROUPNAME", pd.Series(dtype=str)).dropna().tolist()] if isinstance(g, pd.DataFrame) else []
-            rows = []
-            for v in pvals:
-                if v:
-                    rows.append({"YEAR": None, "PI": None, "PROGRAMNAME": v, "TEAMNAME": None, "GROUPNAME": None, "SOURCE": None, "FEATURE_INVESTMENT_DIMENSION": None})
-            for v in tvals:
-                if v:
-                    rows.append({"YEAR": None, "PI": None, "PROGRAMNAME": None, "TEAMNAME": v, "GROUPNAME": None, "SOURCE": None, "FEATURE_INVESTMENT_DIMENSION": None})
-            for v in gvals:
-                if v:
-                    rows.append({"YEAR": None, "PI": None, "PROGRAMNAME": None, "TEAMNAME": None, "GROUPNAME": v, "SOURCE": None, "FEATURE_INVESTMENT_DIMENSION": None})
-            out_df = pd.DataFrame(rows, columns=[
-                "YEAR", "PI", "PROGRAMNAME", "TEAMNAME", "GROUPNAME", "SOURCE", "FEATURE_INVESTMENT_DIMENSION"
-            ])
-        return apply_display_scope_names(out_df)
+        lookback = max(0, int(lookback_raw))
     except Exception:
-        return pd.DataFrame(columns=[
-            "YEAR","PI","PROGRAMNAME","TEAMNAME","GROUPNAME","SOURCE","FEATURE_INVESTMENT_DIMENSION"
-        ])
+        lookback = 5
+    year_floor = int(dt.date.today().year) - int(lookback)
+
+    # Avoid DISTINCT over the large workforce split view (high CPU / timeout risk).
+    sql_primary = f"""
+      ;WITH year_team AS (
+        SELECT DISTINCT
+          TRY_CONVERT(INT, h.YEAR) AS YEAR,
+          TRY_CONVERT(INT, h.PI) AS PI,
+          t.TEAMID,
+          p.PROGRAMNAME,
+          t.TEAMNAME
+        FROM { _fq('TEAM_HEADCOUNT_HISTORY') } h
+        LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = h.TEAMID
+        LEFT JOIN { _fq('PROGRAMS') } p ON p.PROGRAMID = t.PROGRAMID
+        WHERE TRY_CONVERT(INT, h.YEAR) >= %s
+
+        UNION
+
+        SELECT DISTINCT
+          TRY_CONVERT(INT, c.YEAR) AS YEAR,
+          TRY_CONVERT(INT, c.PI) AS PI,
+          t.TEAMID,
+          p.PROGRAMNAME,
+          t.TEAMNAME
+        FROM { _fq('TEAM_CONTRACTOR_HEADCOUNT') } c
+        LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = c.TEAMID
+        LEFT JOIN { _fq('PROGRAMS') } p ON p.PROGRAMID = t.PROGRAMID
+        WHERE TRY_CONVERT(INT, c.YEAR) >= %s
+      )
+      SELECT DISTINCT
+        yt.YEAR,
+        yt.PI,
+        yt.PROGRAMNAME,
+        yt.TEAMNAME,
+        g.GROUPNAME,
+        CAST(NULL AS NVARCHAR(255)) AS SOURCE,
+        CAST(NULL AS NVARCHAR(255)) AS FEATURE_INVESTMENT_DIMENSION
+      FROM year_team yt
+      LEFT JOIN { _fq('APPLICATION_GROUPS') } g ON g.TEAMID = yt.TEAMID
+      WHERE yt.YEAR IS NOT NULL
+    """
+
+    sql_headcount_only = f"""
+      ;WITH year_team AS (
+        SELECT DISTINCT
+          TRY_CONVERT(INT, h.YEAR) AS YEAR,
+          TRY_CONVERT(INT, h.PI) AS PI,
+          t.TEAMID,
+          p.PROGRAMNAME,
+          t.TEAMNAME
+        FROM { _fq('TEAM_HEADCOUNT_HISTORY') } h
+        LEFT JOIN { _fq('TEAMS') } t ON t.TEAMID = h.TEAMID
+        LEFT JOIN { _fq('PROGRAMS') } p ON p.PROGRAMID = t.PROGRAMID
+        WHERE TRY_CONVERT(INT, h.YEAR) >= %s
+      )
+      SELECT DISTINCT
+        yt.YEAR,
+        yt.PI,
+        yt.PROGRAMNAME,
+        yt.TEAMNAME,
+        g.GROUPNAME,
+        CAST(NULL AS NVARCHAR(255)) AS SOURCE,
+        CAST(NULL AS NVARCHAR(255)) AS FEATURE_INVESTMENT_DIMENSION
+      FROM year_team yt
+      LEFT JOIN { _fq('APPLICATION_GROUPS') } g ON g.TEAMID = yt.TEAMID
+      WHERE yt.YEAR IS NOT NULL
+    """
+
+    sql_master_fallback = f"""
+      SELECT DISTINCT
+        CAST(%s AS INT) AS YEAR,
+        CAST(NULL AS INT) AS PI,
+        p.PROGRAMNAME,
+        t.TEAMNAME,
+        g.GROUPNAME,
+        CAST(NULL AS NVARCHAR(255)) AS SOURCE,
+        CAST(NULL AS NVARCHAR(255)) AS FEATURE_INVESTMENT_DIMENSION
+      FROM { _fq('TEAMS') } t
+      LEFT JOIN { _fq('PROGRAMS') } p ON p.PROGRAMID = t.PROGRAMID
+      LEFT JOIN { _fq('APPLICATION_GROUPS') } g ON g.TEAMID = t.TEAMID
+    """
+
+    out: Optional[pd.DataFrame] = None
+    try:
+        out = fetch_df(sql_primary, (int(year_floor), int(year_floor)))
+    except Exception:
+        out = None
+
+    if out is None:
+        try:
+            out = fetch_df(sql_headcount_only, (int(year_floor),))
+        except Exception:
+            out = None
+
+    if out is None or out.empty:
+        try:
+            out = fetch_df(sql_master_fallback, (int(dt.date.today().year),))
+        except Exception:
+            out = pd.DataFrame(columns=cols)
+
+    if out is None:
+        out = pd.DataFrame(columns=cols)
+    out = _augment_with_projected_snapshot_scope(out, year_floor_val=int(year_floor))
+    return apply_display_scope_names(out if isinstance(out, pd.DataFrame) else pd.DataFrame(columns=cols))
 
 
 @cache_data_portfolio(ttl=180, show_spinner=False)
@@ -1060,9 +1211,20 @@ def fetch_cost_lines(
         teams=teams,
         app_groups=app_groups,
     )
+    blocked_until = _cost_query_circuit_until(scope_key)
+    now_ts = float(time.time())
+    if blocked_until > now_ts:
+        wait_s = int(max(1, round(blocked_until - now_ts)))
+        warning = (
+            "Cost model temporarily throttled for this scope due recent DB timeout/error. "
+            f"Auto-retry in ~{wait_s}s."
+        )
+        _set_cost_query_warning(scope_key, warning)
+        return pd.DataFrame(columns=empty_cols)
 
     def _ok(df: pd.DataFrame) -> pd.DataFrame:
         _set_cost_query_warning(scope_key, None)
+        _set_cost_query_circuit(scope_key, 0)
         return df
 
     try:
@@ -1191,6 +1353,7 @@ def fetch_cost_lines(
                 + "; ".join(partial_errors)
             )
             _set_cost_query_warning(scope_key, warning)
+            _set_cost_query_circuit(scope_key, _cost_query_circuit_seconds())
             return out_all
         return _ok(out_all if out_all is not None else pd.DataFrame(columns=empty_cols))
     except Exception as exc:
@@ -1205,6 +1368,7 @@ def fetch_cost_lines(
         if err_msg:
             warning = f"{warning} ({err_name}: {err_msg})"
         _set_cost_query_warning(scope_key, warning)
+        _set_cost_query_circuit(scope_key, _cost_query_circuit_seconds())
         # Fail-open for UI availability: callers receive an empty canonical-shaped frame
         # instead of crashing the page on transient DB/query timeout issues.
         return pd.DataFrame(columns=empty_cols)
@@ -1414,6 +1578,7 @@ def fetch_ado_features(
         {_sel_or_null("EPIC_STATE", "EPIC_STATE", "NVARCHAR(100)")},
         {_sel_or_null("FEATURE_URL", "FEATURE_URL", "NVARCHAR(500)")},
         {_sel_or_null("EPIC_URL", "EPIC_URL", "NVARCHAR(500)")},
+        {_sel_or_null("FEATURE_INVESTMENT_DIMENSION", "FEATURE_INVESTMENT_DIMENSION", "NVARCHAR(255)")},
         {feature_progress_select},
         {epic_progress_select}
       FROM {_fq('VW_ADO_FEATURES_ENRICHED')} v
@@ -1552,6 +1717,7 @@ def fetch_ado_features_for_roadmap(
         {_sel_or_null("EPIC_STATE", "EPIC_STATE", "NVARCHAR(100)")},
         {_sel_or_null("FEATURE_URL", "FEATURE_URL", "NVARCHAR(500)")},
         {_sel_or_null("EPIC_URL", "EPIC_URL", "NVARCHAR(500)")},
+        {_sel_or_null("FEATURE_INVESTMENT_DIMENSION", "FEATURE_INVESTMENT_DIMENSION", "NVARCHAR(255)")},
         {feature_progress_select},
         {epic_progress_select}
       FROM {_fq('VW_ADO_FEATURES_ENRICHED')} v
@@ -1714,6 +1880,7 @@ def _fetch_ado_features_fallback(
         {_tbl_or_null("EPIC_STATE", "EPIC_STATE", "NVARCHAR(100)")},
         {_tbl_or_null("FEATURE_URL", "FEATURE_URL", "NVARCHAR(500)")},
         {_tbl_or_null("EPIC_URL", "EPIC_URL", "NVARCHAR(500)")},
+        {_tbl_or_null("FEATURE_INVESTMENT_DIMENSION", "FEATURE_INVESTMENT_DIMENSION", "NVARCHAR(255)")},
         {feature_progress_select},
         {epic_progress_select}
       FROM {_fq('ADO_FEATURES')} af

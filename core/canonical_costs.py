@@ -17,7 +17,8 @@ The app supports two scenario concepts:
 
 2) Projected (Expected)
    - Projected spend through the year.
-   - Workforce projected costs MUST be based on SWAG-derived Derived FTE only.
+   - Workforce projected costs MUST be based on Derived FTE demand from Explorer v2
+     (`DERIVED_FTE_FEATURE_VELOCITY` with fallback to `DERIVED_FTE_FEATURE`).
    - MSP costs MUST follow MSP-specific allocation logic and MUST NOT be computed via Derived FTE.
 
 3) Actual (Actuals) [optional]
@@ -26,11 +27,10 @@ The app supports two scenario concepts:
 
 Canonical database views used (Azure SQL)
 ----------------------------------------
-- `VW_TCO_WORKFORCE_SPLIT`: unified costs (WF + NWF) including ADO-derived workforce, invoices, MSP, program additional.
-  Backed by `VW_COSTS_AND_INVOICES` in the DB bootstrap (`db/mssql_backend.py`).
-- `VW_TCO_WF_LABOR_SPLIT`: feature×labor-type costs for ADO workload, built from SWAG-derived Derived FTE only
-  (excluding MSP features).
+- `VW_TCO_WF_LABOR_SPLIT`: feature×labor-type costs for ADO workload, built from velocity-aware Derived FTE
+  (`DERIVED_FTE_FEATURE_VELOCITY`, fallback to SWAG-derived `DERIVED_FTE_FEATURE`) and excluding MSP features.
 - `VW_MSP_COSTS`: MSP costs per PI/app group using MSP assignment + rate tables.
+- `VW_INVOICE_SPEND_PI` + `VW_PROGRAM_ADDITIONAL_COSTS_PI`: non-ADO/non-workforce PI costs.
 - `VW_TEAM_HEADCOUNT_EFFECTIVE` / `VW_TEAM_CONTRACTOR_HEADCOUNT_EFFECTIVE`: stable staffing plan headcount by team×PI.
 - `VW_TEAM_WEIGHTED_RATES`: effective per-PI rates by team (includes contractor rates).
 - `VW_PROGRAM_COMPOSITION_EFFECTIVE` + `VW_PROGRAM_RATE_EFFECTIVE`: program overhead headcount and rate for baseline overhead.
@@ -38,7 +38,7 @@ Canonical database views used (Azure SQL)
 Legacy/obsolete inputs intentionally avoided
 --------------------------------------------
 - Any manual/custom effort overrides from ADO are NOT used here.
-- Feature-level Projected costs are sourced from `VW_TCO_WF_LABOR_SPLIT` with SWAG-derived FTE only.
+- Feature-level Projected costs are sourced from `VW_TCO_WF_LABOR_SPLIT` using velocity-aware Derived FTE.
 """
 
 from dataclasses import dataclass
@@ -57,7 +57,10 @@ from core.nwf_program import (
 from core.nwf_taxonomy import normalize_nwf_subcomponent
 
 
-CANONICAL_COSTS_VERSION = "2026-01-02_expected_program_overhead_fix_v1"
+CANONICAL_COSTS_VERSION = "2026-02-17_projected_snapshot_velocity_p3"
+
+_PROJECTED_VELOCITY_READY: bool = False
+_PROJECTED_DEMAND_SNAPSHOT_READY: bool = False
 
 
 def _fq(name: str) -> str:
@@ -68,6 +71,247 @@ def _fq(name: str) -> str:
         return _db_fq(name)
     except Exception:
         return name
+
+
+def _normalize_projected_driver_mode(raw: Any, default: str = "SWAG") -> str:
+    s = str(raw or "").strip().upper()
+    if s in {"SNAPSHOT", "SNAPSHOT_VELOCITY", "VELOCITY"}:
+        return "SNAPSHOT_VELOCITY"
+    if s in {"SWAG", "DERIVED_FTE", "DERIVED_FTE_FEATURE"}:
+        return "SWAG"
+    return default
+
+
+def _boolish(raw: Any, default: bool = True) -> bool:
+    if isinstance(raw, bool):
+        return bool(raw)
+    s = str(raw or "").strip().lower()
+    if not s:
+        return bool(default)
+    if s in {"1", "true", "yes", "y", "on"}:
+        return True
+    if s in {"0", "false", "no", "n", "off"}:
+        return False
+    return bool(default)
+
+
+def _profile_projected_driver_settings(fetch: Optional[FetchFn]) -> tuple[str, bool]:
+    """Read projected driver settings from active ADO profile (best-effort)."""
+    default_mode = "SWAG"
+    default_row_fallback = True
+    if fetch is None:
+        return default_mode, default_row_fallback
+    q = """
+      SELECT TOP 1
+        UPPER(LTRIM(RTRIM(COALESCE(JSON_VALUE(CONFIG_JSON, '$.forecast.derived_fte_driver'), '')))) AS DRIVER_MODE,
+        LOWER(LTRIM(RTRIM(COALESCE(JSON_VALUE(CONFIG_JSON, '$.forecast.velocity_row_fallback'), '')))) AS ROW_FALLBACK
+      FROM ADO_PROFILES
+      WHERE IS_ACTIVE = 1
+      ORDER BY UPDATED_AT DESC
+    """
+    q_any = """
+      SELECT TOP 1
+        UPPER(LTRIM(RTRIM(COALESCE(JSON_VALUE(CONFIG_JSON, '$.forecast.derived_fte_driver'), '')))) AS DRIVER_MODE,
+        LOWER(LTRIM(RTRIM(COALESCE(JSON_VALUE(CONFIG_JSON, '$.forecast.velocity_row_fallback'), '')))) AS ROW_FALLBACK
+      FROM ADO_PROFILES
+      ORDER BY UPDATED_AT DESC
+    """
+    try:
+        df = fetch(q, None)
+    except Exception:
+        df = None
+    if df is None or df.empty:
+        try:
+            df = fetch(q_any, None)
+        except Exception:
+            df = None
+    if df is None or df.empty:
+        return default_mode, default_row_fallback
+    row = df.iloc[0]
+    mode = _normalize_projected_driver_mode(row.get("DRIVER_MODE"), default=default_mode)
+    row_fallback = _boolish(row.get("ROW_FALLBACK"), default=default_row_fallback)
+    return mode, row_fallback
+
+
+def _projected_fte_driver_mode(db: Any = None) -> str:
+    """Projected FTE demand driver mode.
+
+    Supported values:
+    - SNAPSHOT_VELOCITY: compute demand from SWAG points using
+      TEAM_VELOCITY_SNAPSHOT baseline points, fallback to global baseline.
+    - SWAG (default when not configured): stable path based on DERIVED_FTE_FEATURE.
+    """
+    env_raw = str(os.getenv("TCO_PROJECTED_FTE_DRIVER", "") or "").strip()
+    if env_raw:
+        return _normalize_projected_driver_mode(env_raw, default="SWAG")
+    fetch: Optional[FetchFn] = None
+    try:
+        fetch = _resolve_fetch(db) if db is not None else None
+    except Exception:
+        fetch = None
+    mode, _ = _profile_projected_driver_settings(fetch)
+    return mode
+
+
+def _projected_velocity_row_fallback_enabled(db: Any = None) -> bool:
+    """Whether snapshot mode can fallback row-by-row to global SWAG baseline points."""
+    env_raw = str(os.getenv("TCO_PROJECTED_VELOCITY_ROW_FALLBACK", "") or "").strip()
+    if env_raw:
+        return _boolish(env_raw, default=True)
+    fetch: Optional[FetchFn] = None
+    try:
+        fetch = _resolve_fetch(db) if db is not None else None
+    except Exception:
+        fetch = None
+    _, row_fallback = _profile_projected_driver_settings(fetch)
+    return bool(row_fallback)
+
+
+def _ensure_projected_velocity_snapshot_ready() -> None:
+    """Best-effort DDL guard so projected snapshot mode does not fail on missing table."""
+    global _PROJECTED_VELOCITY_READY
+    if _PROJECTED_VELOCITY_READY:
+        return
+    try:
+        from db import ensure_tco_team_velocity_snapshot_table  # type: ignore
+
+        if callable(ensure_tco_team_velocity_snapshot_table):
+            ensure_tco_team_velocity_snapshot_table()
+    except Exception:
+        # Keep fail-open behavior; query path still has SWAG fallback controls.
+        pass
+    _PROJECTED_VELOCITY_READY = True
+
+
+def _projected_demand_snapshot_enabled() -> bool:
+    raw = str(os.getenv("TCO_PROJECTED_DEMAND_SNAPSHOT_ENABLED", "1") or "").strip()
+    return _boolish(raw, default=True)
+
+
+def _projected_demand_snapshot_auto_refresh_enabled() -> bool:
+    raw = str(os.getenv("TCO_PROJECTED_DEMAND_SNAPSHOT_AUTO_REFRESH", "0") or "").strip()
+    return _boolish(raw, default=False)
+
+
+def _projected_demand_snapshot_strict_scope_enabled() -> bool:
+    raw = str(os.getenv("TCO_PROJECTED_DEMAND_SNAPSHOT_STRICT_SCOPE", "1") or "").strip()
+    return _boolish(raw, default=True)
+
+
+def _projected_velocity_failopen_enabled() -> bool:
+    # Reliability guardrail:
+    # when velocity snapshot rows are unavailable for the requested window/scope,
+    # fail-open to SWAG demand instead of returning zero projected WF.
+    raw = str(os.getenv("TCO_PROJECTED_VELOCITY_FAILOPEN_TO_SWAG", "1") or "").strip()
+    return _boolish(raw, default=True)
+
+
+def _ensure_projected_demand_snapshot_ready() -> None:
+    """Best-effort DDL guard for projected-demand snapshot reads."""
+    global _PROJECTED_DEMAND_SNAPSHOT_READY
+    if _PROJECTED_DEMAND_SNAPSHOT_READY:
+        return
+    try:
+        from db import ensure_tco_projected_demand_snapshot_table  # type: ignore
+
+        if callable(ensure_tco_projected_demand_snapshot_table):
+            ensure_tco_projected_demand_snapshot_table()
+    except Exception:
+        pass
+    _PROJECTED_DEMAND_SNAPSHOT_READY = True
+
+
+def _projected_demand_snapshot_available(
+    db: Any,
+    *,
+    years: Sequence[int],
+    pis: Sequence[int],
+    program_ids: Sequence[str],
+    team_ids: Sequence[str],
+) -> bool:
+    """Whether projected-demand snapshot has rows for current scope."""
+    if not _projected_demand_snapshot_enabled():
+        return False
+    try:
+        fetch = _resolve_fetch(db) if db is not None else None
+    except Exception:
+        fetch = None
+    if fetch is None:
+        return False
+
+    _ensure_projected_demand_snapshot_ready()
+
+    where_parts: list[str] = ["1=1"]
+    params: list[Any] = []
+    _add_in(where_parts, params, "s.YEAR", [int(y) for y in years])
+    _add_in(where_parts, params, "s.PI", [int(p) for p in pis])
+    _add_in(where_parts, params, "s.PROGRAMID", [str(v).strip() for v in program_ids if str(v).strip()])
+    _add_in(where_parts, params, "s.TEAMID", [str(v).strip() for v in team_ids if str(v).strip()])
+    exists_sql = f"""
+      SELECT TOP 1 1 AS OK
+      FROM {_fq('TCO_PROJECTED_DEMAND_SNAPSHOT')} s
+      WHERE {' AND '.join(where_parts)}
+    """
+    try:
+        probe = fetch(exists_sql, tuple(params) if params else None)
+    except Exception:
+        probe = None
+    if probe is not None and not probe.empty:
+        return True
+
+    # Optional one-shot refresh when scope is year-bounded.
+    if not _projected_demand_snapshot_auto_refresh_enabled():
+        return False
+    refresh_year = max([int(y) for y in years], default=0)
+    if refresh_year <= 0:
+        return False
+    try:
+        from db import refresh_tco_projected_demand_snapshot  # type: ignore
+
+        if callable(refresh_tco_projected_demand_snapshot):
+            refresh_tco_projected_demand_snapshot(
+                year=refresh_year,
+                include_prior_year=True,
+                reference_year_only=False,
+            )
+            probe = fetch(exists_sql, tuple(params) if params else None)
+            return bool(probe is not None and not probe.empty)
+    except Exception:
+        return False
+    return False
+
+
+def _projected_velocity_snapshot_available(
+    db: Any,
+    *,
+    years: Sequence[int],
+    pis: Sequence[int],
+    team_ids: Sequence[str],
+) -> bool:
+    """Whether team velocity snapshot has rows for the requested window/scope."""
+    if db is None:
+        # Keep deterministic SQL generation for unit tests and non-DB callers.
+        return True
+    try:
+        fetch = _resolve_fetch(db)
+    except Exception:
+        return True
+
+    where_parts: list[str] = ["1=1"]
+    params: list[Any] = []
+    _add_in(where_parts, params, "TRY_CONVERT(INT, s.YEAR)", [int(y) for y in years])
+    _add_in(where_parts, params, "TRY_CONVERT(INT, s.PI)", [int(p) for p in pis])
+    _add_in(where_parts, params, "s.TEAMID", [str(v).strip() for v in team_ids if str(v).strip()])
+    sql = f"""
+      SELECT TOP 1 1 AS OK
+      FROM {_fq('TCO_TEAM_VELOCITY_SNAPSHOT')} s
+      WHERE {' AND '.join(where_parts)}
+    """
+    try:
+        probe = fetch(sql, tuple(params) if params else None)
+        return bool(probe is not None and not probe.empty)
+    except Exception:
+        return False
 
 
 FetchFn = Callable[[str, Optional[Iterable[Any]]], pd.DataFrame]
@@ -447,7 +691,8 @@ def get_cost_lines(
             out["ALLOCATION_DRIVER"] = ""
         if "SHARE" not in out.columns:
             out["SHARE"] = pd.Series([pd.NA] * len(out.index), dtype="Float64")
-        # Demand driver contract: pages should consume FTE only (SWAG-derived demand for Projected).
+        # Demand driver contract: pages should consume FTE only
+        # (snapshot-velocity demand for Projected, with controlled fallback).
         if "FTE" not in out.columns:
             out["FTE"] = pd.Series([pd.NA] * len(out.index), dtype="Float64")
         out["FTE"] = pd.to_numeric(out["FTE"], errors="coerce")
@@ -541,17 +786,7 @@ def get_cost_lines(
         CAST(FTE AS FLOAT) AS FTE
       FROM base
     """
-    try:
-        out = fetch(select_sql, params)
-    except Exception:
-        allow_snapshot_fallback = (
-            spec.name == "Projected"
-            and str(os.getenv("TCO_PROJECTED_COST_FAILOPEN_SNAPSHOT", "1") or "1").strip().lower() in {"1", "true", "yes"}
-        )
-        if not allow_snapshot_fallback:
-            raise
-        snap_sql, snap_params = _projected_cost_lines_snapshot_sql(filters_for_sql)
-        out = fetch(snap_sql, snap_params)
+    out = fetch(select_sql, params)
     if out is None:
         out = pd.DataFrame(
             columns=[
@@ -1024,7 +1259,7 @@ def _dedupe_str_list(values: Sequence[str]) -> list[str]:
 
 def _normalize_scope_filters(filters: Optional[Filters]) -> dict[str, Any]:
     f = dict(filters or {})
-    for key in ("program", "team", "app_group"):
+    for key in ("program", "team", "app_group", "program_id", "team_id"):
         vals: list[str] = []
         for v in _as_list(f.get(key)):
             clean = _clean_scope_text(v)
@@ -1058,7 +1293,19 @@ def _expand_named_scope_values(
             None,
         )
     except Exception:
-        return
+        # Backward compatibility: some schemas do not expose *_DISPLAY_NAME yet.
+        try:
+            df = fetch(
+                f"""
+                SELECT
+                  LTRIM(RTRIM({raw_col})) AS RAW_NAME,
+                  CAST(NULL AS NVARCHAR(512)) AS DISPLAY_NAME
+                FROM {_fq(table)}
+                """,
+                None,
+            )
+        except Exception:
+            return
     if df is None or df.empty:
         return
 
@@ -1112,6 +1359,87 @@ def _resolve_scope_filters_with_aliases(db: Any, filters: Optional[Filters]) -> 
         display_col="TEAM_DISPLAY_NAME",
         filters=f,
     )
+    # Resolve stable IDs for projected-demand filtering. ID predicates are cheaper
+    # than case-insensitive name predicates on large demand views.
+    def _resolve_ids(
+        *,
+        table: str,
+        id_col: str,
+        raw_col: str,
+        display_col: str,
+        selected_names: list[str],
+    ) -> list[str]:
+        if not selected_names:
+            return []
+        try:
+            df = fetch(
+                f"""
+                SELECT
+                  LTRIM(RTRIM({id_col})) AS ENTITY_ID,
+                  LTRIM(RTRIM({raw_col})) AS RAW_NAME,
+                  LTRIM(RTRIM({display_col})) AS DISPLAY_NAME
+                FROM {_fq(table)}
+                """,
+                None,
+            )
+        except Exception:
+            # Backward compatibility: resolve IDs using raw names when display column is unavailable.
+            try:
+                df = fetch(
+                    f"""
+                    SELECT
+                      LTRIM(RTRIM({id_col})) AS ENTITY_ID,
+                      LTRIM(RTRIM({raw_col})) AS RAW_NAME,
+                      CAST(NULL AS NVARCHAR(512)) AS DISPLAY_NAME
+                    FROM {_fq(table)}
+                    """,
+                    None,
+                )
+            except Exception:
+                return []
+        if df is None or df.empty:
+            return []
+        key_to_ids: dict[str, list[str]] = {}
+        for _, r in df.iterrows():
+            entity_id = _clean_scope_text(r.get("ENTITY_ID"))
+            if not entity_id:
+                continue
+            keys = set()
+            keys.update(_normalize_scope_key_variants(r.get("RAW_NAME")))
+            keys.update(_normalize_scope_key_variants(r.get("DISPLAY_NAME")))
+            for key in keys:
+                bucket = key_to_ids.setdefault(key, [])
+                bucket.append(entity_id)
+        out: list[str] = []
+        seen: set[str] = set()
+        for name in selected_names:
+            for key in _normalize_scope_key_variants(name):
+                for entity_id in key_to_ids.get(key, []):
+                    if entity_id in seen:
+                        continue
+                    seen.add(entity_id)
+                    out.append(entity_id)
+        return out
+
+    program_ids = _resolve_ids(
+        table="PROGRAMS",
+        id_col="PROGRAMID",
+        raw_col="PROGRAMNAME",
+        display_col="PROGRAM_DISPLAY_NAME",
+        selected_names=[str(v) for v in _as_list(f.get("program")) if str(v).strip()],
+    )
+    if program_ids:
+        f["program_id"] = _dedupe_str_list(program_ids)
+
+    team_ids = _resolve_ids(
+        table="TEAMS",
+        id_col="TEAMID",
+        raw_col="TEAMNAME",
+        display_col="TEAM_DISPLAY_NAME",
+        selected_names=[str(v) for v in _as_list(f.get("team")) if str(v).strip()],
+    )
+    if team_ids:
+        f["team_id"] = _dedupe_str_list(team_ids)
     return f
 
 
@@ -1211,59 +1539,674 @@ def _labor_bucket_series(df: pd.DataFrame, source_col: str = "SOURCE", sub_col: 
     return out
 
 
-def _projected_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]]:
-    where_sql, params = _build_where(filters, year_col="YEAR", pi_col="PI")
+def _projected_cost_lines_sql(filters: Optional[Filters], *, db: Any = None) -> tuple[str, list[Any]]:
+    # Keep app-group filtering after base-group split. If we filter GROUPNAME before split,
+    # rows from base groups can be incorrectly dropped before they are redistributed.
+    f = filters or {}
+    years = [int(y) for y in _as_list(f.get("year")) if str(y).strip().isdigit()]
+    pis = [int(p) for p in _as_list(f.get("pi")) if str(p).strip().isdigit()]
+    programs = [str(p).strip() for p in _as_list(f.get("program")) if str(p).strip()]
+    teams = [str(t).strip() for t in _as_list(f.get("team")) if str(t).strip()]
+    program_ids = [str(p).strip() for p in _as_list(f.get("program_id")) if str(p).strip()]
+    team_ids = [str(t).strip() for t in _as_list(f.get("team_id")) if str(t).strip()]
+    groups = [str(g).strip() for g in _as_list(f.get("app_group")) if str(g).strip()]
+    snapshot_enabled = _projected_demand_snapshot_enabled()
+    strict_scope_snapshot = (
+        snapshot_enabled
+        and _projected_demand_snapshot_strict_scope_enabled()
+        and bool(programs or teams or program_ids or team_ids)
+    )
+    snapshot_available = False
+    if snapshot_enabled and not strict_scope_snapshot:
+        snapshot_available = _projected_demand_snapshot_available(
+            db,
+            years=years,
+            pis=pis,
+            program_ids=program_ids,
+            team_ids=team_ids,
+        )
+    use_demand_snapshot = snapshot_enabled and (strict_scope_snapshot or snapshot_available)
+
+    d_where_parts: list[str] = ["COALESCE(d.IN_SCOPE_FOR_ROADMAP, 0) = 1"]
+    d_params: list[Any] = []
+    _add_in(d_where_parts, d_params, "d.YEAR", years)
+    _add_in(d_where_parts, d_params, "d.PI", pis)
+    d_where_sql = " AND ".join(d_where_parts)
+    # Push program/team filters into ADO demand extraction to avoid scanning full-year
+    # feature volume when the user is already in a narrower scope.
+    # Keep app-group filter out of this stage because base-group split happens later.
+    d_scope_where_parts: list[str] = []
+    d_scope_params: list[Any] = []
+    if program_ids:
+        _add_in(d_scope_where_parts, d_scope_params, "d.PROGRAMID", program_ids)
+    elif programs:
+        vals = [str(v).strip().upper() for v in programs if str(v).strip()]
+        if vals:
+            placeholders = ", ".join(["%s"] * len(vals))
+            d_scope_where_parts.append(
+                f"d.PROGRAMID IN (SELECT p.PROGRAMID FROM {_fq('PROGRAMS')} p WHERE UPPER(p.PROGRAMNAME) IN ({placeholders}))"
+            )
+            d_scope_params.extend(vals)
+    if team_ids:
+        _add_in(d_scope_where_parts, d_scope_params, "d.TEAMID", team_ids)
+    elif teams:
+        vals = [str(v).strip().upper() for v in teams if str(v).strip()]
+        if vals:
+            placeholders = ", ".join(["%s"] * len(vals))
+            d_scope_where_parts.append(
+                f"d.TEAMID IN (SELECT t.TEAMID FROM {_fq('TEAMS')} t WHERE UPPER(t.TEAMNAME) IN ({placeholders}))"
+            )
+            d_scope_params.extend(vals)
+    d_scope_sql = (" AND " + " AND ".join(d_scope_where_parts)) if d_scope_where_parts else ""
+
+    ds_where_parts: list[str] = ["1=1"]
+    ds_params: list[Any] = []
+    _add_in(ds_where_parts, ds_params, "ds.YEAR", years)
+    _add_in(ds_where_parts, ds_params, "ds.PI", pis)
+    if program_ids:
+        _add_in(ds_where_parts, ds_params, "ds.PROGRAMID", program_ids)
+    elif programs:
+        _add_in(ds_where_parts, ds_params, "ds.PROGRAMNAME", programs, upper=True)
+    if team_ids:
+        _add_in(ds_where_parts, ds_params, "ds.TEAMID", team_ids)
+    elif teams:
+        _add_in(ds_where_parts, ds_params, "ds.TEAMNAME", teams, upper=True)
+    ds_where_sql = " AND ".join(ds_where_parts)
+
+    c_where_parts: list[str] = ["1=1"]
+    c_params: list[Any] = []
+    _add_in(c_where_parts, c_params, "c.YEAR", years)
+    _add_in(c_where_parts, c_params, "c.PI", pis)
+    c_where_sql = " AND ".join(c_where_parts)
+
+    r_where_parts: list[str] = ["1=1"]
+    r_params: list[Any] = []
+    _add_in(r_where_parts, r_params, "r.YEAR", years)
+    _add_in(r_where_parts, r_params, "r.PI", pis)
+    r_where_sql = " AND ".join(r_where_parts)
+
+    base_where_parts: list[str] = ["1=1"]
+    base_where_params: list[Any] = []
+    if program_ids:
+        _add_in(base_where_parts, base_where_params, "PROGRAMID", program_ids)
+    elif programs:
+        vals = [str(v).strip().upper() for v in programs if str(v).strip()]
+        if vals:
+            placeholders = ", ".join(["%s"] * len(vals))
+            base_where_parts.append(
+                f"PROGRAMID IN (SELECT p.PROGRAMID FROM {_fq('PROGRAMS')} p WHERE UPPER(p.PROGRAMNAME) IN ({placeholders}))"
+            )
+            base_where_params.extend(vals)
+    if team_ids:
+        _add_in(base_where_parts, base_where_params, "TEAMID", team_ids)
+    elif teams:
+        vals = [str(v).strip().upper() for v in teams if str(v).strip()]
+        if vals:
+            placeholders = ", ".join(["%s"] * len(vals))
+            base_where_parts.append(
+                f"TEAMID IN (SELECT t.TEAMID FROM {_fq('TEAMS')} t WHERE UPPER(t.TEAMNAME) IN ({placeholders}))"
+            )
+            base_where_params.extend(vals)
+    _add_in(base_where_parts, base_where_params, "GROUPNAME", groups, upper=True)
+    base_where_sql = " AND ".join(base_where_parts)
+
+    non_ado_where_parts: list[str] = ["1=1"]
+    non_ado_params: list[Any] = []
+    _add_in(non_ado_where_parts, non_ado_params, "YEAR", years)
+    _add_in(non_ado_where_parts, non_ado_params, "PI", pis)
+    if program_ids:
+        _add_in(non_ado_where_parts, non_ado_params, "PROGRAMID", program_ids)
+    elif programs:
+        vals = [str(v).strip().upper() for v in programs if str(v).strip()]
+        if vals:
+            placeholders = ", ".join(["%s"] * len(vals))
+            non_ado_where_parts.append(
+                f"PROGRAMID IN (SELECT p.PROGRAMID FROM {_fq('PROGRAMS')} p WHERE UPPER(p.PROGRAMNAME) IN ({placeholders}))"
+            )
+            non_ado_params.extend(vals)
+    if team_ids:
+        _add_in(non_ado_where_parts, non_ado_params, "TEAMID", team_ids)
+    elif teams:
+        vals = [str(v).strip().upper() for v in teams if str(v).strip()]
+        if vals:
+            placeholders = ", ".join(["%s"] * len(vals))
+            non_ado_where_parts.append(
+                f"TEAMID IN (SELECT t.TEAMID FROM {_fq('TEAMS')} t WHERE UPPER(t.TEAMNAME) IN ({placeholders}))"
+            )
+            non_ado_params.extend(vals)
+    _add_in(non_ado_where_parts, non_ado_params, "GROUPNAME", groups, upper=True)
+    non_ado_where_sql = " AND ".join(non_ado_where_parts)
+
+    fte_driver_mode = _projected_fte_driver_mode(db)
+    requested_snapshot_velocity = fte_driver_mode == "SNAPSHOT_VELOCITY"
+    velocity_snapshot_available = True
+    if requested_snapshot_velocity and _projected_velocity_failopen_enabled():
+        velocity_snapshot_available = _projected_velocity_snapshot_available(
+            db,
+            years=years,
+            pis=pis,
+            team_ids=team_ids,
+        )
+    use_snapshot_velocity = requested_snapshot_velocity and velocity_snapshot_available
+    row_fallback_enabled = _projected_velocity_row_fallback_enabled(db)
+    baseline_points_expr = (
+        "COALESCE(sv.EFFECTIVE_BASELINE_POINTS, gb.GLOBAL_BASELINE_POINTS)"
+        if row_fallback_enabled
+        else "sv.EFFECTIVE_BASELINE_POINTS"
+    )
+    snapshot_row_guard = (
+        ""
+        if row_fallback_enabled
+        else "AND COALESCE(TRY_CONVERT(FLOAT, sv.EFFECTIVE_BASELINE_POINTS), 0.0) > 0"
+    )
+    if use_snapshot_velocity:
+        snapshot_where_parts: list[str] = ["1=1"]
+        snapshot_params: list[Any] = []
+        _add_in(snapshot_where_parts, snapshot_params, "TRY_CONVERT(INT, v.YEAR)", years)
+        _add_in(snapshot_where_parts, snapshot_params, "TRY_CONVERT(INT, v.PI)", pis)
+        snapshot_where_sql = " AND ".join(snapshot_where_parts)
+        if use_demand_snapshot:
+            src_sql = f"""
+      src AS (
+        -- Snapshot velocity mode with persisted demand source.
+        SELECT
+          ds.PROGRAMID,
+          ds.PROGRAMNAME,
+          ds.TEAMID,
+          ds.TEAMNAME,
+          ds.GROUPID,
+          ds.GROUPNAME,
+          ds.YEAR,
+          ds.PI,
+          CAST(COALESCE(TRY_CONVERT(FLOAT, ds.SWAG_POINTS_SUM), 0.0) AS FLOAT) AS SWAG_POINTS_SUM
+        FROM {_fq('TCO_PROJECTED_DEMAND_SNAPSHOT')} ds
+        WHERE {ds_where_sql}
+          AND COALESCE(TRY_CONVERT(FLOAT, ds.SWAG_POINTS_SUM), 0.0) > 0
+      ),
+            """.rstrip()
+            src_params = ds_params
+        else:
+            src_sql = f"""
+      src AS (
+        -- Snapshot velocity mode:
+        -- Aggregate SWAG demand first (program/team/group/year/pi), then apply the
+        -- velocity baseline once per aggregate row.
+        SELECT
+          d.PROGRAMID,
+          d.PROGRAMNAME,
+          d.TEAMID,
+          d.TEAMNAME,
+          d.GROUPID,
+          d.GROUPNAME,
+          TRY_CONVERT(INT, d.YEAR) AS YEAR,
+          TRY_CONVERT(INT, d.PI) AS PI,
+          CAST(SUM(COALESCE(TRY_CONVERT(FLOAT, d.SWAG_POINTS), 0.0)) AS FLOAT) AS SWAG_POINTS_SUM
+        FROM {_fq('VW_TCO_FEATURE_DEMAND')} d
+        WHERE {d_where_sql}
+          AND COALESCE(d.IS_MSP_FEATURE, 0) = 0
+          AND COALESCE(TRY_CONVERT(FLOAT, d.SWAG_POINTS), 0.0) > 0
+          {d_scope_sql}
+        GROUP BY
+          d.PROGRAMID,
+          d.PROGRAMNAME,
+          d.TEAMID,
+          d.TEAMNAME,
+          d.GROUPID,
+          d.GROUPNAME,
+          TRY_CONVERT(INT, d.YEAR),
+          TRY_CONVERT(INT, d.PI)
+      ),
+            """.rstrip()
+            src_params = d_params + d_scope_params
+        demand_with_prefix = f"""
+      ;WITH global_baseline AS (
+        SELECT
+          CAST(
+            COALESCE(
+              (
+                SELECT TOP 1 TRY_CONVERT(FLOAT, JSON_VALUE(ap.CONFIG_JSON, '$.swag.points_per_fte'))
+                FROM {_fq('ADO_PROFILES')} ap
+                WHERE COALESCE(ap.IS_ACTIVE, 0) = 1
+                ORDER BY ap.UPDATED_AT DESC
+              ),
+              (
+                SELECT TOP 1 TRY_CONVERT(FLOAT, JSON_VALUE(ap.CONFIG_JSON, '$.swag.points_per_fte'))
+                FROM {_fq('ADO_PROFILES')} ap
+                ORDER BY ap.UPDATED_AT DESC
+              ),
+              65.0
+            ) AS FLOAT
+          ) AS GLOBAL_BASELINE_POINTS
+      ),
+      snapshot AS (
+        SELECT
+          COALESCE(NULLIF(LTRIM(RTRIM(v.TEAMID)), ''), 'UNKNOWN') AS TEAMID,
+          TRY_CONVERT(INT, v.YEAR) AS YEAR,
+          TRY_CONVERT(INT, v.PI) AS PI,
+          TRY_CONVERT(FLOAT, v.EFFECTIVE_BASELINE_POINTS) AS EFFECTIVE_BASELINE_POINTS
+        FROM {_fq('TCO_TEAM_VELOCITY_SNAPSHOT')} v
+        WHERE {snapshot_where_sql}
+      ),
+      {src_sql}
+      d AS (
+        -- Use team-level baseline points from velocity snapshot and compute demand from SWAG points.
+        -- Fallback to global baseline only when snapshot rows are unavailable.
+        SELECT
+          src.PROGRAMID,
+          src.PROGRAMNAME,
+          src.TEAMID,
+          src.TEAMNAME,
+          src.GROUPID,
+          src.GROUPNAME,
+          src.YEAR,
+          src.PI,
+          CAST(
+            COALESCE(
+              src.SWAG_POINTS_SUM / NULLIF({baseline_points_expr}, 0.0),
+              0.0
+            ) AS FLOAT
+          ) AS DEMAND_DERIVED_FTE
+        FROM src
+        CROSS JOIN global_baseline gb
+        LEFT JOIN snapshot sv
+          ON sv.TEAMID = COALESCE(NULLIF(LTRIM(RTRIM(src.TEAMID)), ''), 'UNKNOWN')
+         AND sv.YEAR = src.YEAR
+         AND sv.PI = src.PI
+        WHERE 1=1
+          {snapshot_row_guard}
+      ),
+        """.rstrip()
+        demand_params: list[Any] = snapshot_params + src_params
+    else:
+        if use_demand_snapshot:
+            demand_with_prefix = f"""
+      ;WITH d AS (
+        -- Legacy SWAG mode with persisted demand source.
+        SELECT
+          ds.PROGRAMID,
+          ds.PROGRAMNAME,
+          ds.TEAMID,
+          ds.TEAMNAME,
+          ds.GROUPID,
+          ds.GROUPNAME,
+          ds.YEAR,
+          ds.PI,
+          CAST(COALESCE(TRY_CONVERT(FLOAT, ds.DERIVED_FTE_SUM), 0.0) AS FLOAT) AS DEMAND_DERIVED_FTE
+        FROM {_fq('TCO_PROJECTED_DEMAND_SNAPSHOT')} ds
+        WHERE {ds_where_sql}
+          AND COALESCE(TRY_CONVERT(FLOAT, ds.DERIVED_FTE_SUM), 0.0) > 0
+      ),
+        """.rstrip()
+            demand_params = ds_params
+        else:
+            demand_with_prefix = f"""
+      ;WITH d AS (
+        -- Legacy SWAG mode:
+        -- Keep projected path available by using stable SWAG-derived feature demand.
+        SELECT
+          d.PROGRAMID,
+          d.PROGRAMNAME,
+          d.TEAMID,
+          d.TEAMNAME,
+          d.GROUPID,
+          d.GROUPNAME,
+          TRY_CONVERT(INT, d.YEAR) AS YEAR,
+          TRY_CONVERT(INT, d.PI) AS PI,
+          CAST(SUM(COALESCE(TRY_CONVERT(FLOAT, d.DERIVED_FTE_FEATURE), 0.0)) AS FLOAT) AS DEMAND_DERIVED_FTE
+        FROM {_fq('VW_TCO_FEATURE_DEMAND')} d
+        WHERE {d_where_sql}
+          AND COALESCE(d.IS_MSP_FEATURE, 0) = 0
+          AND COALESCE(TRY_CONVERT(FLOAT, d.DERIVED_FTE_FEATURE), 0.0) > 0
+          {d_scope_sql}
+        GROUP BY
+          d.PROGRAMID,
+          d.PROGRAMNAME,
+          d.TEAMID,
+          d.TEAMNAME,
+          d.GROUPID,
+          d.GROUPNAME,
+          TRY_CONVERT(INT, d.YEAR),
+          TRY_CONVERT(INT, d.PI)
+      ),
+        """.rstrip()
+            demand_params = d_params + d_scope_params
+
     sql = f"""
-      ;WITH base AS (
+      {demand_with_prefix}
+      c AS (
+        SELECT
+          c.YEAR,
+          c.PI,
+          c.TEAMID,
+          c.HC_TEAM,
+          c.HC_DELIVERY,
+          c.HC_CONTRACTOR_C,
+          c.HC_CONTRACTOR_CS,
+          c.HC_TOTAL_LABOR
+        FROM {_fq('VW_TCO_TEAM_LABOR_COMPOSITION')} c
+        WHERE {c_where_sql}
+      ),
+      r AS (
+        SELECT
+          r.TEAMID,
+          r.YEAR,
+          r.PI,
+          r.TEAM_RATE,
+          r.DELIVERY_RATE,
+          r.CONTRACTOR_C_RATE,
+          r.CONTRACTOR_CS_RATE
+        FROM {_fq('VW_TEAM_WEIGHTED_RATES')} r
+        WHERE {r_where_sql}
+      ),
+      joined AS (
+        SELECT
+          d.PROGRAMID,
+          d.PROGRAMNAME,
+          d.TEAMID,
+          d.TEAMNAME,
+          d.GROUPID,
+          d.GROUPNAME,
+          d.YEAR,
+          d.PI,
+          d.DEMAND_DERIVED_FTE,
+          COALESCE(c.HC_TEAM, 0) AS HC_TEAM,
+          COALESCE(c.HC_DELIVERY, 0) AS HC_DELIVERY,
+          COALESCE(c.HC_CONTRACTOR_C, 0) AS HC_CONTRACTOR_C,
+          COALESCE(c.HC_CONTRACTOR_CS, 0) AS HC_CONTRACTOR_CS,
+          COALESCE(c.HC_TOTAL_LABOR, 0) AS HC_TOTAL_LABOR,
+          COALESCE(r.TEAM_RATE, 0) AS TEAM_RATE,
+          COALESCE(r.DELIVERY_RATE, 0) AS DELIVERY_RATE,
+          COALESCE(r.CONTRACTOR_C_RATE, 0) AS CONTRACTOR_C_RATE,
+          COALESCE(r.CONTRACTOR_CS_RATE, 0) AS CONTRACTOR_CS_RATE
+        FROM d
+        LEFT JOIN c ON c.TEAMID = d.TEAMID AND c.YEAR = d.YEAR AND c.PI = d.PI
+        LEFT JOIN r ON r.TEAMID = d.TEAMID AND r.YEAR = d.YEAR AND r.PI = d.PI
+      ),
+      weights AS (
+        SELECT
+          *,
+          CASE WHEN HC_TOTAL_LABOR > 0 THEN HC_TEAM / HC_TOTAL_LABOR ELSE 0 END AS W_TEAM,
+          CASE WHEN HC_TOTAL_LABOR > 0 THEN HC_DELIVERY / HC_TOTAL_LABOR ELSE 0 END AS W_DELIVERY,
+          CASE WHEN HC_TOTAL_LABOR > 0 THEN HC_CONTRACTOR_C / HC_TOTAL_LABOR ELSE 0 END AS W_CONTRACTOR_C,
+          CASE WHEN HC_TOTAL_LABOR > 0 THEN HC_CONTRACTOR_CS / HC_TOTAL_LABOR ELSE 0 END AS W_CONTRACTOR_CS
+        FROM joined
+      ),
+      ado_labor_raw AS (
+        SELECT
+          'ADO' AS SOURCE,
+          v.COST_CATEGORY,
+          v.SUBCOMPONENT,
+          w.PROGRAMID,
+          w.PROGRAMNAME,
+          w.TEAMID,
+          w.TEAMNAME,
+          w.GROUPID,
+          w.GROUPNAME,
+          w.YEAR,
+          w.PI,
+          CAST((w.DEMAND_DERIVED_FTE * v.WEIGHT * v.RATE) AS DECIMAL(18,2)) AS AMOUNT,
+          CAST((w.DEMAND_DERIVED_FTE * v.WEIGHT) AS FLOAT) AS FTE
+        FROM weights w
+        CROSS APPLY (
+          VALUES
+            (CAST('WORK_FORCE' AS NVARCHAR(50)), CAST('Team' AS NVARCHAR(255)), w.W_TEAM, w.TEAM_RATE),
+            (CAST('WORK_FORCE' AS NVARCHAR(50)), CAST('Delivery Team' AS NVARCHAR(255)), w.W_DELIVERY, w.DELIVERY_RATE),
+            (CAST('WORK_FORCE' AS NVARCHAR(50)), CAST('Contractor C' AS NVARCHAR(255)), w.W_CONTRACTOR_C, w.CONTRACTOR_C_RATE),
+            (CAST('NON_WORK_FORCE' AS NVARCHAR(50)), CAST('Contractor CS' AS NVARCHAR(255)), w.W_CONTRACTOR_CS, w.CONTRACTOR_CS_RATE)
+        ) v(COST_CATEGORY, SUBCOMPONENT, WEIGHT, RATE)
+        WHERE COALESCE(w.DEMAND_DERIVED_FTE, 0) > 0
+      ),
+      ado_labor AS (
         SELECT
           SOURCE,
           COST_CATEGORY,
           SUBCOMPONENT,
-          PROGRAMID, PROGRAMNAME,
-          TEAMID, TEAMNAME,
-          GROUPID, GROUPNAME,
+          PROGRAMID,
+          PROGRAMNAME,
+          TEAMID,
+          TEAMNAME,
+          GROUPID,
+          GROUPNAME,
+          YEAR,
+          PI,
+          CAST(SUM(COALESCE(AMOUNT, 0)) AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(SUM(COALESCE(FTE, 0)) AS FLOAT) AS FTE
+        FROM ado_labor_raw
+        GROUP BY
+          SOURCE,
+          COST_CATEGORY,
+          SUBCOMPONENT,
+          PROGRAMID,
+          PROGRAMNAME,
+          TEAMID,
+          TEAMNAME,
+          GROUPID,
+          GROUPNAME,
+          YEAR,
+          PI
+      ),
+      base_rows AS (
+        SELECT s.*
+        FROM ado_labor s
+        LEFT JOIN {_fq('APPLICATION_GROUPS')} ag ON ag.GROUPID = s.GROUPID
+        WHERE ISNULL(ag.IS_BASE, 0) = 1
+      ),
+      non_base_src AS (
+        SELECT s.*
+        FROM ado_labor s
+        LEFT JOIN {_fq('APPLICATION_GROUPS')} ag ON ag.GROUPID = s.GROUPID
+        WHERE ISNULL(ag.IS_BASE, 0) = 0
+      ),
+      team_targets AS (
+        SELECT
+          g.GROUPID AS TARGET_GROUPID,
+          g.GROUPNAME AS TARGET_GROUPNAME,
+          g.TEAMID AS TARGET_TEAMID,
+          COALESCE(g.PROGRAMID, t.PROGRAMID) AS TARGET_PROGRAMID,
+          p.PROGRAMNAME AS TARGET_PROGRAMNAME,
+          t.TEAMNAME AS TARGET_TEAMNAME
+        FROM {_fq('APPLICATION_GROUPS')} g
+        JOIN {_fq('TEAMS')} t ON t.TEAMID = g.TEAMID
+        LEFT JOIN {_fq('PROGRAMS')} p ON p.PROGRAMID = COALESCE(g.PROGRAMID, t.PROGRAMID)
+      ),
+      target_counts AS (
+        SELECT TARGET_TEAMID, COUNT(*) AS TARGET_CT
+        FROM team_targets
+        GROUP BY TARGET_TEAMID
+      ),
+      base_split AS (
+        SELECT
+          s.SOURCE,
+          s.COST_CATEGORY,
+          s.SUBCOMPONENT,
+          nb.TARGET_PROGRAMID AS PROGRAMID,
+          nb.TARGET_PROGRAMNAME AS PROGRAMNAME,
+          nb.TARGET_TEAMID AS TEAMID,
+          nb.TARGET_TEAMNAME AS TEAMNAME,
+          nb.TARGET_GROUPID AS GROUPID,
+          nb.TARGET_GROUPNAME AS GROUPNAME,
+          s.YEAR,
+          s.PI,
+          CAST(s.AMOUNT / NULLIF(tc.TARGET_CT, 0) AS DECIMAL(18,2)) AS AMOUNT,
+          TRY_CONVERT(FLOAT, s.FTE) / NULLIF(tc.TARGET_CT, 0) AS FTE
+        FROM base_rows s
+        JOIN team_targets nb ON nb.TARGET_TEAMID = s.TEAMID
+        JOIN target_counts tc ON tc.TARGET_TEAMID = s.TEAMID
+      ),
+      ado_union AS (
+        SELECT * FROM non_base_src
+        UNION ALL
+        SELECT
+          SOURCE,
+          COST_CATEGORY,
+          SUBCOMPONENT,
+          PROGRAMID,
+          PROGRAMNAME,
+          TEAMID,
+          TEAMNAME,
+          GROUPID,
+          GROUPNAME,
+          YEAR,
+          PI,
+          AMOUNT,
+          FTE
+        FROM base_split
+      ),
+      ado_filtered AS (
+        SELECT
+          SOURCE,
+          COST_CATEGORY,
+          SUBCOMPONENT,
+          PROGRAMID,
+          PROGRAMNAME,
+          TEAMID,
+          TEAMNAME,
+          GROUPID,
+          GROUPNAME,
           YEAR,
           PI,
           CAST(AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
           CAST(FTE AS FLOAT) AS FTE
-        FROM {_fq('VW_TCO_WORKFORCE_SPLIT')}
-        WHERE {where_sql}
-          AND UPPER(COALESCE(SOURCE, '')) <> 'TCO_BASELINE'
+        FROM ado_union
+        WHERE {base_where_sql}
+      ),
+      non_ado_src AS (
+        SELECT
+          'INVOICE' AS SOURCE,
+          CAST('NON_WORK_FORCE' AS NVARCHAR(50)) AS COST_CATEGORY,
+          isp.SUBCOMPONENT,
+          isp.PROGRAMID,
+          isp.PROGRAMNAME,
+          isp.TEAMID,
+          isp.TEAMNAME,
+          isp.GROUPID,
+          isp.GROUPNAME,
+          TRY_CONVERT(INT, isp.FISCAL_YEAR) AS YEAR,
+          TRY_CONVERT(INT, isp.PI) AS PI,
+          CAST(isp.AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(NULL AS FLOAT) AS FTE
+        FROM {_fq('VW_INVOICE_SPEND_PI')} isp
+
+        UNION ALL
+
+        SELECT
+          m.SOURCE,
+          m.COST_CATEGORY,
+          m.SUBCOMPONENT,
+          m.PROGRAMID,
+          m.PROGRAMNAME,
+          m.TEAMID,
+          m.TEAMNAME,
+          m.GROUPID,
+          m.GROUPNAME,
+          TRY_CONVERT(INT, m.YEAR) AS YEAR,
+          TRY_CONVERT(INT, m.PI) AS PI,
+          CAST(m.AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(NULL AS FLOAT) AS FTE
+        FROM {_fq('VW_MSP_COSTS')} m
+
+        UNION ALL
+
+        SELECT
+          'PROGRAM_ADDITIONAL' AS SOURCE,
+          CAST('NON_WORK_FORCE' AS NVARCHAR(50)) AS COST_CATEGORY,
+          CASE
+            WHEN UPPER(pac.COST_TYPE) = 'CLOUD' AND ISNULL(pac.SUBTYPE,'') <> '' THEN CONCAT('Cloud ', pac.SUBTYPE)
+            WHEN UPPER(pac.COST_TYPE) = 'CLOUD' THEN 'Cloud'
+            WHEN UPPER(pac.COST_TYPE) = 'TRAVEL' THEN 'Travel'
+            WHEN UPPER(pac.COST_TYPE) = 'INFRASTRUCTURE' THEN 'Infra'
+            ELSE pac.COST_TYPE
+          END AS SUBCOMPONENT,
+          pac.PROGRAMID,
+          pac.PROGRAMNAME,
+          CAST(NULL AS NVARCHAR(255)) AS TEAMID,
+          CAST(NULL AS NVARCHAR(255)) AS TEAMNAME,
+          CAST(NULL AS NVARCHAR(255)) AS GROUPID,
+          CAST(NULL AS NVARCHAR(255)) AS GROUPNAME,
+          TRY_CONVERT(INT, pac.YEAR) AS YEAR,
+          TRY_CONVERT(INT, pac.PI) AS PI,
+          CAST(pac.AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(NULL AS FLOAT) AS FTE
+        FROM {_fq('VW_PROGRAM_ADDITIONAL_COSTS_PI')} pac
+      ),
+      non_ado_base_rows AS (
+        SELECT s.*
+        FROM non_ado_src s
+        LEFT JOIN {_fq('APPLICATION_GROUPS')} ag ON ag.GROUPID = s.GROUPID
+        WHERE ISNULL(ag.IS_BASE, 0) = 1
+      ),
+      non_ado_non_base_src AS (
+        SELECT s.*
+        FROM non_ado_src s
+        LEFT JOIN {_fq('APPLICATION_GROUPS')} ag ON ag.GROUPID = s.GROUPID
+        WHERE ISNULL(ag.IS_BASE, 0) = 0
+      ),
+      non_ado_team_targets AS (
+        SELECT
+          g.GROUPID AS TARGET_GROUPID,
+          g.GROUPNAME AS TARGET_GROUPNAME,
+          g.TEAMID AS TARGET_TEAMID,
+          COALESCE(g.PROGRAMID, t.PROGRAMID) AS TARGET_PROGRAMID,
+          p.PROGRAMNAME AS TARGET_PROGRAMNAME,
+          t.TEAMNAME AS TARGET_TEAMNAME
+        FROM {_fq('APPLICATION_GROUPS')} g
+        JOIN {_fq('TEAMS')} t ON t.TEAMID = g.TEAMID
+        LEFT JOIN {_fq('PROGRAMS')} p ON p.PROGRAMID = COALESCE(g.PROGRAMID, t.PROGRAMID)
+      ),
+      non_ado_target_counts AS (
+        SELECT TARGET_TEAMID, COUNT(*) AS TARGET_CT
+        FROM non_ado_team_targets
+        GROUP BY TARGET_TEAMID
+      ),
+      non_ado_base_split AS (
+        SELECT
+          s.SOURCE,
+          s.COST_CATEGORY,
+          s.SUBCOMPONENT,
+          nb.TARGET_PROGRAMID AS PROGRAMID,
+          nb.TARGET_PROGRAMNAME AS PROGRAMNAME,
+          nb.TARGET_TEAMID AS TEAMID,
+          nb.TARGET_TEAMNAME AS TEAMNAME,
+          nb.TARGET_GROUPID AS GROUPID,
+          nb.TARGET_GROUPNAME AS GROUPNAME,
+          s.YEAR,
+          s.PI,
+          CAST(s.AMOUNT / NULLIF(tc.TARGET_CT, 0) AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(TRY_CONVERT(FLOAT, s.FTE) / NULLIF(tc.TARGET_CT, 0) AS FLOAT) AS FTE
+        FROM non_ado_base_rows s
+        JOIN non_ado_team_targets nb ON nb.TARGET_TEAMID = s.TEAMID
+        JOIN non_ado_target_counts tc ON tc.TARGET_TEAMID = s.TEAMID
+      ),
+      non_ado_union AS (
+        SELECT * FROM non_ado_non_base_src
+        UNION ALL
+        SELECT * FROM non_ado_base_split
+      ),
+      non_ado AS (
+        SELECT
+          SOURCE,
+          COST_CATEGORY,
+          SUBCOMPONENT,
+          PROGRAMID,
+          PROGRAMNAME,
+          TEAMID,
+          TEAMNAME,
+          GROUPID,
+          GROUPNAME,
+          TRY_CONVERT(INT, YEAR) AS YEAR,
+          TRY_CONVERT(INT, PI) AS PI,
+          CAST(AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(FTE AS FLOAT) AS FTE
+        FROM non_ado_union
+        WHERE {non_ado_where_sql}
+      ),
+      base AS (
+        SELECT * FROM ado_filtered
+        UNION ALL
+        SELECT * FROM non_ado
       )
     """
-    return sql, params
-
-
-def _projected_cost_lines_snapshot_sql(filters: Optional[Filters]) -> tuple[str, list[Any]]:
-    """Fail-open projected path using projected-demand snapshot + team rates."""
-    where_sql, params = _build_where(filters, year_col="d.YEAR", pi_col="d.PI")
-    sql = f"""
-      SELECT
-        TRY_CONVERT(INT, d.YEAR) AS YEAR,
-        TRY_CONVERT(INT, d.PI) AS PI,
-        d.PROGRAMNAME,
-        d.TEAMNAME,
-        COALESCE(d.GROUPNAME, '(Unmapped Application)') AS GROUPNAME,
-        CAST('WORK_FORCE' AS NVARCHAR(40)) AS COST_CATEGORY,
-        CAST('Team' AS NVARCHAR(40)) AS SUBCOMPONENT,
-        CAST('ADO' AS NVARCHAR(40)) AS SOURCE,
-        CAST(
-          ROUND(
-            COALESCE(TRY_CONVERT(FLOAT, d.DERIVED_FTE_SUM), 0.0)
-            * COALESCE(TRY_CONVERT(FLOAT, r.TEAM_RATE), 0.0),
-            2
-          ) AS DECIMAL(18,2)
-        ) AS AMOUNT,
-        CAST(COALESCE(TRY_CONVERT(FLOAT, d.DERIVED_FTE_SUM), 0.0) AS FLOAT) AS FTE
-      FROM {_fq('TCO_PROJECTED_DEMAND_SNAPSHOT')} d
-      LEFT JOIN {_fq('VW_TEAM_WEIGHTED_RATES')} r
-        ON r.TEAMID = d.TEAMID
-       AND TRY_CONVERT(INT, r.YEAR) = TRY_CONVERT(INT, d.YEAR)
-       AND TRY_CONVERT(INT, r.PI) = TRY_CONVERT(INT, d.PI)
-      WHERE {where_sql}
-        AND COALESCE(TRY_CONVERT(FLOAT, d.DERIVED_FTE_SUM), 0.0) > 0.0
-    """
-    return sql, params
+    return sql, demand_params + c_params + r_params + base_where_params + non_ado_params
 
 
 def _baseline_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]]:
@@ -1281,162 +2224,93 @@ def _baseline_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]
     years = [int(y) for y in _as_list(f.get("year")) if str(y).strip().isdigit()]
     pis = [int(p) for p in _as_list(f.get("pi")) if str(p).strip().isdigit()]
     programs = [str(p).strip() for p in _as_list(f.get("program")) if str(p).strip()]
-    _add_in(ov_where_parts, ov_params, "TRY_CONVERT(INT, c.YEAR)", years)
-    _add_in(ov_where_parts, ov_params, "TRY_CONVERT(INT, c.PI)", pis)
+    teams = [str(t).strip() for t in _as_list(f.get("team")) if str(t).strip()]
+
+    # Workforce baseline must be composition-driven for stability and performance.
+    # Use the effective team labor composition view (already PI-expanded and latest-wins)
+    # instead of re-aggregating raw headcount/contractor history on every page load.
+    comp0_where_parts: list[str] = ["c.YEAR IS NOT NULL", "c.PI IS NOT NULL"]
+    comp0_params: list[Any] = []
+    _add_in(comp0_where_parts, comp0_params, "c.YEAR", years)
+    _add_in(comp0_where_parts, comp0_params, "c.PI", pis)
+    _add_in(comp0_where_parts, comp0_params, "p.PROGRAMNAME", programs, upper=True)
+    _add_in(comp0_where_parts, comp0_params, "t.TEAMNAME", teams, upper=True)
+    comp0_where = " AND ".join(comp0_where_parts)
+
+    _add_in(ov_where_parts, ov_params, "c.YEAR", years)
+    _add_in(ov_where_parts, ov_params, "c.PI", pis)
     _add_in(ov_where_parts, ov_params, "p.PROGRAMNAME", programs, upper=True)
     ov_where = " AND ".join(ov_where_parts)
-    # Performance guardrail:
-    # Apply scope prefilters in headcount CTEs before aggregation.
-    hc_pref_parts: list[str] = []
-    hc_pref_params: list[Any] = []
-    teams = [str(t).strip() for t in _as_list(f.get("team")) if str(t).strip()]
-    _add_in(hc_pref_parts, hc_pref_params, "TRY_CONVERT(INT, h.YEAR)", years)
-    _add_in(hc_pref_parts, hc_pref_params, "TRY_CONVERT(INT, h.PI)", pis)
-    _add_in(hc_pref_parts, hc_pref_params, "p.PROGRAMNAME", programs, upper=True)
-    _add_in(hc_pref_parts, hc_pref_params, "t.TEAMNAME", teams, upper=True)
-    hc_pref_where = " AND ".join(hc_pref_parts) if hc_pref_parts else "1=1"
+
+    r_where_parts: list[str] = ["1=1"]
+    r_params: list[Any] = []
+    _add_in(r_where_parts, r_params, "rw.YEAR", years)
+    _add_in(r_where_parts, r_params, "rw.PI", pis)
+    r_where = " AND ".join(r_where_parts)
     sql = f"""
-      ;WITH hc0 AS (
+      ;WITH comp0 AS (
         SELECT
-          h.TEAMID,
+          c.TEAMID,
           t.TEAMNAME,
           t.PROGRAMID,
           p.PROGRAMNAME,
-          TRY_CONVERT(INT, h.YEAR) AS YEAR,
-          TRY_CONVERT(INT, h.PI) AS PI,
-          CAST(
-            SUM(
-              CASE
-                WHEN UPPER(COALESCE(h.CLASS, '')) = 'TEAM'
-                  THEN COALESCE(TRY_CONVERT(FLOAT, h.HEADCOUNT), 0.0)
-                ELSE 0.0
-              END
-            )
-            AS FLOAT
-          ) AS HC_TEAM,
-          CAST(
-            SUM(
-              CASE
-                WHEN UPPER(COALESCE(h.CLASS, '')) = 'DELIVERY'
-                  THEN COALESCE(TRY_CONVERT(FLOAT, h.HEADCOUNT), 0.0)
-                ELSE 0.0
-              END
-            )
-            AS FLOAT
-          ) AS HC_DELIVERY,
-          CAST(0.0 AS FLOAT) AS HC_CONTRACTOR_C,
-          CAST(0.0 AS FLOAT) AS HC_CONTRACTOR_CS
-        FROM {_fq('VW_TEAM_HEADCOUNT_EFFECTIVE')} h
-        LEFT JOIN {_fq('TEAMS')} t ON t.TEAMID = h.TEAMID
+          c.YEAR AS YEAR,
+          c.PI AS PI,
+          COALESCE(TRY_CONVERT(FLOAT, c.HC_TEAM), 0.0) AS HC_TEAM,
+          COALESCE(TRY_CONVERT(FLOAT, c.HC_DELIVERY), 0.0) AS HC_DELIVERY,
+          COALESCE(TRY_CONVERT(FLOAT, c.HC_CONTRACTOR_C), 0.0) AS HC_CONTRACTOR_C,
+          COALESCE(TRY_CONVERT(FLOAT, c.HC_CONTRACTOR_CS), 0.0) AS HC_CONTRACTOR_CS
+        FROM {_fq('VW_TCO_TEAM_LABOR_COMPOSITION')} c
+        LEFT JOIN {_fq('TEAMS')} t ON t.TEAMID = c.TEAMID
         LEFT JOIN {_fq('PROGRAMS')} p ON p.PROGRAMID = t.PROGRAMID
-        WHERE TRY_CONVERT(INT, h.YEAR) IS NOT NULL
-          AND TRY_CONVERT(INT, h.PI) IS NOT NULL
-          AND {hc_pref_where}
-        GROUP BY
-          h.TEAMID,
-          t.TEAMNAME,
-          t.PROGRAMID,
-          p.PROGRAMNAME,
-          TRY_CONVERT(INT, h.YEAR),
-          TRY_CONVERT(INT, h.PI)
+        WHERE {comp0_where}
       ),
-      hc AS (
-        SELECT * FROM hc0
+      comp AS (
+        SELECT * FROM comp0
         WHERE {where_sql}
       ),
-      con0 AS (
-        SELECT
-          h.TEAMID,
-          t.TEAMNAME,
-          t.PROGRAMID,
-          p.PROGRAMNAME,
-          TRY_CONVERT(INT, h.YEAR) AS YEAR,
-          TRY_CONVERT(INT, h.PI) AS PI,
-          UPPER(COALESCE(h.CLASS, '')) AS CLASS,
-          COALESCE(TRY_CONVERT(FLOAT, h.HEADCOUNT), 0.0) AS HEADCOUNT,
-          COALESCE(TRY_CONVERT(FLOAT, cr.RATE), 0.0) AS RATE
-        FROM {_fq('VW_TEAM_CONTRACTOR_HEADCOUNT_EFFECTIVE')} h
-        LEFT JOIN {_fq('TEAMS')} t ON t.TEAMID = h.TEAMID
-        LEFT JOIN {_fq('PROGRAMS')} p ON p.PROGRAMID = t.PROGRAMID
-        LEFT JOIN {_fq('VW_CONTRACTOR_RATE_EFFECTIVE')} cr
-          ON cr.COMPANYID = h.COMPANYID
-         AND UPPER(COALESCE(cr.CLASS, '')) = UPPER(COALESCE(h.CLASS, ''))
-         AND TRY_CONVERT(INT, cr.YEAR) = TRY_CONVERT(INT, h.YEAR)
-         AND TRY_CONVERT(INT, cr.PI) = TRY_CONVERT(INT, h.PI)
-        WHERE TRY_CONVERT(INT, h.YEAR) IS NOT NULL
-          AND TRY_CONVERT(INT, h.PI) IS NOT NULL
-          AND {hc_pref_where}
-      ),
-      con AS (
-        SELECT * FROM con0
-        WHERE {where_sql}
+      comp_scope AS (
+        SELECT DISTINCT TEAMID, YEAR, PI
+        FROM comp
       ),
       r AS (
         SELECT
-          TEAMID,
-          TRY_CONVERT(INT, YEAR) AS YEAR,
-          TRY_CONVERT(INT, PI) AS PI,
-          COALESCE(TRY_CONVERT(FLOAT, TEAM_RATE), 0.0) AS TEAM_RATE,
-          COALESCE(TRY_CONVERT(FLOAT, DELIVERY_RATE), COALESCE(TRY_CONVERT(FLOAT, TEAM_RATE), 0.0)) AS DELIVERY_RATE,
-          COALESCE(TRY_CONVERT(FLOAT, CONTRACTOR_C_RATE), 0.0) AS CONTRACTOR_C_RATE,
-          COALESCE(TRY_CONVERT(FLOAT, CONTRACTOR_CS_RATE), 0.0) AS CONTRACTOR_CS_RATE
-        FROM {_fq('VW_TEAM_WEIGHTED_RATES')}
+          rw.TEAMID,
+          rw.YEAR AS YEAR,
+          rw.PI AS PI,
+          COALESCE(TRY_CONVERT(FLOAT, rw.TEAM_RATE), 0.0) AS TEAM_RATE,
+          COALESCE(TRY_CONVERT(FLOAT, rw.DELIVERY_RATE), COALESCE(TRY_CONVERT(FLOAT, rw.TEAM_RATE), 0.0)) AS DELIVERY_RATE,
+          COALESCE(TRY_CONVERT(FLOAT, rw.CONTRACTOR_C_RATE), 0.0) AS CONTRACTOR_C_RATE,
+          COALESCE(TRY_CONVERT(FLOAT, rw.CONTRACTOR_CS_RATE), 0.0) AS CONTRACTOR_CS_RATE
+        FROM {_fq('VW_TEAM_WEIGHTED_RATES')} rw
+        JOIN comp_scope cs
+          ON cs.TEAMID = rw.TEAMID
+         AND cs.YEAR = rw.YEAR
+         AND cs.PI = rw.PI
+        WHERE {r_where}
       ),
       wf AS (
         SELECT
           'TCO_BASELINE' AS SOURCE,
-          'WORK_FORCE' AS COST_CATEGORY,
-          'Team' AS SUBCOMPONENT,
-          hc.PROGRAMID, hc.PROGRAMNAME,
-          hc.TEAMID, hc.TEAMNAME,
+          v.COST_CATEGORY,
+          v.SUBCOMPONENT,
+          comp.PROGRAMID, comp.PROGRAMNAME,
+          comp.TEAMID, comp.TEAMNAME,
           CAST(NULL AS NVARCHAR(255)) AS GROUPID,
           CAST('' AS NVARCHAR(255)) AS GROUPNAME,
-          hc.YEAR, hc.PI,
-          CAST(ROUND(hc.HC_TEAM * COALESCE(r.TEAM_RATE, 0.0), 2) AS DECIMAL(18,2)) AS AMOUNT,
-          CAST(hc.HC_TEAM AS FLOAT) AS FTE
-        FROM hc
-        LEFT JOIN r ON r.TEAMID = hc.TEAMID AND r.YEAR = hc.YEAR AND r.PI = hc.PI
-
-        UNION ALL
-        SELECT
-          'TCO_BASELINE' AS SOURCE,
-          'WORK_FORCE' AS COST_CATEGORY,
-          'Delivery Team' AS SUBCOMPONENT,
-          hc.PROGRAMID, hc.PROGRAMNAME,
-          hc.TEAMID, hc.TEAMNAME,
-          CAST(NULL AS NVARCHAR(255)) AS GROUPID,
-          CAST('' AS NVARCHAR(255)) AS GROUPNAME,
-          hc.YEAR, hc.PI,
-          CAST(ROUND(hc.HC_DELIVERY * COALESCE(r.DELIVERY_RATE, 0.0), 2) AS DECIMAL(18,2)) AS AMOUNT,
-          CAST(hc.HC_DELIVERY AS FLOAT) AS FTE
-        FROM hc
-        LEFT JOIN r ON r.TEAMID = hc.TEAMID AND r.YEAR = hc.YEAR AND r.PI = hc.PI
-
-	        UNION ALL
-	        SELECT
-	          'TCO_BASELINE' AS SOURCE,
-	          CASE
-	            WHEN UPPER(COALESCE(con.CLASS, '')) = 'CONTRACTOR_CS'
-	            THEN 'NON_WORK_FORCE'
-	            ELSE 'WORK_FORCE'
-	          END AS COST_CATEGORY,
-	          CASE
-	            WHEN UPPER(COALESCE(con.CLASS, '')) = 'CONTRACTOR_CS'
-	            THEN 'Contractor CS'
-	            ELSE 'Contractor C'
-	          END AS SUBCOMPONENT,
-	          con.PROGRAMID, con.PROGRAMNAME,
-	          con.TEAMID, con.TEAMNAME,
-	          CAST(NULL AS NVARCHAR(255)) AS GROUPID,
-	          CAST('' AS NVARCHAR(255)) AS GROUPNAME,
-	          con.YEAR, con.PI,
-	          CAST(
-	            ROUND(COALESCE(con.HEADCOUNT, 0.0) * COALESCE(con.RATE, 0.0), 2)
-	            AS DECIMAL(18,2)
-	          ) AS AMOUNT,
-	          CAST(COALESCE(con.HEADCOUNT, 0.0) AS FLOAT) AS FTE
-	        FROM con
-	      ),
+          comp.YEAR, comp.PI,
+          CAST(ROUND(v.HC * COALESCE(v.RATE, 0.0), 2) AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(v.HC AS FLOAT) AS FTE
+        FROM comp
+        LEFT JOIN r ON r.TEAMID = comp.TEAMID AND r.YEAR = comp.YEAR AND r.PI = comp.PI
+        CROSS APPLY (
+          VALUES
+            (CAST('WORK_FORCE' AS NVARCHAR(50)), CAST('Team' AS NVARCHAR(255)), comp.HC_TEAM, r.TEAM_RATE),
+            (CAST('WORK_FORCE' AS NVARCHAR(50)), CAST('Delivery Team' AS NVARCHAR(255)), comp.HC_DELIVERY, r.DELIVERY_RATE),
+            (CAST('WORK_FORCE' AS NVARCHAR(50)), CAST('Contractor C' AS NVARCHAR(255)), comp.HC_CONTRACTOR_C, r.CONTRACTOR_C_RATE),
+            (CAST('NON_WORK_FORCE' AS NVARCHAR(50)), CAST('Contractor CS' AS NVARCHAR(255)), comp.HC_CONTRACTOR_CS, r.CONTRACTOR_CS_RATE)
+        ) v(COST_CATEGORY, SUBCOMPONENT, HC, RATE)
+      ),
       ov AS (
         SELECT
           'TCO_BASELINE' AS SOURCE,
@@ -1448,8 +2322,8 @@ def _baseline_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]
           CAST('(Program overhead)' AS NVARCHAR(255)) AS TEAMNAME,
           CAST(NULL AS NVARCHAR(255)) AS GROUPID,
           CAST('' AS NVARCHAR(255)) AS GROUPNAME,
-          TRY_CONVERT(INT, c.YEAR) AS YEAR,
-          TRY_CONVERT(INT, c.PI) AS PI,
+          c.YEAR AS YEAR,
+          c.PI AS PI,
           CAST(
             ROUND(
               COALESCE(TRY_CONVERT(FLOAT, c.PROGRAMFTE), 0.0) * COALESCE(TRY_CONVERT(FLOAT, pr.PROGRAM_XOM_RATE), 0.0),
@@ -1460,11 +2334,123 @@ def _baseline_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]
         FROM {_fq('VW_PROGRAM_COMPOSITION_EFFECTIVE')} c
         LEFT JOIN {_fq('PROGRAMS')} p ON p.PROGRAMID = c.PROGRAMID
         LEFT JOIN {_fq('VW_PROGRAM_RATE_EFFECTIVE')} pr
-          ON pr.PROGRAMID = c.PROGRAMID
-         AND TRY_CONVERT(INT, pr.YEAR) = TRY_CONVERT(INT, c.YEAR)
-         AND TRY_CONVERT(INT, pr.PI) = TRY_CONVERT(INT, c.PI)
+         ON pr.PROGRAMID = c.PROGRAMID
+         AND pr.YEAR = c.YEAR
+         AND pr.PI = c.PI
          AND UPPER(LTRIM(RTRIM(pr.LOCATION))) = UPPER(LTRIM(RTRIM(%s)))
         WHERE {ov_where}
+      ),
+      non_ado_src AS (
+        SELECT
+          'INVOICE' AS SOURCE,
+          CAST('NON_WORK_FORCE' AS NVARCHAR(50)) AS COST_CATEGORY,
+          isp.SUBCOMPONENT,
+          isp.PROGRAMID,
+          isp.PROGRAMNAME,
+          isp.TEAMID,
+          isp.TEAMNAME,
+          isp.GROUPID,
+          isp.GROUPNAME,
+          TRY_CONVERT(INT, isp.FISCAL_YEAR) AS YEAR,
+          TRY_CONVERT(INT, isp.PI) AS PI,
+          CAST(isp.AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(NULL AS FLOAT) AS FTE
+        FROM {_fq('VW_INVOICE_SPEND_PI')} isp
+
+        UNION ALL
+
+        SELECT
+          m.SOURCE,
+          m.COST_CATEGORY,
+          m.SUBCOMPONENT,
+          m.PROGRAMID,
+          m.PROGRAMNAME,
+          m.TEAMID,
+          m.TEAMNAME,
+          m.GROUPID,
+          m.GROUPNAME,
+          TRY_CONVERT(INT, m.YEAR) AS YEAR,
+          TRY_CONVERT(INT, m.PI) AS PI,
+          CAST(m.AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(NULL AS FLOAT) AS FTE
+        FROM {_fq('VW_MSP_COSTS')} m
+
+        UNION ALL
+
+        SELECT
+          'PROGRAM_ADDITIONAL' AS SOURCE,
+          CAST('NON_WORK_FORCE' AS NVARCHAR(50)) AS COST_CATEGORY,
+          CASE
+            WHEN UPPER(pac.COST_TYPE) = 'CLOUD' AND ISNULL(pac.SUBTYPE,'') <> '' THEN CONCAT('Cloud ', pac.SUBTYPE)
+            WHEN UPPER(pac.COST_TYPE) = 'CLOUD' THEN 'Cloud'
+            WHEN UPPER(pac.COST_TYPE) = 'TRAVEL' THEN 'Travel'
+            WHEN UPPER(pac.COST_TYPE) = 'INFRASTRUCTURE' THEN 'Infra'
+            ELSE pac.COST_TYPE
+          END AS SUBCOMPONENT,
+          pac.PROGRAMID,
+          pac.PROGRAMNAME,
+          CAST(NULL AS NVARCHAR(255)) AS TEAMID,
+          CAST(NULL AS NVARCHAR(255)) AS TEAMNAME,
+          CAST(NULL AS NVARCHAR(255)) AS GROUPID,
+          CAST(NULL AS NVARCHAR(255)) AS GROUPNAME,
+          TRY_CONVERT(INT, pac.YEAR) AS YEAR,
+          TRY_CONVERT(INT, pac.PI) AS PI,
+          CAST(pac.AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(NULL AS FLOAT) AS FTE
+        FROM {_fq('VW_PROGRAM_ADDITIONAL_COSTS_PI')} pac
+      ),
+      non_ado_base_rows AS (
+        SELECT s.*
+        FROM non_ado_src s
+        LEFT JOIN {_fq('APPLICATION_GROUPS')} ag ON ag.GROUPID = s.GROUPID
+        WHERE ISNULL(ag.IS_BASE, 0) = 1
+      ),
+      non_ado_non_base_src AS (
+        SELECT s.*
+        FROM non_ado_src s
+        LEFT JOIN {_fq('APPLICATION_GROUPS')} ag ON ag.GROUPID = s.GROUPID
+        WHERE ISNULL(ag.IS_BASE, 0) = 0
+      ),
+      non_ado_team_targets AS (
+        SELECT
+          g.GROUPID AS TARGET_GROUPID,
+          g.GROUPNAME AS TARGET_GROUPNAME,
+          g.TEAMID AS TARGET_TEAMID,
+          COALESCE(g.PROGRAMID, t.PROGRAMID) AS TARGET_PROGRAMID,
+          p.PROGRAMNAME AS TARGET_PROGRAMNAME,
+          t.TEAMNAME AS TARGET_TEAMNAME
+        FROM {_fq('APPLICATION_GROUPS')} g
+        JOIN {_fq('TEAMS')} t ON t.TEAMID = g.TEAMID
+        LEFT JOIN {_fq('PROGRAMS')} p ON p.PROGRAMID = COALESCE(g.PROGRAMID, t.PROGRAMID)
+      ),
+      non_ado_target_counts AS (
+        SELECT TARGET_TEAMID, COUNT(*) AS TARGET_CT
+        FROM non_ado_team_targets
+        GROUP BY TARGET_TEAMID
+      ),
+      non_ado_base_split AS (
+        SELECT
+          s.SOURCE,
+          s.COST_CATEGORY,
+          s.SUBCOMPONENT,
+          nb.TARGET_PROGRAMID AS PROGRAMID,
+          nb.TARGET_PROGRAMNAME AS PROGRAMNAME,
+          nb.TARGET_TEAMID AS TEAMID,
+          nb.TARGET_TEAMNAME AS TEAMNAME,
+          nb.TARGET_GROUPID AS GROUPID,
+          nb.TARGET_GROUPNAME AS GROUPNAME,
+          s.YEAR,
+          s.PI,
+          CAST(s.AMOUNT / NULLIF(tc.TARGET_CT, 0) AS DECIMAL(18,2)) AS AMOUNT,
+          CAST(TRY_CONVERT(FLOAT, s.FTE) / NULLIF(tc.TARGET_CT, 0) AS FLOAT) AS FTE
+        FROM non_ado_base_rows s
+        JOIN non_ado_team_targets nb ON nb.TARGET_TEAMID = s.TEAMID
+        JOIN non_ado_target_counts tc ON tc.TARGET_TEAMID = s.TEAMID
+      ),
+      non_ado_union AS (
+        SELECT * FROM non_ado_non_base_src
+        UNION ALL
+        SELECT * FROM non_ado_base_split
       ),
       non_ado AS (
         SELECT
@@ -1478,9 +2464,8 @@ def _baseline_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]
           PI,
           CAST(AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
           CAST(NULL AS FLOAT) AS FTE
-        FROM {_fq('VW_TCO_WORKFORCE_SPLIT')}
+        FROM non_ado_union
         WHERE {where_sql_non_ado}
-          AND UPPER(COALESCE(SOURCE,'')) NOT IN ('ADO', 'TCO_BASELINE')
       ),
       base AS (
         SELECT * FROM wf
@@ -1489,48 +2474,24 @@ def _baseline_cost_lines_sql(filters: Optional[Filters]) -> tuple[str, list[Any]
       )
     """
     # Parameter order must match placeholder order in the SQL text:
-    # 1) hc0 prefilter ({hc_pref_where}) -> hc_pref_params
-    # 2) hc WHERE ({where_sql}) -> params_hc
-    # 3) con0 prefilter ({hc_pref_where}) -> hc_pref_params
-    # 4) con WHERE ({where_sql}) -> params_hc
-    # 5) pr.LOCATION = %s -> loc
-    # 6) ov WHERE ({ov_where}) -> ov_params
-    # 7) non_ado WHERE ({where_sql_non_ado}) -> params_non_ado
-    return sql, hc_pref_params + params_hc + hc_pref_params + params_hc + [loc] + ov_params + params_non_ado
-
-
-def _baseline_cost_lines_fast_sql(filters: Optional[Filters]) -> tuple[str, list[Any]]:
-    """Fast baseline path from unified split view (runtime-safe under local SQL pressure)."""
-    # Keep baseline semantics close to canonical:
-    # - Include TCO_BASELINE workforce rows already materialized in split view
-    # - Include non-ADO rows (invoices, program additional, MSP, etc.)
-    where_sql, params = _build_where(filters, year_col="YEAR", pi_col="PI", allow_group_filter=False)
-    sql = f"""
-      ;WITH base AS (
-        SELECT
-          SOURCE,
-          COST_CATEGORY,
-          SUBCOMPONENT,
-          PROGRAMID, PROGRAMNAME,
-          TEAMID, TEAMNAME,
-          GROUPID, GROUPNAME,
-          YEAR,
-          PI,
-          CAST(AMOUNT AS DECIMAL(18,2)) AS AMOUNT,
-          CAST(FTE AS FLOAT) AS FTE
-        FROM {_fq('VW_TCO_WORKFORCE_SPLIT')}
-        WHERE {where_sql}
-          AND UPPER(COALESCE(SOURCE, '')) <> 'ADO'
-      )
-    """
-    return sql, params
+    # 1) comp0 WHERE ({comp0_where}) -> comp0_params
+    # 2) comp WHERE ({where_sql}) -> params_hc
+    # 3) r WHERE ({r_where}) -> r_params
+    # 4) pr.LOCATION = %s -> loc
+    # 5) ov WHERE ({ov_where}) -> ov_params
+    # 6) non_ado WHERE ({where_sql_non_ado}) -> params_non_ado
+    return sql, comp0_params + params_hc + r_params + [loc] + ov_params + params_non_ado
 
 
 def _cost_lines_sql(db: Any, scenario: str, filters: Optional[Filters]) -> tuple[str, list[Any], ScenarioSpec]:
     filters = _resolve_scope_filters_with_aliases(db, filters)
     spec = _normalize_scenario(scenario)
     if spec.name == "Projected":
-        sql, params = _projected_cost_lines_sql(filters)
+        if _projected_demand_snapshot_enabled():
+            _ensure_projected_demand_snapshot_ready()
+        if _projected_fte_driver_mode(db) == "SNAPSHOT_VELOCITY":
+            _ensure_projected_velocity_snapshot_ready()
+        sql, params = _projected_cost_lines_sql(filters, db=db)
         return sql, params, spec
     if spec.name == "Actual":
         # Actuals are appended in Python (monthly Apptio NWF → PI allocation via ADO iteration calendar).
@@ -1555,11 +2516,7 @@ def _cost_lines_sql(db: Any, scenario: str, filters: Optional[Filters]) -> tuple
 	          )
 	        """
         return sql, [], spec
-    use_fast_baseline = str(os.getenv("TCO_BASELINE_FAST_FROM_SPLIT", "1") or "1").strip().lower() in {"1", "true", "yes"}
-    if use_fast_baseline:
-        sql, params = _baseline_cost_lines_fast_sql(filters)
-    else:
-        sql, params = _baseline_cost_lines_sql(filters)
+    sql, params = _baseline_cost_lines_sql(filters)
     return sql, params, spec
 
 
@@ -1829,11 +2786,12 @@ def get_app_group_costs(
 
 
 def get_feature_costs(db: Any, filters: Optional[dict] = None) -> pd.DataFrame:
-    """Return feature-level Projected (Expected) costs based on SWAG-derived Derived FTE only.
+    """Return feature-level Projected (Expected) costs based on velocity-aware Derived FTE demand.
 
     This function MUST NOT use manual/custom FTE overrides.
     It reads from the canonical DB view `VW_TCO_WF_LABOR_SPLIT`, which:
-    - uses the feature-level SWAG-derived demand from `VW_TCO_FEATURE_DEMAND`,
+    - uses feature-level demand from `VW_TCO_FEATURE_DEMAND`
+      (`DERIVED_FTE_FEATURE_VELOCITY` with fallback to `DERIVED_FTE_FEATURE`),
     - splits cost across labor types using team composition weights,
     - excludes MSP features (MSP is handled separately via `VW_MSP_COSTS`).
     """

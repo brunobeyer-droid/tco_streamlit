@@ -1266,6 +1266,20 @@ role = role_display
 
 base_raw = fetch_filter_options()
 base_df = base_raw if isinstance(base_raw, pd.DataFrame) else pd.DataFrame()
+if base_df.empty:
+    # Fallback: query the same canonical unified view directly.
+    try:
+        base_df = fetch_df(
+            """
+            SELECT DISTINCT YEAR, PI, PROGRAMNAME, TEAMNAME, GROUPNAME, SOURCE, FEATURE_INVESTMENT_DIMENSION
+            FROM VW_TCO_WORKFORCE_SPLIT
+            """,
+            None,
+        )
+        if not isinstance(base_df, pd.DataFrame):
+            base_df = pd.DataFrame()
+    except Exception:
+        base_df = pd.DataFrame()
 
 if base_df.empty:
     _budget_status_error("No unified cost data found for this selection.")

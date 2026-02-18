@@ -1957,6 +1957,7 @@ def render_ado_profiles_tab() -> None:
             "business_value": "BusinessValue",
         },
         "swag": {"points_per_fte": 65.0},
+        "forecast": {"derived_fte_driver": "SWAG", "velocity_row_fallback": True},
         "filters": {"exclude_states": ["Removed"], "years_prefix": ["2025", "2026", "2027"]},
         "epic_resolution": {"max_depth": 6},
     }
@@ -2172,6 +2173,42 @@ def render_ado_profiles_tab() -> None:
         )
         st.caption("Derived FTE = Story Points ÷ Story Points per 1 FTE")
 
+        st.markdown("#### Forecast demand driver")
+        raw_driver = str(_get_cfg("forecast.derived_fte_driver", defaults["forecast"]["derived_fte_driver"])).strip().upper()
+        if raw_driver in {"VELOCITY", "SNAPSHOT", "SNAPSHOT_VELOCITY"}:
+            forecast_driver = "SNAPSHOT_VELOCITY"
+        else:
+            forecast_driver = "SWAG"
+        driver_options = ["SWAG", "SNAPSHOT_VELOCITY"]
+        driver_labels = {
+            "SWAG": "SWAG (Derived FTE)",
+            "SNAPSHOT_VELOCITY": "Velocity snapshot (Derived FTE)",
+        }
+        forecast_driver = st.selectbox(
+            "Expected/Forecast demand driver",
+            options=driver_options,
+            index=driver_options.index(forecast_driver),
+            format_func=lambda v: driver_labels.get(v, v),
+            key=f"ado_profile_forecast_driver_{selected_id}",
+            help=(
+                "Controls how Expected/Forecast demand is derived in canonical costing. "
+                "SWAG uses Derived FTE from Story Points. Velocity snapshot converts SWAG points "
+                "using team baseline points from TEAM_VELOCITY_SNAPSHOT."
+            ),
+        )
+        velocity_row_fallback = st.checkbox(
+            "Velocity mode: fallback missing rows to global SWAG baseline",
+            value=bool(_get_cfg("forecast.velocity_row_fallback", defaults["forecast"]["velocity_row_fallback"])),
+            key=f"ado_profile_velocity_row_fallback_{selected_id}",
+            help=(
+                "When enabled, features without a team snapshot row still use the global baseline "
+                "instead of zero demand."
+            ),
+            disabled=(forecast_driver != "SNAPSHOT_VELOCITY"),
+        )
+        if forecast_driver == "SNAPSHOT_VELOCITY":
+            st.caption("Velocity mode selected. Ensure TEAM_VELOCITY_SNAPSHOT is refreshed after ADO sync.")
+
         st.markdown("#### Filters")
         exclude_states = st.multiselect(
             "Exclude states",
@@ -2218,6 +2255,10 @@ def render_ado_profiles_tab() -> None:
                     "business_value": "" if business_value_field == "(None)" else business_value_field,
                 },
                 "swag": {"points_per_fte": float(points_per_fte or 0.0)},
+                "forecast": {
+                    "derived_fte_driver": str(forecast_driver or "SWAG"),
+                    "velocity_row_fallback": bool(velocity_row_fallback),
+                },
                 "filters": {"exclude_states": list(exclude_states), "years_prefix": years_list},
                 "epic_resolution": {"max_depth": int(max_depth)},
             }
@@ -3692,10 +3733,23 @@ def render_ado_sync_tab() -> None:
     
     with tab_run:
         st.markdown("### Demand driver (Expected/Forecast)")
-        st.info(
-            "The app always uses Derived FTE (SWAG) as the single demand driver for Expected/Forecast. "
-            "If SWAG input is missing for a feature, its demand is 0."
-        )
+        try:
+            _active_cfg = normalize_profile_config(get_active_ado_profile())
+            _driver = str((_active_cfg.get("forecast") or {}).get("derived_fte_driver") or "SWAG").strip().upper()
+            _fallback = bool((_active_cfg.get("forecast") or {}).get("velocity_row_fallback", True))
+        except Exception:
+            _driver = "SWAG"
+            _fallback = True
+        if _driver in {"VELOCITY", "SNAPSHOT", "SNAPSHOT_VELOCITY"}:
+            st.info(
+                "Active profile demand driver: Velocity snapshot (Derived FTE). "
+                f"Row fallback to global baseline: {'ON' if _fallback else 'OFF'}."
+            )
+        else:
+            st.info(
+                "Active profile demand driver: SWAG (Derived FTE from Story Points). "
+                "Features without SWAG contribute zero demand."
+            )
 
         effective_url = profile_url if sync_mode == "Profile-driven (ADO Profiles)" else final_url
         effective_features_only = features_only if sync_mode == "Legacy (portfolio settings)" else False
@@ -6022,7 +6076,8 @@ def render_ado_advanced_tab() -> None:
 
             st.markdown("#### Latest features")
             st.caption(
-                "Derived FTE (SWAG) is the only demand driver used by Expected costing. Features with Derived FTE = 0 contribute no demand/cost."
+                "Expected demand is driven by the active ADO profile configuration "
+                "(SWAG or Velocity snapshot)."
             )
             df_raw = ado_features_base_query(where_sql, tuple(params) if params else None)
 
@@ -6163,8 +6218,7 @@ def render_ado_advanced_tab() -> None:
                 st.dataframe(df_team_iter, use_container_width=True, height=300)
         with tab_explore_po:
             st.caption(
-                "Explorer v2 is the canonical feature-level demand view. "
-                "Demand driver is Derived FTE (SWAG). Features with Derived FTE = 0 contribute no Expected demand/cost."
+                "Explorer v2 is the canonical feature-level demand view used by Expected costing."
             )
             profile_cfg = normalize_profile_config(get_active_ado_profile())
             org, project = _parse_org_project_from_odata_base(str(profile_cfg.get("odata_base_url") or ""))
@@ -6307,11 +6361,18 @@ def render_ado_advanced_tab() -> None:
                 total_features = int(filt["FEATURE_ID"].nunique())
                 swag_ready_ct = int(filt["SWAG_READY"].fillna(False).astype(bool).sum()) if total_features else 0
                 derived_fte_total = float(filt["DERIVED_FTE"].sum()) if total_features else 0.0
+                derived_fte_velocity_total = float(filt["DERIVED_FTE_FEATURE_VELOCITY"].sum()) if total_features else 0.0
+                derived_delta = derived_fte_velocity_total - derived_fte_total
 
-                m1, m2, m3 = st.columns(3)
+                m1, m2, m3, m4 = st.columns(4)
                 m1.metric("Features (in scope)", f"{total_features:,d}")
                 m2.metric("SWAG-ready features", f"{swag_ready_ct:,d}")
                 m3.metric("Derived FTE total (SWAG)", f"{derived_fte_total:,.2f}" if derived_fte_total else "0.00")
+                m4.metric(
+                    "Derived FTE total (Velocity)",
+                    f"{derived_fte_velocity_total:,.2f}" if derived_fte_velocity_total else "0.00",
+                    delta=f"{derived_delta:+,.2f}",
+                )
 
                 not_ready = filt[~filt["SWAG_READY"].fillna(False).astype(bool)].copy()
                 if not not_ready.empty:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, List, Optional, Sequence, Set
+import os
+from typing import Any, Dict, List, Optional, Sequence, Set
 
 import pandas as pd
 import streamlit as st
@@ -30,6 +31,164 @@ def _fq(name: str) -> str:
         return _db_fq(name) if _db_fq else name
     except Exception:
         return name
+
+
+def _env_flag(name: str, default: bool) -> bool:
+    raw = str(os.getenv(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default)
+    return raw in {"1", "true", "yes", "on"}
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    msg = str(exc or "").strip().lower()
+    return ("timed out" in msg) or ("hyt00" in msg) or ("timeout" in msg)
+
+
+def _resolve_program_scope_tokens(programs: Sequence[str]) -> List[str]:
+    vals = [str(v).strip() for v in (programs or []) if str(v).strip()]
+    if not vals or fetch_df is None:
+        return vals
+    try:
+        ph = ", ".join(["%s"] * len(vals))
+        up_vals = [v.upper() for v in vals]
+        df = fetch_df(
+            f"""
+            SELECT PROGRAMNAME, PROGRAM_DISPLAY_NAME
+            FROM {_fq('PROGRAMS')}
+            WHERE UPPER(LTRIM(RTRIM(COALESCE(PROGRAMNAME, '')))) IN ({ph})
+               OR UPPER(LTRIM(RTRIM(COALESCE(PROGRAM_DISPLAY_NAME, '')))) IN ({ph})
+            """,
+            tuple(up_vals + up_vals),
+        )
+    except Exception:
+        return vals
+    out = set(vals)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for c in ("PROGRAMNAME", "PROGRAM_DISPLAY_NAME"):
+            if c in df.columns:
+                out.update(
+                    {
+                        str(v).strip()
+                        for v in df[c].dropna().astype(str).tolist()
+                        if str(v).strip()
+                    }
+                )
+    return sorted(out)
+
+
+def _resolve_team_scope_tokens(teams: Sequence[str]) -> List[str]:
+    vals = [str(v).strip() for v in (teams or []) if str(v).strip()]
+    if not vals or fetch_df is None:
+        return vals
+    try:
+        ph = ", ".join(["%s"] * len(vals))
+        up_vals = [v.upper() for v in vals]
+        df = fetch_df(
+            f"""
+            SELECT TEAMNAME, TEAM_DISPLAY_NAME
+            FROM {_fq('TEAMS')}
+            WHERE UPPER(LTRIM(RTRIM(COALESCE(TEAMNAME, '')))) IN ({ph})
+               OR UPPER(LTRIM(RTRIM(COALESCE(TEAM_DISPLAY_NAME, '')))) IN ({ph})
+            """,
+            tuple(up_vals + up_vals),
+        )
+    except Exception:
+        return vals
+    out = set(vals)
+    if isinstance(df, pd.DataFrame) and not df.empty:
+        for c in ("TEAMNAME", "TEAM_DISPLAY_NAME"):
+            if c in df.columns:
+                out.update(
+                    {
+                        str(v).strip()
+                        for v in df[c].dropna().astype(str).tolist()
+                        if str(v).strip()
+                    }
+                )
+    return sorted(out)
+
+
+@cache_data_portfolio(ttl=300, show_spinner=False)
+def _velocity_snapshot_lookup(years_key: tuple[int, ...]) -> pd.DataFrame:
+    if fetch_df is None:
+        return pd.DataFrame()
+    years_i = sorted({int(y) for y in years_key if y is not None and int(y) > 0})
+    if not years_i:
+        return pd.DataFrame()
+    ph = ", ".join(["%s"] * len(years_i))
+    sql = f"""
+      SELECT
+        COALESCE(NULLIF(LTRIM(RTRIM(v.TEAMID)), ''), 'UNKNOWN') AS TEAMID,
+        TRY_CONVERT(INT, v.YEAR) AS YEAR,
+        TRY_CONVERT(INT, v.PI) AS PI,
+        MAX(TRY_CONVERT(FLOAT, v.EFFECTIVE_BASELINE_POINTS)) AS EFFECTIVE_BASELINE_POINTS
+      FROM {_fq('TCO_TEAM_VELOCITY_SNAPSHOT')} v
+      WHERE TRY_CONVERT(INT, v.YEAR) IN ({ph})
+        AND TRY_CONVERT(INT, v.PI) IS NOT NULL
+      GROUP BY
+        COALESCE(NULLIF(LTRIM(RTRIM(v.TEAMID)), ''), 'UNKNOWN'),
+        TRY_CONVERT(INT, v.YEAR),
+        TRY_CONVERT(INT, v.PI)
+      HAVING MAX(COALESCE(TRY_CONVERT(FLOAT, v.EFFECTIVE_BASELINE_POINTS), 0.0)) > 0
+    """
+    try:
+        df = fetch_df(sql, tuple(years_i))
+    except Exception:
+        return pd.DataFrame()
+    if df is None or df.empty:
+        return pd.DataFrame()
+    needed = {"TEAMID", "YEAR", "PI", "EFFECTIVE_BASELINE_POINTS"}
+    present = {str(c).strip().upper() for c in df.columns.tolist()}
+    if not needed.issubset(present):
+        return pd.DataFrame()
+    out = df.copy()
+    out["TEAMID"] = out.get("TEAMID", "").astype(str).str.strip().str.upper().replace({"": "UNKNOWN"})
+    out["YEAR"] = pd.to_numeric(out.get("YEAR"), errors="coerce").astype("Int64")
+    out["PI"] = pd.to_numeric(out.get("PI"), errors="coerce").astype("Int64")
+    out["EFFECTIVE_BASELINE_POINTS"] = pd.to_numeric(out.get("EFFECTIVE_BASELINE_POINTS"), errors="coerce")
+    out = out.dropna(subset=["YEAR", "PI", "EFFECTIVE_BASELINE_POINTS"])
+    if out.empty:
+        return pd.DataFrame()
+    return out[["TEAMID", "YEAR", "PI", "EFFECTIVE_BASELINE_POINTS"]]
+
+
+def _apply_velocity_from_snapshot(work: pd.DataFrame, *, years: Sequence[int]) -> pd.DataFrame:
+    if work is None or work.empty:
+        return work
+    if "SWAG_POINTS" not in work.columns or "DERIVED_FTE_FEATURE" not in work.columns:
+        return work
+    if "TEAMID" not in work.columns or "ADO_YEAR" not in work.columns or "PI_NUM" not in work.columns:
+        return work
+    lookup = _velocity_snapshot_lookup(tuple(int(y) for y in years if y is not None and int(y) > 0))
+    if lookup is None or lookup.empty:
+        return work
+
+    src = work.copy()
+    src["_TEAM_KEY"] = src.get("TEAMID", "").astype(str).str.strip().str.upper().replace({"": "UNKNOWN"})
+    src["_YEAR_KEY"] = pd.to_numeric(src.get("ADO_YEAR"), errors="coerce").astype("Int64")
+    src["_PI_KEY"] = pd.to_numeric(src.get("PI_NUM"), errors="coerce").astype("Int64")
+
+    lk = lookup.copy()
+    lk["_TEAM_KEY"] = lk.get("TEAMID", "").astype(str).str.strip().str.upper().replace({"": "UNKNOWN"})
+    lk["_YEAR_KEY"] = pd.to_numeric(lk.get("YEAR"), errors="coerce").astype("Int64")
+    lk["_PI_KEY"] = pd.to_numeric(lk.get("PI"), errors="coerce").astype("Int64")
+
+    merged = src.merge(
+        lk[["_TEAM_KEY", "_YEAR_KEY", "_PI_KEY", "EFFECTIVE_BASELINE_POINTS"]],
+        on=["_TEAM_KEY", "_YEAR_KEY", "_PI_KEY"],
+        how="left",
+    )
+    swag = pd.to_numeric(merged.get("SWAG_POINTS"), errors="coerce")
+    baseline = pd.to_numeric(merged.get("EFFECTIVE_BASELINE_POINTS"), errors="coerce")
+    fallback = pd.to_numeric(merged.get("DERIVED_FTE_FEATURE"), errors="coerce").fillna(0.0)
+    velocity = swag.divide(baseline.where(baseline > 0))
+
+    is_msp = pd.to_numeric(merged.get("IS_MSP_FEATURE"), errors="coerce").fillna(0).astype(int) > 0
+    velocity = velocity.where(~is_msp, fallback)
+    merged["DERIVED_FTE_FEATURE_VELOCITY"] = pd.to_numeric(velocity, errors="coerce").fillna(fallback)
+    merged = merged.drop(columns=["_TEAM_KEY", "_YEAR_KEY", "_PI_KEY"], errors="ignore")
+    return merged
 
 
 @cache_data_portfolio(ttl=300, show_spinner=False)
@@ -170,6 +329,8 @@ def load_explorer_feature_rows(
     pi_nums: Sequence[int] = (),
     cache_bust: int = 0,
     data_version: Optional[int] = None,
+    include_ado_enrichment: bool = True,
+    include_velocity_column: bool = True,
 ) -> pd.DataFrame:
     """
     Ground-truth (Explorer v2) feature-level rows for recon/debug.
@@ -195,7 +356,11 @@ def load_explorer_feature_rows(
         derived_feature_expr = "TRY_CONVERT(FLOAT, d.DERIVED_FTE)"
     else:
         derived_feature_expr = "CAST(0 AS FLOAT)"
-    if "DERIVED_FTE_FEATURE_VELOCITY" in view_cols:
+    use_snapshot_velocity = bool(include_velocity_column) and _env_flag(
+        "TCO_EXPLORER_VELOCITY_FROM_SNAPSHOT",
+        True,
+    )
+    if (not use_snapshot_velocity) and ("DERIVED_FTE_FEATURE_VELOCITY" in view_cols):
         velocity_feature_expr = "TRY_CONVERT(FLOAT, d.DERIVED_FTE_FEATURE_VELOCITY)"
     else:
         velocity_feature_expr = derived_feature_expr
@@ -222,11 +387,9 @@ def load_explorer_feature_rows(
             where.append(f"TRY_CONVERT(INT, d.PI) IN ({ph})")
             params.extend(pi_i)
 
-    sql = f"""
-      SELECT
-        d.FEATURE_ID,
-        d.FEATURE_TITLE AS TITLE,
-        d.FEATURE_STATE AS STATE,
+    include_ado = bool(include_ado_enrichment)
+    if include_ado:
+        ado_select = """
         /* Back-compat: APP_NAME_RAW/CHANGED_AT may not exist in VW_TCO_FEATURE_DEMAND; enrich from ADO_FEATURES. */
         af.APP_NAME_RAW AS APP_NAME_RAW,
         TRY_CONVERT(DATETIME2, af.CHANGED_AT) AS CHANGED_AT,
@@ -242,6 +405,33 @@ def load_explorer_feature_rows(
         af.AREA_LEVEL4_RAW,
         af.AREA_PATH_RAW,
         TRY_CONVERT(FLOAT, af.STORY_POINTS) AS STORY_POINTS,
+        """
+        ado_join = f"LEFT JOIN {_fq('ADO_FEATURES')} af ON af.FEATURE_ID = d.FEATURE_ID"
+    else:
+        ado_select = """
+        CAST(NULL AS NVARCHAR(512)) AS APP_NAME_RAW,
+        CAST(NULL AS DATETIME2) AS CHANGED_AT,
+        CAST(NULL AS NVARCHAR(64)) AS PARENT_ID,
+        CAST(NULL AS NVARCHAR(64)) AS EPIC_ID,
+        CAST(NULL AS NVARCHAR(512)) AS EPIC_TITLE,
+        CAST(NULL AS NVARCHAR(100)) AS EPIC_STATE,
+        CAST(NULL AS NVARCHAR(512)) AS PROGRAM_RAW,
+        CAST(NULL AS NVARCHAR(512)) AS TEAM_RAW,
+        CAST(NULL AS NVARCHAR(512)) AS AREA_LEVEL1_RAW,
+        CAST(NULL AS NVARCHAR(512)) AS AREA_LEVEL2_RAW,
+        CAST(NULL AS NVARCHAR(512)) AS AREA_LEVEL3_RAW,
+        CAST(NULL AS NVARCHAR(512)) AS AREA_LEVEL4_RAW,
+        CAST(NULL AS NVARCHAR(1024)) AS AREA_PATH_RAW,
+        CAST(NULL AS FLOAT) AS STORY_POINTS,
+        """
+        ado_join = ""
+
+    sql = f"""
+      SELECT
+        d.FEATURE_ID,
+        d.FEATURE_TITLE AS TITLE,
+        d.FEATURE_STATE AS STATE,
+        {ado_select}
         d.TEAMID,
         d.TEAMNAME,
         d.PROGRAMID,
@@ -261,8 +451,9 @@ def load_explorer_feature_rows(
         d.INVESTMENT_DIMENSION,
         d.FEATURE_STATE AS FEATURE_STATE
       FROM {_fq('VW_TCO_FEATURE_DEMAND')} d
-      LEFT JOIN {_fq('ADO_FEATURES')} af ON af.FEATURE_ID = d.FEATURE_ID
+      {ado_join}
       WHERE {" AND ".join(where)}
+        AND COALESCE(d.IN_SCOPE_FOR_ROADMAP, 0) = 1
     """
 
     df = fetch_df(sql, tuple(params) if params else None)
@@ -290,6 +481,11 @@ def load_explorer_feature_rows(
     work["DERIVED_FTE_FEATURE_VELOCITY"] = pd.to_numeric(
         work.get("DERIVED_FTE_FEATURE_VELOCITY", work.get("DERIVED_FTE_FEATURE")), errors="coerce"
     ).fillna(work["DERIVED_FTE_FEATURE"])
+    if use_snapshot_velocity:
+        try:
+            work = _apply_velocity_from_snapshot(work, years=years_i)
+        except Exception:
+            pass
     if "IS_SWAG_READY" in work.columns:
         work["SWAG_READY"] = pd.to_numeric(work.get("IS_SWAG_READY"), errors="coerce").fillna(0).astype(int) > 0
     elif "SWAG_POINTS" in work.columns:
@@ -297,7 +493,6 @@ def load_explorer_feature_rows(
     else:
         work["SWAG_READY"] = work["DERIVED_FTE"] > 0
     work = work.drop_duplicates(subset=["FEATURE_ID", "ADO_YEAR", "PI_NUM"], keep="first").copy()
-    work = work[work["COUNTS_FOR_ROADMAP"]].copy()
     work["PI_LABEL"] = work.get("PI_LABEL", "").astype(str).str.strip()
     work["PI_LABEL"] = work["PI_LABEL"].where(
         work["PI_LABEL"].ne(""),
@@ -366,6 +561,189 @@ def load_explorer_feature_rows(
 
 
 @cache_data_portfolio(ttl=180, show_spinner=False)
+def load_velocity_fidelity_metrics(
+    *,
+    years: Sequence[int],
+    programs: Sequence[str] = (),
+    teams: Sequence[str] = (),
+    groups: Sequence[str] = (),
+    pi_nums: Sequence[int] = (),
+    cache_bust: int = 0,
+    data_version: Optional[int] = None,
+) -> Dict[str, Any]:
+    """
+    Compare velocity demand from view column vs snapshot-based velocity calculation.
+
+    Returns a dict with summary metrics and a by-team breakdown dataframe.
+    """
+    _ = cache_bust, data_version
+    years_i = sorted({int(y) for y in years if y is not None and int(y) > 0})
+    if not years_i:
+        return {
+            "status": "empty",
+            "message": "No valid year in scope.",
+            "total_rows": 0,
+            "aligned_rows": 0,
+            "mismatched_rows": 0,
+            "aligned_pct": 0.0,
+            "delta_total": 0.0,
+            "view_total": 0.0,
+            "snapshot_total": 0.0,
+            "by_team": pd.DataFrame(),
+        }
+
+    programs_q = _resolve_program_scope_tokens(programs)
+    teams_q = _resolve_team_scope_tokens(teams)
+    groups_q = [str(v).strip() for v in (groups or []) if str(v).strip()]
+    pi_q = sorted({int(p) for p in (pi_nums or []) if p is not None and 1 <= int(p) <= 4})
+
+    try:
+        snap_df = load_explorer_feature_rows(
+            years=years_i,
+            programs=tuple(programs_q),
+            teams=tuple(teams_q),
+            groups=tuple(groups_q),
+            pi_nums=tuple(pi_q),
+            cache_bust=int(cache_bust or 0),
+            data_version=data_version,
+            include_ado_enrichment=False,
+            include_velocity_column=True,
+        )
+    except Exception as exc:
+        return {
+            "status": "timeout" if _is_timeout_error(exc) else "unavailable",
+            "message": str(exc),
+            "total_rows": 0,
+            "aligned_rows": 0,
+            "mismatched_rows": 0,
+            "aligned_pct": 0.0,
+            "delta_total": 0.0,
+            "view_total": 0.0,
+            "snapshot_total": 0.0,
+            "by_team": pd.DataFrame(),
+        }
+    try:
+        view_df = load_explorer_feature_rows(
+            years=years_i,
+            programs=tuple(programs_q),
+            teams=tuple(teams_q),
+            groups=tuple(groups_q),
+            pi_nums=tuple(pi_q),
+            cache_bust=int(cache_bust or 0),
+            data_version=data_version,
+            include_ado_enrichment=False,
+            include_velocity_column=False,
+        )
+    except Exception as exc:
+        return {
+            "status": "timeout" if _is_timeout_error(exc) else "unavailable",
+            "message": str(exc),
+            "total_rows": 0,
+            "aligned_rows": 0,
+            "mismatched_rows": 0,
+            "aligned_pct": 0.0,
+            "delta_total": 0.0,
+            "view_total": 0.0,
+            "snapshot_total": 0.0,
+            "by_team": pd.DataFrame(),
+        }
+
+    if snap_df is None or snap_df.empty or view_df is None or view_df.empty:
+        return {
+            "status": "empty",
+            "message": "No feature rows in scope for fidelity comparison.",
+            "total_rows": 0,
+            "aligned_rows": 0,
+            "mismatched_rows": 0,
+            "aligned_pct": 0.0,
+            "delta_total": 0.0,
+            "view_total": 0.0,
+            "snapshot_total": 0.0,
+            "by_team": pd.DataFrame(),
+        }
+
+    key_cols = ["FEATURE_ID", "ADO_YEAR", "PI_NUM"]
+    left = snap_df.copy()
+    right = view_df.copy()
+    for c in key_cols:
+        left[c] = left.get(c).astype(str).str.strip()
+        right[c] = right.get(c).astype(str).str.strip()
+    left = left.rename(
+        columns={
+            "DERIVED_FTE_FEATURE_VELOCITY": "VELOCITY_FTE_SNAPSHOT",
+        }
+    )
+    right = right.rename(
+        columns={
+            "DERIVED_FTE_FEATURE_VELOCITY": "VELOCITY_FTE_VIEW",
+        }
+    )
+    merged = left.merge(
+        right[key_cols + ["VELOCITY_FTE_VIEW"]],
+        on=key_cols,
+        how="inner",
+    )
+    if merged.empty:
+        return {
+            "status": "empty",
+            "message": "No overlapping feature rows between snapshot/view velocity datasets.",
+            "total_rows": 0,
+            "aligned_rows": 0,
+            "mismatched_rows": 0,
+            "aligned_pct": 0.0,
+            "delta_total": 0.0,
+            "view_total": 0.0,
+            "snapshot_total": 0.0,
+            "by_team": pd.DataFrame(),
+        }
+
+    merged["VELOCITY_FTE_SNAPSHOT"] = pd.to_numeric(merged.get("VELOCITY_FTE_SNAPSHOT"), errors="coerce").fillna(0.0)
+    merged["VELOCITY_FTE_VIEW"] = pd.to_numeric(merged.get("VELOCITY_FTE_VIEW"), errors="coerce").fillna(0.0)
+    merged["ABS_DIFF"] = (merged["VELOCITY_FTE_VIEW"] - merged["VELOCITY_FTE_SNAPSHOT"]).abs()
+    merged["ALIGNED"] = merged["ABS_DIFF"] < 1e-6
+
+    total_rows = int(len(merged.index))
+    aligned_rows = int(merged["ALIGNED"].sum())
+    mismatched_rows = int(total_rows - aligned_rows)
+    aligned_pct = (100.0 * aligned_rows / total_rows) if total_rows else 0.0
+    delta_total = float((merged["VELOCITY_FTE_VIEW"] - merged["VELOCITY_FTE_SNAPSHOT"]).sum())
+    view_total = float(merged["VELOCITY_FTE_VIEW"].sum())
+    snapshot_total = float(merged["VELOCITY_FTE_SNAPSHOT"].sum())
+
+    by_team = (
+        merged.groupby(["PROGRAMNAME", "TEAMNAME"], dropna=False)
+        .agg(
+            TOTAL_ROWS=("FEATURE_ID", "count"),
+            MISMATCHED_ROWS=("ALIGNED", lambda s: int((~s.astype(bool)).sum())),
+            ALIGNED_PCT=("ALIGNED", lambda s: float(100.0 * s.astype(bool).mean()) if len(s.index) else 0.0),
+            DELTA_TOTAL=("VELOCITY_FTE_VIEW", "sum"),
+            SNAPSHOT_TOTAL=("VELOCITY_FTE_SNAPSHOT", "sum"),
+        )
+        .reset_index()
+    )
+    by_team["DELTA_TOTAL"] = pd.to_numeric(by_team.get("DELTA_TOTAL"), errors="coerce").fillna(0.0) - pd.to_numeric(
+        by_team.get("SNAPSHOT_TOTAL"), errors="coerce"
+    ).fillna(0.0)
+    by_team["PROGRAMNAME"] = by_team.get("PROGRAMNAME", "").fillna("").astype(str).str.strip()
+    by_team["TEAMNAME"] = by_team.get("TEAMNAME", "").fillna("").astype(str).str.strip()
+    by_team = by_team.drop(columns=["SNAPSHOT_TOTAL"], errors="ignore")
+    by_team = by_team.sort_values(["MISMATCHED_ROWS", "ALIGNED_PCT"], ascending=[False, True], kind="mergesort")
+
+    return {
+        "status": "ok",
+        "message": "",
+        "total_rows": total_rows,
+        "aligned_rows": aligned_rows,
+        "mismatched_rows": mismatched_rows,
+        "aligned_pct": aligned_pct,
+        "delta_total": delta_total,
+        "view_total": view_total,
+        "snapshot_total": snapshot_total,
+        "by_team": by_team,
+    }
+
+
+@cache_data_portfolio(ttl=180, show_spinner=False)
 def load_explorer_fte_by_group(
     *,
     years: Sequence[int],
@@ -374,6 +752,7 @@ def load_explorer_fte_by_group(
     groups: Sequence[str] = (),
     pi_nums: Sequence[int] = (),
     data_version: Optional[int] = None,
+    allow_feature_fallback: bool = True,
 ) -> pd.DataFrame:
     """Aggregate Explorer v2 feature-level rows to demand per (Year, PI, Program, Team, App Group)."""
     agg = _agg_explorer_fte_by_group(
@@ -384,6 +763,8 @@ def load_explorer_fte_by_group(
         pi_nums=pi_nums,
     )
     if agg is None:
+        if not bool(allow_feature_fallback):
+            return pd.DataFrame()
         feats = load_explorer_feature_rows(
             years=years,
             programs=programs,
@@ -391,6 +772,8 @@ def load_explorer_fte_by_group(
             groups=groups,
             pi_nums=pi_nums,
             data_version=data_version,
+            include_ado_enrichment=False,
+            include_velocity_column=False,
         )
         if feats is None or feats.empty:
             return pd.DataFrame()
@@ -557,33 +940,99 @@ def _load_velocity_baseline_window_uncached(
         except Exception:
             snapshot_ready = False
 
-    if snapshot_ready and refresh_tco_team_velocity_snapshot is not None:
+    def _snapshot_window_meta() -> tuple[int, int, int, int]:
         try:
             meta = fetch_df(
                 f"""
                 SELECT
                   COUNT(1) AS ROWS_N,
-                  MAX(COALESCE(DATA_VERSION, 0)) AS MAX_DATA_VERSION
+                  MAX(COALESCE(DATA_VERSION, 0)) AS MAX_DATA_VERSION,
+                  MIN(COALESCE(DATA_VERSION, 0)) AS MIN_DATA_VERSION,
+                  SUM(
+                    CASE
+                      WHEN %s > 0 AND COALESCE(DATA_VERSION, 0) < %s THEN 1
+                      ELSE 0
+                    END
+                  ) AS ROWS_BELOW_TARGET
                 FROM {_fq('TCO_TEAM_VELOCITY_SNAPSHOT')}
                 WHERE TRY_CONVERT(INT, YEAR) <= %s
                   AND TRY_CONVERT(INT, YEAR) >= %s
                 """,
-                (year_i, year_floor),
+                (target_ver, target_ver, year_i, year_floor),
             )
-            rows_n = int(meta.iloc[0]["ROWS_N"]) if meta is not None and not meta.empty else 0
-            max_ver = int(meta.iloc[0]["MAX_DATA_VERSION"]) if meta is not None and not meta.empty else 0
-            stale = (rows_n <= 0) or (target_ver > 0 and max_ver < target_ver)
-            if stale:
+            rows_n = int(meta.iloc[0].get("ROWS_N") or 0) if meta is not None and not meta.empty else 0
+            max_ver = int(meta.iloc[0].get("MAX_DATA_VERSION") or 0) if meta is not None and not meta.empty else 0
+            min_ver = int(meta.iloc[0].get("MIN_DATA_VERSION") or 0) if meta is not None and not meta.empty else 0
+            rows_below_target = int(meta.iloc[0].get("ROWS_BELOW_TARGET") or 0) if meta is not None and not meta.empty else 0
+            return rows_n, max_ver, min_ver, rows_below_target
+        except Exception:
+            return 0, 0, 0, 0
+
+    def _is_snapshot_stale(rows_n: int, max_ver: int, min_ver: int, rows_below_target: int) -> bool:
+        stale_now = rows_n <= 0
+        if target_ver > 0:
+            # Using only MAX(DATA_VERSION) can hide stale slices when a subset of
+            # rows carries an oversized token (for example clamped int32 values).
+            # Require the full window to be at-or-above the target version.
+            stale_now = stale_now or (rows_below_target > 0) or (max_ver < target_ver)
+        elif min_ver <= 0:
+            stale_now = stale_now or (rows_n > 0 and max_ver <= 0)
+        return stale_now
+
+    snapshot_stale = False
+    snapshot_rows_n = 0
+    snapshot_max_ver = 0
+    snapshot_min_ver = 0
+    snapshot_rows_below_target = 0
+    snapshot_refresh_attempted = False
+    snapshot_refresh_ok = False
+    auto_refresh_snapshot = _env_flag("TCO_VELOCITY_SNAPSHOT_AUTO_REFRESH", False)
+    allow_stale_snapshot = _env_flag("TCO_VELOCITY_ALLOW_STALE_SNAPSHOT", True)
+    if snapshot_ready:
+        snapshot_rows_n, snapshot_max_ver, snapshot_min_ver, snapshot_rows_below_target = _snapshot_window_meta()
+        snapshot_stale = _is_snapshot_stale(
+            snapshot_rows_n,
+            snapshot_max_ver,
+            snapshot_min_ver,
+            snapshot_rows_below_target,
+        )
+        # Availability-first policy:
+        # only trigger expensive inline refresh when the snapshot window is empty.
+        # If rows already exist (even stale), keep fail-open behavior and avoid
+        # blocking interactive pages with long INSERT...SELECT refreshes.
+        if (
+            snapshot_stale
+            and auto_refresh_snapshot
+            and snapshot_rows_n <= 0
+            and refresh_tco_team_velocity_snapshot is not None
+        ):
+            snapshot_refresh_attempted = True
+            try:
                 refresh_tco_team_velocity_snapshot(
                     data_version=target_ver or None,
                     year=year_i,
                     include_prior_year=include_prior_year,
                     reference_year_only=reference_year_only,
                 )
-        except Exception:
-            pass
+                snapshot_refresh_ok = True
+            except Exception:
+                snapshot_refresh_ok = False
 
-    if snapshot_ready:
+    snapshot_has_rows = snapshot_rows_n > 0
+    snapshot_usable = bool(snapshot_ready and snapshot_has_rows)
+    if snapshot_usable and snapshot_stale:
+        if snapshot_refresh_attempted and snapshot_refresh_ok:
+            rows_n2, max_ver2, min_ver2, rows_below_target2 = _snapshot_window_meta()
+            snapshot_has_rows = rows_n2 > 0
+            snapshot_usable = not _is_snapshot_stale(rows_n2, max_ver2, min_ver2, rows_below_target2)
+            if (not snapshot_usable) and allow_stale_snapshot and snapshot_has_rows:
+                # Availability guardrail: stale snapshot is preferable to expensive view fallback.
+                snapshot_usable = True
+        else:
+            # Keep a stale snapshot as a fail-open source to avoid page stalls/timeouts.
+            snapshot_usable = bool(allow_stale_snapshot and snapshot_has_rows)
+
+    if snapshot_usable:
         try:
             df_snapshot = fetch_df(
                 f"""
