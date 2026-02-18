@@ -3892,28 +3892,12 @@ def render_snapshot_section() -> None:
     kpi_card_h = 150
     kpi_row_gap = 12
     kpi_tall_h = (2 * kpi_card_h) + kpi_row_gap
-    liquid_stack_h = int(round(kpi_tall_h * 0.4))
-    widget_help = "Full-year forecast versus full-year plan for the selected scope."
-    liquid_html, liquid_height = _build_snapshot_liquid_card_html(
-        ratio=forecast_vs_plan_ratio,
-        page_theme=page_theme,
-        title="Forecast vs Plan",
-        help_text=widget_help,
-        tall_h=liquid_stack_h,
-        accent_color="#B3B3B3",
-    )
     baseline_single_row_html = _build_velocity_baseline_compact_card_html(
         velocity_snapshot,
         height_px=kpi_card_h,
     )
-
-    snapshot_left_col, snapshot_right_col = st.columns([1.0, 0.22], gap="small", vertical_alignment="top")
-    with snapshot_left_col:
-        st.subheader("Snapshot")
-        st.markdown(f"**{headline.text}**")
-    with snapshot_right_col:
-        # Add a small buffer under the widget without changing the Snapshot text position.
-        components.html(liquid_html, height=max(liquid_height + 13, 131), scrolling=False)
+    st.subheader("Snapshot")
+    st.markdown(f"**{headline.text}**")
 
     st.markdown(
         (
