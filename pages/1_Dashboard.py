@@ -22,6 +22,7 @@ from core.data import (
     fetch_apptio_actuals_monthly_breakdown,
     _program_ids_for_names,
 )
+from core.capacity_data import fetch_capacity_demand_pi
 from core.init import init_page, page_loader, render_echart
 from core.scope import infer_role, read_scope_from_session, scope_label
 from core.ui import render_page_header, touch_last_updated_status
@@ -1828,6 +1829,11 @@ def _pick_fte_series(df: pd.DataFrame) -> pd.Series:
     return pd.Series([0.0] * len(df.index), index=df.index, dtype=float)
 
 
+def _looks_like_timeout_error(exc: Exception) -> bool:
+    msg = str(exc or "").strip().lower()
+    return ("timeout" in msg) or ("timed out" in msg) or ("hyt00" in msg)
+
+
 @cache_data_portfolio(ttl=180, show_spinner=False)
 def _build_staffing_capacity_df(
     year: int,
@@ -2087,22 +2093,59 @@ def _build_capacity_demand_budget_series(
         "neg_fte_total": 0.0,
         "rate_by_pi_head": [],
     }
-    staffing_df = _build_staffing_capacity_df(
-        int(year),
-        programs,
-        teams,
-        filters_sig=filters_sig,
-        user_scope_sig=user_scope_sig,
-        cache_buster=cache_buster,
-    )
-    demand_df = _build_demand_fte_df(
-        int(year),
-        programs,
-        teams,
-        filters_sig=filters_sig,
-        user_scope_sig=user_scope_sig,
-        cache_buster=cache_buster,
-    )
+    staffing_df = pd.DataFrame()
+    demand_df = pd.DataFrame()
+
+    # Snapshot-first path: keeps Dashboard responsive on narrow Team/Program scopes.
+    try:
+        cap_snap = fetch_capacity_demand_pi(
+            int(year),
+            list(programs or ()),
+            list(teams or ()),
+            data_version=int(get_data_version() or 0),
+        )
+    except Exception:
+        cap_snap = pd.DataFrame()
+
+    if isinstance(cap_snap, pd.DataFrame) and not cap_snap.empty:
+        snap = cap_snap.copy()
+        snap["YEAR"] = pd.to_numeric(snap.get("YEAR"), errors="coerce").astype("Int64")
+        snap["PI"] = pd.to_numeric(snap.get("PI"), errors="coerce").astype("Int64")
+        snap["PROGRAMNAME"] = snap.get("PROGRAMNAME", "").fillna("").astype(str).str.strip()
+        snap["TEAMNAME"] = snap.get("TEAMNAME", "").fillna("").astype(str).str.strip()
+        snap["CAPACITY_FTE"] = pd.to_numeric(snap.get("CAPACITY_FTE"), errors="coerce").fillna(0.0)
+        snap["DEMAND_FTE"] = pd.to_numeric(snap.get("DEMAND_FTE"), errors="coerce").fillna(0.0)
+
+        staffing_df = snap[["YEAR", "PI", "PROGRAMNAME", "TEAMNAME", "CAPACITY_FTE"]].copy()
+        staffing_df = staffing_df.rename(columns={"CAPACITY_FTE": "FTE"})
+        staffing_df["COMPONENT"] = "DELIVERY"
+
+        demand_df = snap[["YEAR", "PI", "PROGRAMNAME", "TEAMNAME", "DEMAND_FTE"]].copy()
+        debug["capacity_source_mode"] = "snapshot_team_pi"
+    else:
+        try:
+            staffing_df = _build_staffing_capacity_df(
+                int(year),
+                programs,
+                teams,
+                filters_sig=filters_sig,
+                user_scope_sig=user_scope_sig,
+                cache_buster=cache_buster,
+            )
+            demand_df = _build_demand_fte_df(
+                int(year),
+                programs,
+                teams,
+                filters_sig=filters_sig,
+                user_scope_sig=user_scope_sig,
+                cache_buster=cache_buster,
+            )
+        except Exception as exc:
+            if _looks_like_timeout_error(exc):
+                debug["status"] = "timeout"
+                debug["error"] = str(exc)
+                return [], [], [], [], [], debug
+            raise
     debug["rows"] = int(staffing_df.shape[0]) if isinstance(staffing_df, pd.DataFrame) else 0
     if staffing_df is None or staffing_df.empty:
         return [], [], [], [], [], debug
