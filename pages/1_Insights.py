@@ -669,14 +669,22 @@ def cached_prepare_insights_inputs(
         if groups:
             df_ado = df_ado[df_ado["GROUPNAME"].isin(set(groups))].copy()
 
-    df_explorer = load_explorer_feature_rows(
-        years=[int(year)],
-        programs=tuple(programs),
-        teams=tuple(teams),
-        groups=tuple(groups),
-        pi_nums=tuple(),
-        data_version=data_version,
-    )
+    try:
+        # Keep Insights responsive under constrained DB latency:
+        # this dataset is used for demand-focused analytics and does not require
+        # ADO enrichment joins or velocity-column materialization at this stage.
+        df_explorer = load_explorer_feature_rows(
+            years=[int(year)],
+            programs=tuple(programs),
+            teams=tuple(teams),
+            groups=tuple(groups),
+            pi_nums=tuple(),
+            data_version=data_version,
+            include_ado_enrichment=False,
+            include_velocity_column=False,
+        )
+    except Exception:
+        df_explorer = pd.DataFrame()
     if df_explorer is None:
         df_explorer = pd.DataFrame()
 

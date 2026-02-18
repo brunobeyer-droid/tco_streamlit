@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from typing import Any, List, Sequence, Optional
 
 import pandas as pd
@@ -406,6 +407,13 @@ def fetch_capacity_demand_pi(year: int, programs: list[str], teams: list[str], d
     programs_norm = [str(p).strip() for p in (programs or []) if str(p).strip()]
     teams_norm = [str(t).strip() for t in (teams or []) if str(t).strip()]
 
+    strict_scope = str(os.getenv("TCO_PROJECTED_DEMAND_SNAPSHOT_STRICT_SCOPE", "1") or "1").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
     demand_multi = _load_projected_demand_snapshot_team_pi_years(
         years=[y],
         programs=programs_norm,
@@ -413,6 +421,8 @@ def fetch_capacity_demand_pi(year: int, programs: list[str], teams: list[str], d
     )
     # Fallback to Explorer aggregation only when snapshot demand is unavailable/empty.
     if demand_multi is None or demand_multi.empty:
+        if strict_scope:
+            return _empty_capacity_demand_df()
         try:
             demand_multi = load_explorer_fte_by_group(
                 years=[y],
