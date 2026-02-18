@@ -12,6 +12,21 @@ from core.ado_recon import load_explorer_fte_by_group
 from db import fetch_df_active as fetch_df  # type: ignore
 
 
+def _to_nullable_int64(values: Any, *, index: Optional[pd.Index] = None) -> pd.Series:
+    """Safely coerce unknown/scalar/list inputs to pandas nullable Int64 series."""
+    if isinstance(values, pd.Series):
+        s = values.copy()
+    else:
+        if index is None:
+            s = pd.Series(values)
+        else:
+            if isinstance(values, (list, tuple)):
+                s = pd.Series(list(values), index=index)
+            else:
+                s = pd.Series([values] * len(index), index=index)
+    return pd.to_numeric(s, errors="coerce").astype("Int64")
+
+
 def _empty_capacity_demand_df() -> pd.DataFrame:
     return pd.DataFrame(
         columns=[
@@ -545,8 +560,15 @@ def fetch_capacity_demand_pi(year: int, programs: list[str], teams: list[str], d
 
     cap_fraction = float(_roadmap_capacity_fraction())
     capw = cap.copy()
-    capw["ADO_YEAR"] = pd.to_numeric(capw.get("ADO_YEAR"), errors="coerce").astype("Int64")
-    capw["ITERATION_NUM"] = pd.to_numeric(capw.get("ITERATION_NUM"), errors="coerce").astype("Int64")
+    if "ADO_YEAR" not in capw.columns and "YEAR" in capw.columns:
+        capw["ADO_YEAR"] = capw.get("YEAR")
+    if "ITERATION_NUM" not in capw.columns:
+        if "PI_NUM" in capw.columns:
+            capw["ITERATION_NUM"] = capw.get("PI_NUM")
+        elif "PI" in capw.columns:
+            capw["ITERATION_NUM"] = capw.get("PI")
+    capw["ADO_YEAR"] = _to_nullable_int64(capw.get("ADO_YEAR"), index=capw.index)
+    capw["ITERATION_NUM"] = _to_nullable_int64(capw.get("ITERATION_NUM"), index=capw.index)
     capw = capw[capw["ITERATION_NUM"].notna() & capw["ITERATION_NUM"].isin(pi_nums)].copy()
     capw["PROGRAMNAME"] = capw.get("PROGRAMNAME", "").astype(str).str.strip().replace({"": "(Unassigned)"})
     capw["TEAMNAME"] = capw.get("TEAMNAME", "").astype(str).str.strip().replace({"": "(Unassigned)"})
@@ -567,13 +589,13 @@ def fetch_capacity_demand_pi(year: int, programs: list[str], teams: list[str], d
         lambda r: (float(r["DEMAND_FTE"]) / float(r["CAPACITY_FTE"])) if float(r["CAPACITY_FTE"]) > 0 else pd.NA,
         axis=1,
     )
-    ycol = pd.to_numeric(merged.get("ADO_YEAR"), errors="coerce").astype("Int64")
-    pcol = pd.to_numeric(merged.get("PI_NUM"), errors="coerce").astype("Int64")
+    ycol = _to_nullable_int64(merged.get("ADO_YEAR"), index=merged.index)
+    pcol = _to_nullable_int64(merged.get("PI_NUM"), index=merged.index)
     merged["ITERATION_LEVEL3"] = (ycol.astype(str) + " I" + pcol.astype(str)).where(ycol.notna() & pcol.notna(), "")
     merged["PI_ORDER"] = (ycol * 10 + pcol).astype("Int64")
 
-    merged["YEAR"] = pd.to_numeric(merged.get("ADO_YEAR"), errors="coerce").astype("Int64")
-    merged["PI"] = pd.to_numeric(merged.get("PI_NUM"), errors="coerce").astype("Int64")
+    merged["YEAR"] = _to_nullable_int64(merged.get("ADO_YEAR"), index=merged.index)
+    merged["PI"] = _to_nullable_int64(merged.get("PI_NUM"), index=merged.index)
 
     merged["CAPACITY_SOD_FTE"] = pd.to_numeric(merged.get("CAPACITY_FTE"), errors="coerce").fillna(0.0)
     merged["DEMAND_SOD_FTE"] = pd.to_numeric(merged.get("DEMAND_FTE"), errors="coerce").fillna(0.0)

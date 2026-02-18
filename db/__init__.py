@@ -24,7 +24,11 @@ def fetch_df_active(sql, params=None):  # type: ignore
 def execute_active(sql, params=None, *, many=False):  # type: ignore
     try:
         from core.db_session import db_execute
-        return db_execute(sql, params, many=many)
+        try:
+            return db_execute(sql, params, many=many)
+        except TypeError:
+            # Backward compatibility: some db_execute implementations do not accept `many`.
+            return db_execute(sql, params)
     except Exception:
         return execute(sql, params, many=many)  # type: ignore[name-defined]
 
@@ -36,7 +40,11 @@ def execute_control(sql, params=None):  # type: ignore
 
 def execute_portfolio(sql, params=None, *, many=False):  # type: ignore
     from core.db_session import db_execute
-    return db_execute(sql, params, many=many)
+    try:
+        return db_execute(sql, params, many=many)
+    except TypeError:
+        # Backward compatibility: some db_execute implementations do not accept `many`.
+        return db_execute(sql, params)
 
 def execute(sql, params=None, *args, **kwargs):  # type: ignore
     if isinstance(sql, str) and "CONTROL_" in sql.upper():

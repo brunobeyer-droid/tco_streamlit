@@ -2150,29 +2150,9 @@ def _build_capacity_demand_budget_series(
         demand_df = snap[["YEAR", "PI", "PROGRAMNAME", "TEAMNAME", "DEMAND_FTE"]].copy()
         debug["capacity_source_mode"] = "snapshot_team_pi"
     else:
-        try:
-            staffing_df = _build_staffing_capacity_df(
-                int(year),
-                programs,
-                teams,
-                filters_sig=filters_sig,
-                user_scope_sig=user_scope_sig,
-                cache_buster=cache_buster,
-            )
-            demand_df = _build_demand_fte_df(
-                int(year),
-                programs,
-                teams,
-                filters_sig=filters_sig,
-                user_scope_sig=user_scope_sig,
-                cache_buster=cache_buster,
-            )
-        except Exception as exc:
-            if _looks_like_timeout_error(exc):
-                debug["status"] = "timeout"
-                debug["error"] = str(exc)
-                return [], [], [], [], [], debug
-            raise
+        # Avoid heavy fallback SQL here (it causes frequent HYT00 on local SQL).
+        # Use already-loaded canonical cost lines as the resilient fallback source.
+        return _fallback_from_cost_lines()
     debug["rows"] = int(staffing_df.shape[0]) if isinstance(staffing_df, pd.DataFrame) else 0
     if staffing_df is None or staffing_df.empty:
         return _fallback_from_cost_lines()
